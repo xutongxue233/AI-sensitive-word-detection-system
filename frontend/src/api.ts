@@ -63,6 +63,8 @@ export const uploadVideo = (video: File, subtitle?: File, onProgress?: (percent:
 
 export const getVideo = (id: number) => api.get<VideoFile>(`/videos/${id}`).then((res) => res.data);
 
+export const deleteVideo = (id: number) => api.delete(`/videos/${id}`);
+
 export const startJob = (videoId: number) =>
   api.post<DetectionJob>(`/videos/${videoId}/jobs`).then((res) => res.data);
 

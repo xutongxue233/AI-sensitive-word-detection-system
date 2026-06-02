@@ -12,4 +12,8 @@ public interface DetectionJobRepository extends BaseCrudMapper<DetectionJob> {
                 .eq(DetectionJob::getVideoId, videoId)
                 .orderByDesc(DetectionJob::getCreatedAt));
     }
+
+    default void deleteByVideoId(Long videoId) {
+        delete(Wrappers.lambdaQuery(DetectionJob.class).eq(DetectionJob::getVideoId, videoId));
+    }
 }

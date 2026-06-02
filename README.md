@@ -4,7 +4,7 @@
 
 ### 项目简介
 
-AI 敏感词检测系统是一个基于 `Spring Boot + React` 的视频内容审核工作台。系统支持维护敏感词/违规词库，上传视频或字幕，通过 FFmpeg 抽取音频，使用本地 Whisper ASR 生成词级时间戳，再通过规则召回和 AI 上下文复核判断是否违规，最终生成可确认、可调整、可导出的视频剪辑建议。
+AI 敏感词检测系统是一个基于 `Spring Boot + React + shadcn/ui` 的视频内容审核工作台。系统支持维护敏感词/违规词库，上传视频或字幕，通过 FFmpeg 抽取音频，使用本地 OpenAI Whisper ASR 生成词级时间戳，再通过规则召回和 AI 上下文复核判断是否违规，最终生成可确认、可调整、可导出的视频剪辑建议。
 
 该项目的核心目标不是直接依赖“整段视频多模态审核”，而是构建一个可审计、可解释、可定位到时间轴的审核流程。
 
@@ -12,13 +12,13 @@ AI 敏感词检测系统是一个基于 `Spring Boot + React` 的视频内容审
 
 - 违规词库维护：支持新增、编辑、删除、启停、CSV 导入。
 - 多种匹配方式：精确词、变体词、正则词、语义规则。
-- 视频上传：支持视频文件上传，可选上传 `.srt/.vtt` 字幕。
+- 视频上传与删除：支持视频文件上传，可选上传 `.srt/.vtt` 字幕，并可删除视频及关联检测记录。
 - 音频抽取：通过 FFmpeg 将视频音频转为 16kHz mono wav。
-- Whisper ASR：通过本地 `faster-whisper` 服务生成句段和词级时间戳。
+- OpenAI Whisper ASR：通过本地 `openai-whisper` 服务生成句段和词级时间戳，默认使用 `large-v3` 以优先保证准确度。
 - 简体中文输出：ASR 使用简体中文提示词，并用 OpenCC 做繁转简兜底。
 - 规则召回：先用词库规则找到候选命中，降低 AI 审核成本。
 - AI 复核：只复核候选上下文，输出违规判断、原因和置信度。
-- 时间轴展示：展示违规词出现的起止时间。
+- 时间轴展示：展示违规词出现的起止时间，点击违规词或字幕片段可跳转到视频对应时间。
 - 剪辑建议：默认按命中词前后各 1 秒生成剪辑片段。
 - 管理员确认：确认、忽略或手动调整剪辑片段。
 - 视频导出：确认后调用 FFmpeg 导出去违规版本视频。
@@ -28,8 +28,8 @@ AI 敏感词检测系统是一个基于 `Spring Boot + React` 的视频内容审
 | 模块 | 技术 |
 | --- | --- |
 | 后端 | Spring Boot 3.3, Java 21, MyBatis-Plus, MySQL |
-| 前端 | React 18, TypeScript, Vite, Ant Design |
-| ASR | FastAPI, faster-whisper, OpenCC |
+| 前端 | React 18, TypeScript, Vite, shadcn/ui, Radix UI, Tailwind CSS, Video.js |
+| ASR | FastAPI, OpenAI Whisper (`openai-whisper`), OpenCC |
 | 媒体处理 | FFmpeg, ffprobe |
 | 数据库 | MySQL 8+ |
 
@@ -38,8 +38,8 @@ AI 敏感词检测系统是一个基于 `Spring Boot + React` 的视频内容审
 ```text
 .
 ├── backend/      # Spring Boot 后端 API、检测管线、MyBatis-Plus Mapper
-├── frontend/     # React + Vite 前端审核工作台
-├── asr-service/  # FastAPI + faster-whisper 本地 ASR 服务
+├── frontend/     # React + Vite + shadcn/ui 前端审核工作台
+├── asr-service/  # FastAPI + OpenAI Whisper 本地 ASR 服务
 └── README.md
 ```
 
@@ -120,9 +120,8 @@ py -3.10 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\pip.exe install -r requirements.txt
 
-$env:WHISPER_MODEL='base'
+$env:WHISPER_MODEL='large-v3'
 $env:WHISPER_DEVICE='cpu'
-$env:WHISPER_COMPUTE_TYPE='int8'
 $env:WHISPER_LANGUAGE='zh'
 $env:WHISPER_CHINESE_CONVERTER='t2s'
 $env:WHISPER_INITIAL_PROMPT='请使用简体中文转写普通话内容。'
@@ -132,9 +131,9 @@ $env:WHISPER_INITIAL_PROMPT='请使用简体中文转写普通话内容。'
 
 说明：
 
-- 第一次识别会下载 Whisper 模型。
+- 第一次识别会通过 `openai-whisper` 下载 Whisper 模型。
 - `WHISPER_MODEL` 可改为 `tiny/base/small/medium/large-v3`。
-- CPU 环境建议先使用 `base` 或 `small`。
+- 默认使用 `large-v3`，准确度优先；CPU 环境如果速度过慢，可改为 `small` 或 `medium`。
 - 默认输出会使用简体中文提示词，并通过 OpenCC 做繁转简。
 
 ### 启动后端
@@ -171,6 +170,14 @@ npm run dev
 http://127.0.0.1:5174/
 ```
 
+也可以先构建再用内置静态服务托管生产包，服务会将 `/api` 代理到 `http://127.0.0.1:8090`：
+
+```powershell
+cd frontend
+npm run build
+npm run serve:dist
+```
+
 ### REST API
 
 | 方法 | 路径 | 说明 |
@@ -179,6 +186,7 @@ http://127.0.0.1:5174/
 | `GET` | `/api/v1/videos` | 视频列表 |
 | `GET` | `/api/v1/videos/{id}` | 视频详情 |
 | `GET` | `/api/v1/videos/{id}/content` | 视频内容预览 |
+| `DELETE` | `/api/v1/videos/{id}` | 删除视频及其检测记录 |
 | `POST` | `/api/v1/videos/{id}/jobs` | 创建检测任务 |
 | `GET` | `/api/v1/jobs/{id}` | 查询任务进度 |
 | `GET` | `/api/v1/jobs/{id}/segments` | 字幕句段 |
@@ -220,7 +228,7 @@ term,category,severity,matchType,variants
 ### 注意事项
 
 - 本项目不会提交本地视频、模型、虚拟环境、FFmpeg 二进制文件。
-- ASR 模型由 faster-whisper 首次运行时下载并缓存到本机。
+- ASR 模型由 `openai-whisper` 首次运行时下载并缓存到本机。
 - 真实生产环境建议增加鉴权、审计日志、对象存储、任务队列和模型服务监控。
 - AI 复核只处理规则召回候选，不做全文无差别审核。
 
@@ -230,7 +238,7 @@ term,category,severity,matchType,variants
 
 ### Overview
 
-AI Sensitive Word Detection System is a video moderation console built with `Spring Boot + React`. It manages a sensitive-term dictionary, uploads videos or subtitle files, extracts audio with FFmpeg, transcribes speech with local Whisper ASR, maps terms to word-level timestamps, reviews candidate hits with AI, and generates editable clip suggestions for administrators.
+AI Sensitive Word Detection System is a video moderation console built with `Spring Boot + React + shadcn/ui`. It manages a sensitive-term dictionary, uploads videos or subtitle files, extracts audio with FFmpeg, transcribes speech with local OpenAI Whisper ASR, maps terms to word-level timestamps, reviews candidate hits with AI, and generates editable clip suggestions for administrators.
 
 The system is designed for auditability and precise timeline positioning instead of relying on a black-box multimodal video model.
 
@@ -238,13 +246,13 @@ The system is designed for auditability and precise timeline positioning instead
 
 - Sensitive-term management: create, edit, delete, enable, disable, and CSV import.
 - Matching modes: exact terms, variants, regex, and semantic rules.
-- Video upload: upload video files with optional `.srt/.vtt` subtitles.
+- Video upload and deletion: upload video files with optional `.srt/.vtt` subtitles, and delete videos together with related detection records.
 - Audio extraction: convert video audio to 16kHz mono wav using FFmpeg.
-- Whisper ASR: generate segment-level and word-level timestamps.
+- OpenAI Whisper ASR: generate segment-level and word-level timestamps, defaulting to `large-v3` for accuracy.
 - Simplified Chinese output: ASR uses a Simplified Chinese prompt and OpenCC fallback conversion.
 - Rule recall: find candidate hits before AI review.
 - AI review: review only candidate contexts and return status, confidence, and reason.
-- Timeline view: show where sensitive words appear in the video.
+- Timeline view: show where sensitive words appear in the video; clicking a hit or subtitle segment jumps the player to that timestamp.
 - Clip suggestions: default range is hit start minus 1 second to hit end plus 1 second.
 - Admin confirmation: confirm, ignore, or adjust suggested clips.
 - Export: generate moderated videos after confirmed clip removal.
@@ -254,8 +262,8 @@ The system is designed for auditability and precise timeline positioning instead
 | Layer | Stack |
 | --- | --- |
 | Backend | Spring Boot 3.3, Java 21, MyBatis-Plus, MySQL |
-| Frontend | React 18, TypeScript, Vite, Ant Design |
-| ASR | FastAPI, faster-whisper, OpenCC |
+| Frontend | React 18, TypeScript, Vite, shadcn/ui, Radix UI, Tailwind CSS, Video.js |
+| ASR | FastAPI, OpenAI Whisper (`openai-whisper`), OpenCC |
 | Media | FFmpeg, ffprobe |
 | Database | MySQL 8+ |
 
@@ -264,8 +272,8 @@ The system is designed for auditability and precise timeline positioning instead
 ```text
 .
 ├── backend/      # Spring Boot APIs, detection pipeline, MyBatis-Plus mappers
-├── frontend/     # React + Vite moderation console
-├── asr-service/  # FastAPI + faster-whisper local ASR service
+├── frontend/     # React + Vite + shadcn/ui moderation console
+├── asr-service/  # FastAPI + OpenAI Whisper local ASR service
 └── README.md
 ```
 
@@ -343,9 +351,8 @@ py -3.10 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\pip.exe install -r requirements.txt
 
-$env:WHISPER_MODEL='base'
+$env:WHISPER_MODEL='large-v3'
 $env:WHISPER_DEVICE='cpu'
-$env:WHISPER_COMPUTE_TYPE='int8'
 $env:WHISPER_LANGUAGE='zh'
 $env:WHISPER_CHINESE_CONVERTER='t2s'
 $env:WHISPER_INITIAL_PROMPT='请使用简体中文转写普通话内容。'
@@ -355,9 +362,9 @@ $env:WHISPER_INITIAL_PROMPT='请使用简体中文转写普通话内容。'
 
 Notes:
 
-- The Whisper model is downloaded on first use.
+- The Whisper model is downloaded by `openai-whisper` on first use.
 - `WHISPER_MODEL` can be `tiny`, `base`, `small`, `medium`, or `large-v3`.
-- For CPU usage, start with `base` or `small`.
+- The default is `large-v3` for accuracy. For slow CPU-only machines, use `small` or `medium`.
 - Simplified Chinese is enforced with both prompt guidance and OpenCC fallback conversion.
 
 ### Start Backend
@@ -394,6 +401,14 @@ Open:
 http://127.0.0.1:5174/
 ```
 
+You can also build first and serve the production bundle locally. The built-in server proxies `/api` to `http://127.0.0.1:8090`:
+
+```powershell
+cd frontend
+npm run build
+npm run serve:dist
+```
+
 ### REST API
 
 | Method | Path | Description |
@@ -402,6 +417,7 @@ http://127.0.0.1:5174/
 | `GET` | `/api/v1/videos` | List videos |
 | `GET` | `/api/v1/videos/{id}` | Get video details |
 | `GET` | `/api/v1/videos/{id}/content` | Preview video content |
+| `DELETE` | `/api/v1/videos/{id}` | Delete a video and related detection records |
 | `POST` | `/api/v1/videos/{id}/jobs` | Create detection job |
 | `GET` | `/api/v1/jobs/{id}` | Query job progress |
 | `GET` | `/api/v1/jobs/{id}/segments` | Transcript segments |
@@ -443,6 +459,6 @@ SensitiveTerm,Sensitive Content,CRITICAL,EXACT,
 ### Notes
 
 - Local videos, model files, virtual environments, and FFmpeg binaries are not committed.
-- Whisper models are downloaded and cached locally on first use.
+- Whisper models are downloaded and cached locally by `openai-whisper` on first use.
 - Production deployments should add authentication, audit logs, object storage, a job queue, and model service monitoring.
 - AI review only checks rule-recalled candidates instead of reviewing every sentence blindly.

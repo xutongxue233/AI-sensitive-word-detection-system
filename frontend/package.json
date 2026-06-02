@@ -6,21 +6,37 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc -b && vite build",
-    "preview": "vite preview --host 127.0.0.1"
+    "preview": "vite preview --host 127.0.0.1",
+    "serve:dist": "node serve-dist.mjs"
   },
   "dependencies": {
-    "@ant-design/icons": "^5.5.1",
-    "antd": "^5.21.6",
+    "@radix-ui/react-alert-dialog": "^1.1.15",
+    "@radix-ui/react-dialog": "^1.1.15",
+    "@radix-ui/react-select": "^2.2.6",
+    "@radix-ui/react-separator": "^1.1.8",
+    "@radix-ui/react-slot": "^1.2.4",
+    "@radix-ui/react-switch": "^1.2.6",
+    "@radix-ui/react-tabs": "^1.1.13",
     "axios": "^1.7.7",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
     "dayjs": "^1.11.13",
+    "lucide-react": "^1.17.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "sonner": "^2.0.7",
+    "tailwind-merge": "^3.6.0",
+    "video.js": "^8.23.7"
   },
   "devDependencies": {
+    "@types/node": "^22.9.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
-    "@types/node": "^22.9.0",
     "@vitejs/plugin-react": "^4.3.3",
+    "autoprefixer": "^10.5.0",
+    "postcss": "^8.5.15",
+    "tailwindcss": "^3.4.17",
+    "tailwindcss-animate": "^1.0.7",
     "typescript": "^5.6.3",
     "vite": "^5.4.10"
   }

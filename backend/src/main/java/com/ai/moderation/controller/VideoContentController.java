@@ -59,11 +59,10 @@ public class VideoContentController {
         FileSystemResource resource = new FileSystemResource(path);
         MediaType mediaType = MediaType.parseMediaType(contentType);
         long contentLength = fileSize(path);
-        String filename = "inline; filename=\"" + path.getFileName() + "\"";
 
         if (requestHeaders.getRange().isEmpty()) {
             return ResponseEntity.ok()
-                    .header(HttpHeaders.CONTENT_DISPOSITION, filename)
+                    .header(HttpHeaders.CONTENT_DISPOSITION, "inline")
                     .header(HttpHeaders.ACCEPT_RANGES, "bytes")
                     .contentLength(contentLength)
                     .contentType(mediaType)
@@ -76,7 +75,7 @@ public class VideoContentController {
         long end = Math.min(requestedEnd, start + RANGE_CHUNK_SIZE - 1);
         byte[] chunk = readRange(path, start, end);
         return ResponseEntity.status(HttpStatus.PARTIAL_CONTENT)
-                .header(HttpHeaders.CONTENT_DISPOSITION, filename)
+                .header(HttpHeaders.CONTENT_DISPOSITION, "inline")
                 .header(HttpHeaders.ACCEPT_RANGES, "bytes")
                 .header(HttpHeaders.CONTENT_RANGE, "bytes " + start + "-" + end + "/" + contentLength)
                 .contentLength(chunk.length)
