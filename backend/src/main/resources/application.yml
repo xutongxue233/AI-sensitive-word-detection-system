@@ -1,0 +1,44 @@
+server:
+  port: 8090
+
+spring:
+  application:
+    name: video-moderation
+  datasource:
+    url: jdbc:mysql://localhost:3306/video_moderation?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true&createDatabaseIfNotExist=true
+    username: root
+    password: root
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  sql:
+    init:
+      mode: always
+      encoding: UTF-8
+      schema-locations: classpath:schema-mysql.sql
+  servlet:
+    multipart:
+      max-file-size: 2GB
+      max-request-size: 2GB
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+    default-enum-type-handler: org.apache.ibatis.type.EnumTypeHandler
+  global-config:
+    banner: false
+
+app:
+  storage:
+    root-path: ${user.dir}/storage
+  ffmpeg:
+    ffmpeg-path: ${FFMPEG_PATH:${user.dir}/tools/ffmpeg/bin/ffmpeg.exe}
+    ffprobe-path: ${FFPROBE_PATH:${user.dir}/tools/ffmpeg/bin/ffprobe.exe}
+  asr:
+    enabled: true
+    base-url: http://localhost:9000
+    transcribe-path: /transcribe
+  ai:
+    enabled: false
+    base-url: http://localhost:11434
+    api-key:
+    model: qwen2.5
+    timeout-seconds: 60
