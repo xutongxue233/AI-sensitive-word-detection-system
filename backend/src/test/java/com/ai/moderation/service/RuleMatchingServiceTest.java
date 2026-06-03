@@ -28,12 +28,14 @@ class RuleMatchingServiceTest {
         segmentRepository = mock(TranscriptSegmentRepository.class);
         wordRepository = mock(TranscriptWordRepository.class);
         hitRepository = mock(TermHitRepository.class);
+        TextNormalizer textNormalizer = new TextNormalizer();
         matchingService = new RuleMatchingService(
                 termRepository,
                 segmentRepository,
                 wordRepository,
                 hitRepository,
-                new TextNormalizer()
+                textNormalizer,
+                new SegmentTimeLocator(textNormalizer)
         );
         when(hitRepository.saveAll(anyList())).thenAnswer(invocation -> invocation.getArgument(0));
     }

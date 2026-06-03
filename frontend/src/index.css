@@ -1,0 +1,171 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 150 24% 97%;
+    --foreground: 168 28% 12%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 168 28% 12%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 168 28% 12%;
+
+    --primary: 167 71% 23%;
+    --primary-foreground: 150 40% 97%;
+
+    --secondary: 152 16% 93%;
+    --secondary-foreground: 168 24% 18%;
+
+    --muted: 152 16% 94%;
+    --muted-foreground: 165 10% 40%;
+
+    --accent: 158 64% 40%;
+    --accent-foreground: 150 40% 97%;
+
+    --destructive: 352 74% 47%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 156 16% 87%;
+    --input: 156 16% 85%;
+    --ring: 167 60% 30%;
+
+    --sidebar: 170 32% 8%;
+    --sidebar-foreground: 152 12% 72%;
+    --sidebar-accent: 167 56% 14%;
+    --sidebar-accent-foreground: 150 40% 96%;
+    --sidebar-border: 168 22% 16%;
+    --sidebar-ring: 158 64% 42%;
+
+    --sev-low: 199 89% 48%;
+    --sev-medium: 38 92% 50%;
+    --sev-high: 22 90% 53%;
+    --sev-critical: 352 80% 56%;
+
+    --radius: 0.6rem;
+  }
+
+  .dark {
+    --background: 170 26% 7%;
+    --foreground: 150 16% 90%;
+
+    --card: 170 22% 10%;
+    --card-foreground: 150 16% 90%;
+
+    --popover: 170 24% 9%;
+    --popover-foreground: 150 16% 90%;
+
+    --primary: 158 64% 44%;
+    --primary-foreground: 170 45% 8%;
+
+    --secondary: 168 16% 16%;
+    --secondary-foreground: 150 14% 86%;
+
+    --muted: 168 14% 15%;
+    --muted-foreground: 152 10% 58%;
+
+    --accent: 158 60% 40%;
+    --accent-foreground: 150 40% 96%;
+
+    --destructive: 352 70% 53%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 168 14% 18%;
+    --input: 168 14% 20%;
+    --ring: 158 64% 44%;
+
+    --sidebar: 172 34% 6%;
+    --sidebar-foreground: 152 12% 74%;
+    --sidebar-accent: 167 52% 13%;
+    --sidebar-accent-foreground: 150 40% 96%;
+    --sidebar-border: 168 20% 14%;
+    --sidebar-ring: 158 64% 44%;
+
+    --sev-low: 199 89% 58%;
+    --sev-medium: 38 95% 60%;
+    --sev-high: 22 92% 62%;
+    --sev-critical: 352 84% 66%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-feature-settings: 'cv05' 1, 'ss01' 1;
+  }
+
+  ::selection {
+    background: hsl(var(--primary) / 0.22);
+  }
+
+  /* Scrollbars */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--muted-foreground) / 0.35) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted-foreground) / 0.28);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.5);
+    background-clip: content-box;
+  }
+}
+
+@layer components {
+  /* Uppercase mono eyebrow label — the console signature */
+  .eyebrow {
+    @apply font-mono text-[10.5px] font-medium uppercase tracking-[0.22em] text-muted-foreground;
+  }
+
+  /* Tabular telemetry numerals */
+  .telemetry {
+    @apply font-mono tabular-nums;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Faint engineering grid backdrop */
+  .bg-grid {
+    background-image:
+      linear-gradient(to right, hsl(var(--foreground) / 0.045) 1px, transparent 1px),
+      linear-gradient(to bottom, hsl(var(--foreground) / 0.045) 1px, transparent 1px);
+    background-size: 32px 32px;
+  }
+
+  .bg-dots {
+    background-image: radial-gradient(hsl(var(--foreground) / 0.07) 1px, transparent 1px);
+    background-size: 18px 18px;
+  }
+}
+
+@layer utilities {
+  .mask-fade-r {
+    -webkit-mask-image: linear-gradient(to right, #000 84%, transparent 100%);
+    mask-image: linear-gradient(to right, #000 84%, transparent 100%);
+  }
+  .animate-delay-75 {
+    animation-delay: 75ms;
+  }
+  .animate-delay-150 {
+    animation-delay: 150ms;
+  }
+  .animate-delay-300 {
+    animation-delay: 300ms;
+  }
+}

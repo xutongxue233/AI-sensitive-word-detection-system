@@ -38,7 +38,13 @@ app:
     transcribe-path: /transcribe
   ai:
     enabled: false
+    api-type: chat
     base-url: http://localhost:11434
     api-key:
     model: qwen2.5
+    temperature: 0
+    confidence-threshold: 0.6
     timeout-seconds: 60
+  clip:
+    padding-seconds: 0.2
+    precise-export: false

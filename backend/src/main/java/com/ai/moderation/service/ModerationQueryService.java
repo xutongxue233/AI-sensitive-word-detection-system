@@ -53,7 +53,9 @@ public class ModerationQueryService {
                         hit.getReviewStatus(),
                         hit.getStartTime(),
                         hit.getEndTime(),
-                        hit.getContextText()
+                        hit.getContextText(),
+                        hit.getAiConfidence(),
+                        reviewRepository.findByHitId(hit.getId()).map(AiReview::getReason).orElse(null)
                 ))
                 .toList();
     }

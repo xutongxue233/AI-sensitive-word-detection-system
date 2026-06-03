@@ -103,6 +103,21 @@ CREATE TABLE IF NOT EXISTS ai_reviews (
     CONSTRAINT fk_ai_reviews_hit FOREIGN KEY (hit_id) REFERENCES term_hits(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS app_settings (
+    id BIGINT PRIMARY KEY,
+    ai_enabled TINYINT(1) NOT NULL DEFAULT 0,
+    ai_api_type VARCHAR(20) NOT NULL DEFAULT 'CHAT',
+    ai_base_url VARCHAR(500),
+    ai_api_key VARCHAR(500),
+    ai_model VARCHAR(120),
+    ai_temperature DOUBLE NOT NULL DEFAULT 0,
+    ai_confidence_threshold DOUBLE NOT NULL DEFAULT 0.6,
+    ai_timeout_seconds INT NOT NULL DEFAULT 60,
+    clip_padding_seconds DOUBLE NOT NULL DEFAULT 0.2,
+    clip_precise_export TINYINT(1) NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS clip_suggestions (
     id BIGINT PRIMARY KEY AUTO_INCREMENT,
     job_id BIGINT NOT NULL,

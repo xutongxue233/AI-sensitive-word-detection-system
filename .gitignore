@@ -19,3 +19,5 @@ tmp-smoke/
 *.wav
 .DS_Store
 Thumbs.db
+.idea/
+frontend/.preview/

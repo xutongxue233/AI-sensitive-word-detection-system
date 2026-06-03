@@ -59,6 +59,14 @@ public class FfmpegService {
     }
 
     public Path exportWithoutClips(Path inputVideo, Path outputDir, List<TimeRange> removeRanges, double durationSeconds) {
+        return exportWithoutClips(inputVideo, outputDir, removeRanges, durationSeconds, false);
+    }
+
+    /**
+     * @param precise true 时对保留片段重编码以实现帧级精确切割,避免流复制按关键帧吸附;
+     *                false 时使用流复制(快速,边界吸附到关键帧,倾向少切)。
+     */
+    public Path exportWithoutClips(Path inputVideo, Path outputDir, List<TimeRange> removeRanges, double durationSeconds, boolean precise) {
         try {
             Files.createDirectories(outputDir);
             List<TimeRange> keepRanges = buildKeepRanges(removeRanges, durationSeconds);
@@ -69,14 +77,22 @@ public class FfmpegService {
             for (int i = 0; i < keepRanges.size(); i++) {
                 TimeRange range = keepRanges.get(i);
                 Path part = outputDir.resolve("keep-" + i + ".mp4");
-                run(List.of(
+                List<String> command = new ArrayList<>(List.of(
                         properties.ffmpegPath(), "-y",
                         "-ss", formatSeconds(range.start()),
                         "-i", inputVideo.toString(),
-                        "-t", formatSeconds(range.end() - range.start()),
-                        "-c", "copy",
-                        part.toString()
+                        "-t", formatSeconds(range.end() - range.start())
                 ));
+                if (precise) {
+                    command.addAll(List.of(
+                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                            "-c:a", "aac"
+                    ));
+                } else {
+                    command.addAll(List.of("-c", "copy"));
+                }
+                command.add(part.toString());
+                run(command);
                 parts.add(part);
             }
             Path concatList = outputDir.resolve("concat.txt");

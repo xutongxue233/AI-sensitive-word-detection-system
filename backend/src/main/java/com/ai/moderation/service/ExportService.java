@@ -23,19 +23,22 @@ public class ExportService {
     private final DetectionJobRepository jobRepository;
     private final ClipSuggestionRepository suggestionRepository;
     private final FfmpegService ffmpegService;
+    private final SettingsService settingsService;
 
     public ExportService(
             StorageProperties storageProperties,
             VideoFileRepository videoRepository,
             DetectionJobRepository jobRepository,
             ClipSuggestionRepository suggestionRepository,
-            FfmpegService ffmpegService
+            FfmpegService ffmpegService,
+            SettingsService settingsService
     ) {
         this.storageProperties = storageProperties;
         this.videoRepository = videoRepository;
         this.jobRepository = jobRepository;
         this.suggestionRepository = suggestionRepository;
         this.ffmpegService = ffmpegService;
+        this.settingsService = settingsService;
     }
 
     @Transactional
@@ -62,7 +65,8 @@ public class ExportService {
                 .map(item -> new FfmpegService.TimeRange(item.getStartTime(), item.getEndTime()))
                 .toList();
         Path outputDir = Path.of(storageProperties.rootPath(), "exports", "video-" + videoId, "job-" + job.getId());
-        Path output = ffmpegService.exportWithoutClips(Path.of(video.getStoragePath()), outputDir, ranges, durationValue);
+        Path output = ffmpegService.exportWithoutClips(
+                Path.of(video.getStoragePath()), outputDir, ranges, durationValue, settingsService.currentClip().preciseExport());
         suggestions.forEach(suggestion -> {
             suggestion.setStatus(ClipStatus.EXPORTED);
             suggestion.setExportPath(output.toString());

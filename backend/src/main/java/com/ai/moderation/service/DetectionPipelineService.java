@@ -24,7 +24,7 @@ public class DetectionPipelineService {
     private final WhisperAsrClient whisperAsrClient;
     private final TranscriptService transcriptService;
     private final RuleMatchingService ruleMatchingService;
-    private final AiReviewService aiReviewService;
+    private final AiExtractionService aiExtractionService;
     private final ClipSuggestionService clipSuggestionService;
 
     public DetectionPipelineService(
@@ -35,7 +35,7 @@ public class DetectionPipelineService {
             WhisperAsrClient whisperAsrClient,
             TranscriptService transcriptService,
             RuleMatchingService ruleMatchingService,
-            AiReviewService aiReviewService,
+            AiExtractionService aiExtractionService,
             ClipSuggestionService clipSuggestionService
     ) {
         this.jobRepository = jobRepository;
@@ -45,7 +45,7 @@ public class DetectionPipelineService {
         this.whisperAsrClient = whisperAsrClient;
         this.transcriptService = transcriptService;
         this.ruleMatchingService = ruleMatchingService;
-        this.aiReviewService = aiReviewService;
+        this.aiExtractionService = aiExtractionService;
         this.clipSuggestionService = clipSuggestionService;
     }
 
@@ -64,10 +64,10 @@ public class DetectionPipelineService {
             ruleMatchingService.matchJob(job);
 
             mark(job, JobStatus.AI_REVIEWING, 75);
-            aiReviewService.reviewJob(job.getId());
+            aiExtractionService.extractAndReview(job.getId());
 
             mark(job, JobStatus.SUGGESTING_CLIPS, 90);
-            clipSuggestionService.createSuggestions(job.getId(), 1.0);
+            clipSuggestionService.createSuggestions(job.getId());
 
             job.setStatus(JobStatus.COMPLETED);
             job.setProgress(100);

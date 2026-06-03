@@ -52,7 +52,7 @@ public class JobController {
 
     @PostMapping("/jobs/{id}/clip-suggestions")
     public List<ClipSuggestionResponse> createSuggestions(@PathVariable Long id) {
-        return clipSuggestionService.createSuggestions(id, 1.0);
+        return clipSuggestionService.createSuggestions(id);
     }
 
     @PatchMapping("/clip-suggestions/{id}")

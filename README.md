@@ -14,12 +14,13 @@ AI 敏感词检测系统是一个基于 `Spring Boot + React` 的视频内容审
 - 多种匹配方式：精确词、变体词、正则词、语义规则。
 - 视频上传：支持视频文件上传，可选上传 `.srt/.vtt` 字幕。
 - 音频抽取：通过 FFmpeg 将视频音频转为 16kHz mono wav。
-- Whisper ASR：通过本地 `faster-whisper` 服务生成句段和词级时间戳。
+- Whisper ASR：通过本地 `openai/whisper` 服务生成句段和词级时间戳。
 - 简体中文输出：ASR 使用简体中文提示词，并用 OpenCC 做繁转简兜底。
 - 规则召回：先用词库规则找到候选命中，降低 AI 审核成本。
-- AI 复核：只复核候选上下文，输出违规判断、原因和置信度。
-- 时间轴展示：展示违规词出现的起止时间。
-- 剪辑建议：默认按命中词前后各 1 秒生成剪辑片段。
+- AI 复核：对接 OpenAI 兼容接口（Chat Completions 与 Responses 两种形态可配置切换），只复核候选上下文，输出违规判断、原因和置信度。
+- 置信度把关：只有 AI 确认违规且置信度达到阈值（默认 0.6）的命中才进入违规时间轴并生成剪辑，低置信命中保留记录与原因但不自动剪，减少误剪。
+- 时间轴展示：展示违规词出现的起止时间，并附 AI 置信度与判定原因。
+- 剪辑建议：基于 Whisper 词级时间戳，按命中词前后各留白 `app.clip.padding-seconds`（默认 0.2 秒）生成剪辑片段，避免切掉过多时间轴。
 - 管理员确认：确认、忽略或手动调整剪辑片段。
 - 视频导出：确认后调用 FFmpeg 导出去违规版本视频。
 
@@ -29,7 +30,7 @@ AI 敏感词检测系统是一个基于 `Spring Boot + React` 的视频内容审
 | --- | --- |
 | 后端 | Spring Boot 3.3, Java 21, MyBatis-Plus, MySQL |
 | 前端 | React 18, TypeScript, Vite, Ant Design |
-| ASR | FastAPI, faster-whisper, OpenCC |
+| ASR | FastAPI, openai-whisper, OpenCC |
 | 媒体处理 | FFmpeg, ffprobe |
 | 数据库 | MySQL 8+ |
 
@@ -39,7 +40,7 @@ AI 敏感词检测系统是一个基于 `Spring Boot + React` 的视频内容审
 .
 ├── backend/      # Spring Boot 后端 API、检测管线、MyBatis-Plus Mapper
 ├── frontend/     # React + Vite 前端审核工作台
-├── asr-service/  # FastAPI + faster-whisper 本地 ASR 服务
+├── asr-service/  # FastAPI + openai/whisper 本地 ASR 服务
 └── README.md
 ```
 
@@ -120,9 +121,9 @@ py -3.10 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\pip.exe install -r requirements.txt
 
-$env:WHISPER_MODEL='base'
+$env:WHISPER_MODEL='large-v3'
 $env:WHISPER_DEVICE='cpu'
-$env:WHISPER_COMPUTE_TYPE='int8'
+$env:WHISPER_FP16='false'
 $env:WHISPER_LANGUAGE='zh'
 $env:WHISPER_CHINESE_CONVERTER='t2s'
 $env:WHISPER_INITIAL_PROMPT='请使用简体中文转写普通话内容。'
@@ -133,8 +134,9 @@ $env:WHISPER_INITIAL_PROMPT='请使用简体中文转写普通话内容。'
 说明：
 
 - 第一次识别会下载 Whisper 模型。
-- `WHISPER_MODEL` 可改为 `tiny/base/small/medium/large-v3`。
-- CPU 环境建议先使用 `base` 或 `small`。
+- `WHISPER_MODEL` 可改为 `tiny/base/small/medium/large/large-v3/turbo`。
+- 当前默认使用 `large-v3`；CPU 环境会更慢，如只验证流程可临时改为 `base` 或 `small`。
+- CPU 环境保持 `WHISPER_FP16=false`；使用 CUDA 时可按硬件情况改为 `true`。
 - 默认输出会使用简体中文提示词，并通过 OpenCC 做繁转简。
 
 ### 启动后端
@@ -156,6 +158,37 @@ app:
 ```
 
 如果你只想使用字幕文件检测，可以把 `app.asr.enabled` 改为 `false`。
+
+### AI 复核（OpenAI 兼容）
+
+AI 复核与剪辑参数支持**前台即时配置**：在界面右上角点击齿轮图标打开「系统设置」，修改后对新建的检测任务立即生效，无需改文件或重启后端。设置持久化在数据库 `app_settings` 表（单行）。
+
+`application.yml` 中的 `app.ai.*` / `app.clip.*` 仅作为**首次启动的初始默认值**（数据库无记录时种子化）：
+
+```yaml
+app:
+  ai:
+    enabled: false          # 改为 true 启用 AI 复核
+    api-type: chat          # chat = /v1/chat/completions；responses = /v1/responses
+    base-url: http://localhost:11434
+    api-key:                # 需要鉴权时填入，作为 Authorization: Bearer
+    model: qwen2.5
+    temperature: 0          # 设为负数则不下发该参数（适配不支持自定义温度的推理模型）
+    confidence-threshold: 0.6  # 置信度阈值：低于该值的命中不进入时间轴/剪辑
+    timeout-seconds: 60
+  clip:
+    padding-seconds: 0.2    # 剪辑在命中词前后各留白的秒数，越小切得越少
+    precise-export: false   # true 时导出重编码以帧级精确切割；false 为快速流复制
+```
+
+说明：
+
+- 这些项均可在前台「系统设置」中调整；`application.yml` 改动只影响数据库尚无记录时的首次种子化。
+- 两种形态都使用结构化输出（`json_schema`，字段 `violation/confidence/category/reason`），并对仅支持 `json_object` 的国产网关 / Ollama 做了兼容兜底。
+- `api-type=chat` 兼容性最广（Ollama、vLLM、one-api、new-api 等）；`api-type=responses` 用于 OpenAI 新版 Responses 接口，请确认你的服务商支持该端点。
+- 置信度把关：命中经 AI 复核后，仅当 `violation=true` 且 `confidence >= confidence-threshold` 才标记为违规；其余置为安全状态，仍可在「命中与 AI 复核」表中查看其置信度与原因。
+- 关闭 AI 时，规则命中按 0.70 置信度全部保留为违规，便于人工兜底。
+- 出于安全考虑，`GET /api/v1/settings` 不回传明文 API Key，仅返回 `aiApiKeyConfigured` 标记是否已配置；前台保存时留空即保持原 Key 不变。
 
 ### 启动前端
 
@@ -190,6 +223,8 @@ http://127.0.0.1:5174/
 | `POST` | `/api/v1/videos/{id}/exports` | 导出去违规视频 |
 | `GET/POST/PATCH/DELETE` | `/api/v1/terms` | 维护违规词 |
 | `POST` | `/api/v1/terms/import` | CSV 导入违规词 |
+| `GET` | `/api/v1/settings` | 读取系统设置（AI/剪辑，屏蔽 API Key） |
+| `PUT` | `/api/v1/settings` | 更新系统设置（前台即时生效） |
 
 ### 价格/金额这类模糊表达
 
@@ -220,7 +255,7 @@ term,category,severity,matchType,variants
 ### 注意事项
 
 - 本项目不会提交本地视频、模型、虚拟环境、FFmpeg 二进制文件。
-- ASR 模型由 faster-whisper 首次运行时下载并缓存到本机。
+- ASR 模型由 openai-whisper 首次运行时下载并缓存到本机。
 - 真实生产环境建议增加鉴权、审计日志、对象存储、任务队列和模型服务监控。
 - AI 复核只处理规则召回候选，不做全文无差别审核。
 
@@ -243,9 +278,10 @@ The system is designed for auditability and precise timeline positioning instead
 - Whisper ASR: generate segment-level and word-level timestamps.
 - Simplified Chinese output: ASR uses a Simplified Chinese prompt and OpenCC fallback conversion.
 - Rule recall: find candidate hits before AI review.
-- AI review: review only candidate contexts and return status, confidence, and reason.
-- Timeline view: show where sensitive words appear in the video.
-- Clip suggestions: default range is hit start minus 1 second to hit end plus 1 second.
+- AI review: call an OpenAI-compatible API (Chat Completions or Responses, switchable via `app.ai.api-type`) to review only candidate contexts and return violation, confidence, and reason.
+- Confidence gating: only hits the AI confirms as violations with `confidence >= app.ai.confidence-threshold` (default 0.6) enter the timeline and produce clips; low-confidence hits are kept and explained but not auto-clipped.
+- Timeline view: show where sensitive words appear, with AI confidence and reason.
+- Clip suggestions: based on Whisper word-level timestamps, padded by `app.clip.padding-seconds` (default 0.2s) on each side to avoid cutting too much.
 - Admin confirmation: confirm, ignore, or adjust suggested clips.
 - Export: generate moderated videos after confirmed clip removal.
 
@@ -255,7 +291,7 @@ The system is designed for auditability and precise timeline positioning instead
 | --- | --- |
 | Backend | Spring Boot 3.3, Java 21, MyBatis-Plus, MySQL |
 | Frontend | React 18, TypeScript, Vite, Ant Design |
-| ASR | FastAPI, faster-whisper, OpenCC |
+| ASR | FastAPI, openai-whisper, OpenCC |
 | Media | FFmpeg, ffprobe |
 | Database | MySQL 8+ |
 
@@ -265,7 +301,7 @@ The system is designed for auditability and precise timeline positioning instead
 .
 ├── backend/      # Spring Boot APIs, detection pipeline, MyBatis-Plus mappers
 ├── frontend/     # React + Vite moderation console
-├── asr-service/  # FastAPI + faster-whisper local ASR service
+├── asr-service/  # FastAPI + openai/whisper local ASR service
 └── README.md
 ```
 
@@ -343,9 +379,9 @@ py -3.10 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\pip.exe install -r requirements.txt
 
-$env:WHISPER_MODEL='base'
+$env:WHISPER_MODEL='large-v3'
 $env:WHISPER_DEVICE='cpu'
-$env:WHISPER_COMPUTE_TYPE='int8'
+$env:WHISPER_FP16='false'
 $env:WHISPER_LANGUAGE='zh'
 $env:WHISPER_CHINESE_CONVERTER='t2s'
 $env:WHISPER_INITIAL_PROMPT='请使用简体中文转写普通话内容。'
@@ -356,8 +392,9 @@ $env:WHISPER_INITIAL_PROMPT='请使用简体中文转写普通话内容。'
 Notes:
 
 - The Whisper model is downloaded on first use.
-- `WHISPER_MODEL` can be `tiny`, `base`, `small`, `medium`, or `large-v3`.
-- For CPU usage, start with `base` or `small`.
+- `WHISPER_MODEL` can be `tiny`, `base`, `small`, `medium`, `large`, `large-v3`, or `turbo`.
+- The default is `large-v3`; CPU inference is slower, so use `base` or `small` only for quick workflow checks.
+- Keep `WHISPER_FP16=false` on CPU; set it to `true` only when your CUDA hardware supports it.
 - Simplified Chinese is enforced with both prompt guidance and OpenCC fallback conversion.
 
 ### Start Backend
@@ -413,6 +450,8 @@ http://127.0.0.1:5174/
 | `POST` | `/api/v1/videos/{id}/exports` | Export moderated video |
 | `GET/POST/PATCH/DELETE` | `/api/v1/terms` | Manage sensitive terms |
 | `POST` | `/api/v1/terms/import` | Import terms from CSV |
+| `GET` | `/api/v1/settings` | Read system settings (AI/clip, API key masked) |
+| `PUT` | `/api/v1/settings` | Update system settings (effective immediately) |
 
 ### Semantic Price Rules
 

@@ -11,7 +11,8 @@ public record TimelineItemResponse(
         ReviewStatus reviewStatus,
         double startTime,
         double endTime,
-        String contextText
+        String contextText,
+        Double aiConfidence,
+        String aiReason
 ) {
 }
-

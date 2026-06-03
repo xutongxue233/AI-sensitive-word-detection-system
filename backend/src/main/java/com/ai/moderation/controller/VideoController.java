@@ -32,6 +32,12 @@ public class VideoController {
         return videoService.getVideo(id);
     }
 
+    @DeleteMapping("/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void deleteVideo(@PathVariable Long id) {
+        videoService.deleteVideo(id);
+    }
+
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
     public VideoResponse upload(

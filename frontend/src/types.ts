@@ -97,6 +97,8 @@ export interface TimelineItem {
   startTime: number;
   endTime: number;
   contextText?: string;
+  aiConfidence?: number;
+  aiReason?: string;
 }
 
 export interface ClipSuggestion {
@@ -108,6 +110,7 @@ export interface ClipSuggestion {
   paddingSeconds: number;
   status: ClipStatus;
   exportPath?: string;
+  aiConfidence?: number;
 }
 
 export interface ExportResult {
@@ -115,6 +118,50 @@ export interface ExportResult {
   jobId: number;
   exportPath: string;
   removedClipCount: number;
+}
+
+export type AiApiType = 'CHAT' | 'RESPONSES';
+
+export interface AppSettings {
+  aiEnabled: boolean;
+  aiApiType: AiApiType;
+  aiBaseUrl: string;
+  aiApiKeyConfigured: boolean;
+  aiModel: string;
+  aiTemperature: number;
+  aiConfidenceThreshold: number;
+  aiTimeoutSeconds: number;
+  clipPaddingSeconds: number;
+  clipPreciseExport: boolean;
+}
+
+export interface AppSettingsUpdate {
+  aiEnabled?: boolean;
+  aiApiType?: AiApiType;
+  aiBaseUrl?: string;
+  aiApiKey?: string;
+  aiModel?: string;
+  aiTemperature?: number;
+  aiConfidenceThreshold?: number;
+  aiTimeoutSeconds?: number;
+  clipPaddingSeconds?: number;
+  clipPreciseExport?: boolean;
+}
+
+export interface AiConnectionTestRequest {
+  aiApiType?: AiApiType;
+  aiBaseUrl?: string;
+  aiApiKey?: string;
+  aiModel?: string;
+  aiTemperature?: number;
+  aiTimeoutSeconds?: number;
+}
+
+export interface AiConnectionTestResponse {
+  ok: boolean;
+  message: string;
+  model: string;
+  elapsedMs: number;
 }
 
 export interface TermImportResult {

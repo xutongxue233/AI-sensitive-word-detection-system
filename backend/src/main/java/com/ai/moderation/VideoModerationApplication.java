@@ -2,6 +2,7 @@ package com.ai.moderation;
 
 import com.ai.moderation.config.AiProperties;
 import com.ai.moderation.config.AsrProperties;
+import com.ai.moderation.config.ClipProperties;
 import com.ai.moderation.config.FfmpegProperties;
 import com.ai.moderation.config.StorageProperties;
 import org.mybatis.spring.annotation.MapperScan;
@@ -17,7 +18,8 @@ import org.springframework.scheduling.annotation.EnableAsync;
         StorageProperties.class,
         FfmpegProperties.class,
         AsrProperties.class,
-        AiProperties.class
+        AiProperties.class,
+        ClipProperties.class
 })
 public class VideoModerationApplication {
     public static void main(String[] args) {

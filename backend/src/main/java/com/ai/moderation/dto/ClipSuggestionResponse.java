@@ -11,9 +11,10 @@ public record ClipSuggestionResponse(
         double endTime,
         double paddingSeconds,
         ClipStatus status,
-        String exportPath
+        String exportPath,
+        Double aiConfidence
 ) {
-    public static ClipSuggestionResponse from(ClipSuggestion suggestion, String matchedText) {
+    public static ClipSuggestionResponse from(ClipSuggestion suggestion, String matchedText, Double aiConfidence) {
         return new ClipSuggestionResponse(
                 suggestion.getId(),
                 suggestion.getHitId(),
@@ -22,7 +23,8 @@ public record ClipSuggestionResponse(
                 suggestion.getEndTime(),
                 suggestion.getPaddingSeconds(),
                 suggestion.getStatus(),
-                suggestion.getExportPath()
+                suggestion.getExportPath(),
+                aiConfidence
         );
     }
 }

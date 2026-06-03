@@ -4,12 +4,20 @@ import com.ai.moderation.common.ApiException;
 import com.ai.moderation.config.StorageProperties;
 import com.ai.moderation.domain.DetectionJob;
 import com.ai.moderation.domain.JobStatus;
+import com.ai.moderation.domain.TermHit;
 import com.ai.moderation.domain.VideoFile;
 import com.ai.moderation.domain.VideoStatus;
 import com.ai.moderation.dto.JobResponse;
 import com.ai.moderation.dto.VideoResponse;
+import com.ai.moderation.repository.AiReviewRepository;
+import com.ai.moderation.repository.ClipSuggestionRepository;
 import com.ai.moderation.repository.DetectionJobRepository;
+import com.ai.moderation.repository.TermHitRepository;
+import com.ai.moderation.repository.TranscriptSegmentRepository;
+import com.ai.moderation.repository.TranscriptWordRepository;
 import com.ai.moderation.repository.VideoFileRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -19,34 +27,53 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDate;
+import java.util.Comparator;
 import java.util.List;
 import java.util.UUID;
+import java.util.stream.Stream;
 
 @Service
 public class VideoService {
+    private static final Logger log = LoggerFactory.getLogger(VideoService.class);
+
     private final StorageProperties storageProperties;
     private final VideoFileRepository videoRepository;
     private final DetectionJobRepository jobRepository;
     private final DetectionPipelineService detectionPipelineService;
     private final FfmpegService ffmpegService;
+    private final TermHitRepository hitRepository;
+    private final AiReviewRepository reviewRepository;
+    private final ClipSuggestionRepository clipSuggestionRepository;
+    private final TranscriptSegmentRepository segmentRepository;
+    private final TranscriptWordRepository wordRepository;
 
     public VideoService(
             StorageProperties storageProperties,
             VideoFileRepository videoRepository,
             DetectionJobRepository jobRepository,
             DetectionPipelineService detectionPipelineService,
-            FfmpegService ffmpegService
+            FfmpegService ffmpegService,
+            TermHitRepository hitRepository,
+            AiReviewRepository reviewRepository,
+            ClipSuggestionRepository clipSuggestionRepository,
+            TranscriptSegmentRepository segmentRepository,
+            TranscriptWordRepository wordRepository
     ) {
         this.storageProperties = storageProperties;
         this.videoRepository = videoRepository;
         this.jobRepository = jobRepository;
         this.detectionPipelineService = detectionPipelineService;
         this.ffmpegService = ffmpegService;
+        this.hitRepository = hitRepository;
+        this.reviewRepository = reviewRepository;
+        this.clipSuggestionRepository = clipSuggestionRepository;
+        this.segmentRepository = segmentRepository;
+        this.wordRepository = wordRepository;
     }
 
     @Transactional(readOnly = true)
     public List<VideoResponse> listVideos() {
-        return videoRepository.findAll().stream().map(VideoResponse::from).toList();
+        return videoRepository.findAllByOrderByCreatedAtDesc().stream().map(VideoResponse::from).toList();
     }
 
     @Transactional(readOnly = true)
@@ -103,6 +130,66 @@ public class VideoService {
     @Transactional(readOnly = true)
     public List<JobResponse> listJobs(Long videoId) {
         return jobRepository.findByVideoIdOrderByCreatedAtDesc(videoId).stream().map(JobResponse::from).toList();
+    }
+
+    /**
+     * 删除视频及其全部关联数据:逐个检测任务清理 term_hits/ai_reviews/clip_suggestions
+     * 与转写 segments/words,再删任务与视频记录,最后清理磁盘上的视频/字幕文件。
+     */
+    @Transactional
+    public void deleteVideo(Long id) {
+        VideoFile video = findVideo(id);
+        List<DetectionJob> jobs = jobRepository.findByVideoIdOrderByCreatedAtDesc(id);
+        for (DetectionJob job : jobs) {
+            List<TermHit> hits = hitRepository.findByJobIdOrderByStartTimeAsc(job.getId());
+            reviewRepository.deleteByHitIds(hits.stream().map(TermHit::getId).toList());
+            hitRepository.deleteByJobId(job.getId());
+            clipSuggestionRepository.deleteByJobId(job.getId());
+            segmentRepository.deleteByJobId(job.getId());
+            wordRepository.deleteByJobId(job.getId());
+        }
+        jobRepository.deleteByVideoId(id);
+        videoRepository.deleteById(id);
+        deleteStorageFiles(video);
+    }
+
+    /**
+     * 删除磁盘文件,优先删整个 uuid 目录(上传时视频与字幕同放该目录);
+     * 文件缺失或清理失败只记录日志,不影响数据库删除已提交的结果。
+     */
+    private void deleteStorageFiles(VideoFile video) {
+        try {
+            Path videoPath = video.getStoragePath() == null ? null : Path.of(video.getStoragePath());
+            Path uuidDir = videoPath == null ? null : videoPath.getParent();
+            if (uuidDir != null && Files.isDirectory(uuidDir) && isInsideStorageRoot(uuidDir)) {
+                try (Stream<Path> walk = Files.walk(uuidDir)) {
+                    walk.sorted(Comparator.reverseOrder()).forEach(path -> {
+                        try {
+                            Files.deleteIfExists(path);
+                        } catch (IOException ex) {
+                            log.warn("删除文件失败 {}: {}", path, ex.getMessage());
+                        }
+                    });
+                }
+                return;
+            }
+            // 目录结构不符合预期时,退而删除已知的单个文件
+            deleteIfPresent(video.getStoragePath());
+            deleteIfPresent(video.getSubtitlePath());
+        } catch (IOException ex) {
+            log.warn("清理视频存储目录失败 videoId={}: {}", video.getId(), ex.getMessage());
+        }
+    }
+
+    private boolean isInsideStorageRoot(Path dir) {
+        Path root = Path.of(storageProperties.rootPath()).toAbsolutePath().normalize();
+        return dir.toAbsolutePath().normalize().startsWith(root);
+    }
+
+    private void deleteIfPresent(String path) throws IOException {
+        if (path != null && !path.isBlank()) {
+            Files.deleteIfExists(Path.of(path));
+        }
     }
 
     private VideoFile findVideo(Long id) {

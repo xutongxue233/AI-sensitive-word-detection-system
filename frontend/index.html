@@ -1,13 +1,26 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" class="">
   <head>
     <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AI 视频违规词检测系统</title>
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#0f1d18" />
+    <title>AI 视频违规词检测系统 · 审核控制台</title>
+    <script>
+      // 在首屏绘制前应用主题，避免暗色模式闪烁
+      (function () {
+        try {
+          var stored = localStorage.getItem('vm-theme');
+          if (stored === 'dark') {
+            document.documentElement.classList.add('dark');
+          }
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
-
