@@ -177,6 +177,7 @@ public class RuleMatchingService {
         hit.setCategory(term.getCategory());
         hit.setSeverity(term.getSeverity());
         hit.setRuleSource(term.getMatchType());
+        hit.setSource(segment.getSource() == null ? TranscriptSource.AUDIO : segment.getSource());
         hit.setStartTime(Math.max(segment.getStartTime(), startTime));
         hit.setEndTime(Math.min(segment.getEndTime(), Math.max(endTime, startTime + 0.2)));
         hit.setContextText(context);

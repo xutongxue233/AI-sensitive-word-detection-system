@@ -50,6 +50,7 @@ public class ModerationQueryService {
                         hit.getMatchedText(),
                         hit.getCategory(),
                         hit.getSeverity(),
+                        hit.getSource(),
                         hit.getReviewStatus(),
                         hit.getStartTime(),
                         hit.getEndTime(),
@@ -72,4 +73,3 @@ public class ModerationQueryService {
     public record HitStatusRequest(ReviewStatus status) {
     }
 }
-

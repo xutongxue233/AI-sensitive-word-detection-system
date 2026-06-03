@@ -62,6 +62,7 @@ import type {
   Severity,
   TermHit,
   TimelineItem,
+  TranscriptSource,
   TranscriptSegment,
   VideoFile,
   ViolationTerm
@@ -147,6 +148,12 @@ const NAV = [
   }
 ];
 
+const TRANSCRIPT_SOURCE: Record<TranscriptSource, { label: string; tone: 'neutral' | 'primary' | 'success' | 'info' | 'warn' | 'danger' }> = {
+  AUDIO: { label: '音频', tone: 'primary' },
+  SUBTITLE_FILE: { label: '字幕文件', tone: 'info' },
+  VIDEO_SUBTITLE: { label: '画面字幕', tone: 'warn' }
+};
+
 function useTheme() {
   const [theme, setTheme] = useState<'light' | 'dark'>(() =>
     typeof document !== 'undefined' && document.documentElement.classList.contains('dark') ? 'dark' : 'light'
@@ -230,7 +237,7 @@ function Sidebar({ active, onNavigate }: { active: NavKey; onNavigate: (key: Nav
           <Eyebrow className="text-sidebar-foreground/50">系统状态</Eyebrow>
           <div className="mt-2.5 space-y-2 text-[12px]">
             <StatusLine label="检测流水线" ok />
-            <StatusLine label="Whisper ASR" ok />
+            <StatusLine label="ASR / 字幕 OCR" ok />
             <StatusLine label="数据来源" ok note="后端" />
           </div>
         </div>
@@ -426,7 +433,7 @@ function VideosPage() {
   const exportModerated = async (video: VideoFile) => {
     try {
       const result = await exportVideo(video.id);
-      toast.success(`已导出，删除片段 ${result.removedClipCount} 个`);
+      toast.success(`已导出，处理建议 ${result.removedClipCount} 个`);
       load();
     } catch (error) {
       toast.error(getErrorMessage(error, '导出失败'));
@@ -480,7 +487,7 @@ function VideosPage() {
               <div>
                 <div className="text-sm font-medium">字幕文件（可选）</div>
                 <div className="text-[12px] text-muted-foreground">
-                  选择后再上传视频；未选择时将抽取音频并调用 Whisper ASR。
+                  上传后会检测音频层；选择字幕文件后作为字幕层，未选择时用 PaddleOCR 扫描画面字幕。
                 </div>
               </div>
             </div>
@@ -530,7 +537,7 @@ function VideosPage() {
               <Progress value={progress} className="mx-auto mt-3 h-1.5 w-56" />
             ) : (
               <div className="mt-1 text-[13px] text-muted-foreground">
-                支持常见视频格式 · 系统优先解析字幕，无字幕时调用本地 Whisper ASR
+                支持常见视频格式 · 音频层调用 Whisper ASR，字幕层优先解析字幕文件，否则使用 PaddleOCR
               </div>
             )}
           </Dropzone>
@@ -934,6 +941,9 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
                               <div className="max-w-[260px] space-y-0.5">
                                 <div className="flex items-center gap-2">
                                   <span className="font-medium">{item.matchedText}</span>
+                                  <Pill tone={TRANSCRIPT_SOURCE[item.source]?.tone ?? 'neutral'} dot={false}>
+                                    {TRANSCRIPT_SOURCE[item.source]?.label ?? item.source}
+                                  </Pill>
                                   {item.aiConfidence !== undefined && (
                                     <span className="telemetry text-[11px] text-muted-foreground">
                                       AI {Math.round(item.aiConfidence * 100)}%
@@ -968,6 +978,9 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
                         className="flex items-center gap-3 rounded-md border border-border bg-card px-3 py-2"
                       >
                         <SeverityBadge severity={item.severity} />
+                        <Pill tone={TRANSCRIPT_SOURCE[item.source]?.tone ?? 'neutral'} dot={false}>
+                          {TRANSCRIPT_SOURCE[item.source]?.label ?? item.source}
+                        </Pill>
                         <span className="font-medium">{item.matchedText}</span>
                         <span className="telemetry shrink-0 text-[12px] text-muted-foreground">
                           {seconds(item.startTime)} – {seconds(item.endTime)}
@@ -1007,6 +1020,7 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
                   <TableHeader>
                     <TableRow className="hover:bg-transparent">
                       <TableHead>违规词</TableHead>
+                      <TableHead className="w-[96px]">处理</TableHead>
                       <TableHead className="w-[150px]">开始 (秒)</TableHead>
                       <TableHead className="w-[150px]">结束 (秒)</TableHead>
                       <TableHead className="w-[88px]">置信度</TableHead>
@@ -1021,6 +1035,11 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
                       return (
                         <TableRow key={record.id}>
                           <TableCell className="font-medium">{record.matchedText}</TableCell>
+                          <TableCell>
+                            <Pill tone={TRANSCRIPT_SOURCE[record.source]?.tone ?? 'neutral'} dot={false}>
+                              {record.action === 'BLUR_SUBTITLE' ? '遮盖字幕' : '删除音频段'}
+                            </Pill>
+                          </TableCell>
                           <TableCell>
                             <NumberField
                               value={record.startTime}
@@ -1094,6 +1113,7 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
                     <TableHeader>
                       <TableRow className="hover:bg-transparent">
                         <TableHead>词</TableHead>
+                        <TableHead className="w-[96px]">来源</TableHead>
                         <TableHead className="w-[150px]">时间</TableHead>
                         <TableHead className="w-[92px]">判定</TableHead>
                         <TableHead className="w-[88px]">置信度</TableHead>
@@ -1106,6 +1126,11 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
                         return (
                           <TableRow key={hit.id}>
                             <TableCell className="font-medium">{hit.matchedText}</TableCell>
+                            <TableCell>
+                              <Pill tone={TRANSCRIPT_SOURCE[hit.source]?.tone ?? 'neutral'} dot={false}>
+                                {TRANSCRIPT_SOURCE[hit.source]?.label ?? hit.source}
+                              </Pill>
+                            </TableCell>
                             <TableCell className="telemetry text-[12px] text-muted-foreground">
                               {seconds(hit.startTime)} – {seconds(hit.endTime)}
                             </TableCell>
@@ -1151,6 +1176,9 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
                         <span className="telemetry shrink-0 rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
                           {seconds(segment.startTime)} – {seconds(segment.endTime)}
                         </span>
+                        <Pill tone={TRANSCRIPT_SOURCE[segment.source]?.tone ?? 'neutral'} dot={false}>
+                          {TRANSCRIPT_SOURCE[segment.source]?.label ?? segment.source}
+                        </Pill>
                         <span className="text-[13px] leading-relaxed">{segment.text}</span>
                       </div>
                     ))}

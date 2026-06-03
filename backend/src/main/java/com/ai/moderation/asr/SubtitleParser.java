@@ -1,5 +1,6 @@
 package com.ai.moderation.asr;
 
+import com.ai.moderation.domain.TranscriptSource;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
@@ -22,6 +23,10 @@ public class SubtitleParser {
     }
 
     public TranscriptionResult parse(Path subtitlePath) throws IOException {
+        return parse(subtitlePath, TranscriptSource.SUBTITLE_FILE);
+    }
+
+    public TranscriptionResult parse(Path subtitlePath, TranscriptSource source) throws IOException {
         List<String> lines = Files.readAllLines(subtitlePath, StandardCharsets.UTF_8);
         List<TranscriptionSegment> segments = new ArrayList<>();
         int i = 0;
@@ -48,7 +53,8 @@ public class SubtitleParser {
                 i++;
             }
             String segmentText = text.toString();
-            segments.add(new TranscriptionSegment(start, end, segmentText, inferWords(segmentText, start, end)));
+            segments.add(new TranscriptionSegment(start, end, segmentText, inferWords(segmentText, start, end),
+                    source, null, null, null, null));
         }
         return new TranscriptionResult(segments);
     }
@@ -83,4 +89,3 @@ public class SubtitleParser {
         return Double.parseDouble(clean);
     }
 }
-

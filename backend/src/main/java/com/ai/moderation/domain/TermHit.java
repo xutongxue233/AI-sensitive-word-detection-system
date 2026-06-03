@@ -29,6 +29,8 @@ public class TermHit implements Identifiable {
 
     private MatchType ruleSource;
 
+    private TranscriptSource source = TranscriptSource.AUDIO;
+
     private double startTime;
 
     private double endTime;

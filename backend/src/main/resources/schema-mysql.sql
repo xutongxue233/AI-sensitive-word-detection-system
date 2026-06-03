@@ -50,6 +50,11 @@ CREATE TABLE IF NOT EXISTS transcript_segments (
     start_time DOUBLE NOT NULL,
     end_time DOUBLE NOT NULL,
     text TEXT NOT NULL,
+    source VARCHAR(20) NOT NULL DEFAULT 'AUDIO',
+    bbox_x DOUBLE,
+    bbox_y DOUBLE,
+    bbox_width DOUBLE,
+    bbox_height DOUBLE,
     KEY idx_segments_job (job_id),
     CONSTRAINT fk_segments_job FOREIGN KEY (job_id) REFERENCES detection_jobs(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -78,6 +83,7 @@ CREATE TABLE IF NOT EXISTS term_hits (
     category VARCHAR(80),
     severity VARCHAR(20) NOT NULL,
     rule_source VARCHAR(20) NOT NULL,
+    source VARCHAR(20) NOT NULL DEFAULT 'AUDIO',
     start_time DOUBLE NOT NULL,
     end_time DOUBLE NOT NULL,
     context_text TEXT,

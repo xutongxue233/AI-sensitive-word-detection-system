@@ -1,6 +1,7 @@
 export type Severity = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
 export type MatchType = 'EXACT' | 'VARIANT' | 'REGEX' | 'SEMANTIC';
 export type VideoStatus = 'UPLOADED' | 'DETECTING' | 'DETECTED' | 'EXPORTED' | 'FAILED';
+export type TranscriptSource = 'AUDIO' | 'SUBTITLE_FILE' | 'VIDEO_SUBTITLE';
 export type JobStatus =
   | 'QUEUED'
   | 'EXTRACTING_AUDIO'
@@ -61,6 +62,11 @@ export interface TranscriptSegment {
   startTime: number;
   endTime: number;
   text: string;
+  source: TranscriptSource;
+  bboxX?: number;
+  bboxY?: number;
+  bboxWidth?: number;
+  bboxHeight?: number;
   words: TranscriptWord[];
 }
 
@@ -80,6 +86,7 @@ export interface TermHit {
   category?: string;
   severity: Severity;
   ruleSource: MatchType;
+  source: TranscriptSource;
   startTime: number;
   endTime: number;
   contextText?: string;
@@ -93,6 +100,7 @@ export interface TimelineItem {
   matchedText: string;
   category?: string;
   severity: Severity;
+  source: TranscriptSource;
   reviewStatus: ReviewStatus;
   startTime: number;
   endTime: number;
@@ -105,6 +113,8 @@ export interface ClipSuggestion {
   id: number;
   hitId: number;
   matchedText: string;
+  source: TranscriptSource;
+  action: 'REMOVE_AUDIO_SEGMENT' | 'BLUR_SUBTITLE';
   startTime: number;
   endTime: number;
   paddingSeconds: number;

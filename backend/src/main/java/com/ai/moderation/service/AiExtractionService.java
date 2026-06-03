@@ -146,6 +146,7 @@ public class AiExtractionService {
             hit.setCategory(term != null ? term.getCategory() : emptyToNull(eh.category()));
             hit.setSeverity(term != null ? term.getSeverity() : parseSeverity(eh.severity()));
             hit.setRuleSource(term != null ? term.getMatchType() : MatchType.SEMANTIC);
+            hit.setSource(segment.getSource() == null ? TranscriptSource.AUDIO : segment.getSource());
             double start = Math.max(segment.getStartTime(), range.start());
             double end = Math.min(segment.getEndTime(), Math.max(range.end(), start + 0.2));
             hit.setStartTime(start);

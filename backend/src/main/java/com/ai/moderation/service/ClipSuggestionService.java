@@ -89,6 +89,7 @@ public class ClipSuggestionService {
         TermHit hit = hitRepository.findById(suggestion.getHitId()).orElse(null);
         String matchedText = hit == null ? "-" : hit.getMatchedText();
         Double aiConfidence = hit == null ? null : hit.getAiConfidence();
-        return ClipSuggestionResponse.from(suggestion, matchedText, aiConfidence);
+        TranscriptSource source = hit == null || hit.getSource() == null ? TranscriptSource.AUDIO : hit.getSource();
+        return ClipSuggestionResponse.from(suggestion, matchedText, source, aiConfidence);
     }
 }
