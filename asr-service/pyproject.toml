@@ -1,0 +1,8 @@
+[project]
+name = "asr-service"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "python-multipart==0.0.27",
+]

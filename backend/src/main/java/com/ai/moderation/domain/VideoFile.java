@@ -25,6 +25,14 @@ public class VideoFile implements Identifiable {
 
     private Double durationSeconds;
 
+    private Long sizeBytes;
+
+    private String contentType;
+
+    private Integer width;
+
+    private Integer height;
+
     private VideoStatus status = VideoStatus.UPLOADED;
 
     private Instant createdAt = Instant.now();

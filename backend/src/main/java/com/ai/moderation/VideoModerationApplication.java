@@ -6,6 +6,7 @@ import com.ai.moderation.config.ClipProperties;
 import com.ai.moderation.config.FfmpegProperties;
 import com.ai.moderation.config.StorageProperties;
 import com.ai.moderation.config.SubtitleOcrProperties;
+import com.ai.moderation.config.SubtitleRemovalProperties;
 import org.mybatis.spring.annotation.MapperScan;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -21,7 +22,8 @@ import org.springframework.scheduling.annotation.EnableAsync;
         AsrProperties.class,
         AiProperties.class,
         ClipProperties.class,
-        SubtitleOcrProperties.class
+        SubtitleOcrProperties.class,
+        SubtitleRemovalProperties.class
 })
 public class VideoModerationApplication {
     public static void main(String[] args) {

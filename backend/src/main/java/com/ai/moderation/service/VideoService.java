@@ -29,6 +29,7 @@ import java.nio.file.Path;
 import java.time.LocalDate;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
 import java.util.stream.Stream;
 
@@ -90,13 +91,13 @@ public class VideoService {
             String uuid = UUID.randomUUID().toString();
             Path dayDir = Path.of(storageProperties.rootPath(), "videos", LocalDate.now().toString(), uuid);
             Files.createDirectories(dayDir);
-            String storedFilename = uuid + "-" + sanitize(video.getOriginalFilename());
+            String storedFilename = uuid + extension(video.getOriginalFilename());
             Path videoPath = dayDir.resolve(storedFilename);
             video.transferTo(videoPath);
 
             String subtitlePath = null;
             if (subtitle != null && !subtitle.isEmpty()) {
-                String subtitleName = uuid + "-" + sanitize(subtitle.getOriginalFilename());
+                String subtitleName = uuid + "-subtitle" + extension(subtitle.getOriginalFilename());
                 Path path = dayDir.resolve(subtitleName);
                 subtitle.transferTo(path);
                 subtitlePath = path.toString();
@@ -107,6 +108,13 @@ public class VideoService {
             file.setStoredFilename(storedFilename);
             file.setStoragePath(videoPath.toString());
             file.setSubtitlePath(subtitlePath);
+            file.setSizeBytes(video.getSize());
+            file.setContentType(video.getContentType());
+            int[] resolution = ffmpegService.probeResolution(videoPath);
+            if (resolution != null) {
+                file.setWidth(resolution[0]);
+                file.setHeight(resolution[1]);
+            }
             file.setDurationSeconds(ffmpegService.probeDuration(videoPath));
             return VideoResponse.from(videoRepository.save(file));
         } catch (IOException ex) {
@@ -142,11 +150,13 @@ public class VideoService {
         List<DetectionJob> jobs = jobRepository.findByVideoIdOrderByCreatedAtDesc(id);
         for (DetectionJob job : jobs) {
             List<TermHit> hits = hitRepository.findByJobIdOrderByStartTimeAsc(job.getId());
+            // 删除顺序须满足外键(引用方先删): ai_reviews、clip_suggestions 都引用 term_hits,
+            // term_hits、transcript_words 都引用 transcript_segments
             reviewRepository.deleteByHitIds(hits.stream().map(TermHit::getId).toList());
-            hitRepository.deleteByJobId(job.getId());
             clipSuggestionRepository.deleteByJobId(job.getId());
-            segmentRepository.deleteByJobId(job.getId());
+            hitRepository.deleteByJobId(job.getId());
             wordRepository.deleteByJobId(job.getId());
+            segmentRepository.deleteByJobId(job.getId());
         }
         jobRepository.deleteByVideoId(id);
         videoRepository.deleteById(id);
@@ -196,9 +206,16 @@ public class VideoService {
         return videoRepository.findById(id).orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, "视频不存在"));
     }
 
-    private String sanitize(String name) {
-        String fallback = "upload.bin";
-        String value = name == null || name.isBlank() ? fallback : name;
-        return value.replaceAll("[\\\\/:*?\"<>|]", "_");
+    /** 从原始文件名提取小写扩展名(含点,如 ".mp4");无合法扩展名时返回空串。存储文件名只用 UUID,不含原始名。 */
+    private String extension(String name) {
+        if (name == null) {
+            return "";
+        }
+        int dot = name.lastIndexOf('.');
+        if (dot < 0 || dot == name.length() - 1) {
+            return "";
+        }
+        String ext = name.substring(dot);
+        return ext.matches("\\.[A-Za-z0-9]{1,10}") ? ext.toLowerCase(Locale.ROOT) : "";
     }
 }

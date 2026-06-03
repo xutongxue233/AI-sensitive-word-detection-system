@@ -21,7 +21,7 @@ AI 敏感词检测系统是一个基于 `Spring Boot + React` 的视频内容审
 - AI 复核：对接 OpenAI 兼容接口（Chat Completions 与 Responses 两种形态可配置切换），只复核候选上下文，输出违规判断、原因和置信度。
 - 置信度把关：只有 AI 确认违规且置信度达到阈值（默认 0.6）的命中才进入违规时间轴并生成剪辑，低置信命中保留记录与原因但不自动剪，减少误剪。
 - 时间轴展示：展示违规词出现的起止时间，并附 AI 置信度与判定原因。
-- 剪辑/遮盖建议：基于词级时间戳，按命中词前后各留白 `app.clip.padding-seconds`（默认 0.2 秒）生成处理建议；音频命中走剪辑删除，画面字幕命中走局部模糊遮盖。
+- 剪辑/遮盖建议：基于词级时间戳，按命中词前后各留白 `app.clip.padding-seconds`（默认 0.2 秒）生成处理建议；音频命中走剪辑删除，画面字幕命中走 delogo 邻域插值修复（抹除字幕并尽量融入背景，而非盒式模糊）。
 - 管理员确认：确认、忽略或手动调整剪辑片段。
 - 视频导出：确认后调用 FFmpeg 导出去违规版本视频，字幕遮盖不会造成整段画面跳切。
 
@@ -148,6 +148,7 @@ $env:PADDLE_OCR_ENABLE_MKLDNN='false'
 - `WHISPER_MODEL` 可改为 `tiny/base/small/medium/large/large-v3/turbo`。
 - 当前默认使用 `large-v3`；CPU 环境会更慢，如只验证流程可临时改为 `base` 或 `small`。
 - CPU 环境保持 `WHISPER_FP16=false`；使用 CUDA 时可按硬件情况改为 `true`。
+- 默认启用 beam search（`WHISPER_BEAM_SIZE=5`）提升数字/口语识别（如「几十块」不易被听成「十块」）；CPU 上更慢，可设 `WHISPER_BEAM_SIZE=0` 改用更快的贪心解码。
 - 默认输出会使用简体中文提示词，并通过 OpenCC 做繁转简。
 
 ### 启动后端
@@ -184,10 +185,42 @@ app:
 
 说明：
 
-- `crop-bottom-ratio` 表示扫描画面底部区域的高度占比，适合常见底部字幕；如果字幕位置更高可适当调大。
+- `crop-bottom-ratio` 表示从画面底部向上扫描的高度占比：`1.0` 扫描整个画面（识别任意位置文字，默认）；`0.35` 仅扫底部字幕条（更快，但会漏掉非底部的文字）。
 - `interval-seconds` 越小越不容易漏字幕，但 OCR 更慢。
 - OCR 结果会与音频 ASR 结果合并为两层；同一时间段口播和字幕文本相同也会保留两条来源，因为音频和字幕需要分别处理。
-- 导出时，音频来源命中按现有方式删除对应时间片段；画面字幕来源命中会根据 OCR 字幕框做局部模糊遮盖，坐标缺失时回退遮盖底部字幕区域。
+- 导出时，音频来源命中按现有方式删除对应时间片段；画面字幕来源命中默认调用 VSR 做 AI 修复去除（见下节），VSR 不可用时回退 ffmpeg delogo 邻域插值（超宽字幕条自动横向分块），仍不可用时回退盒式模糊。
+
+### 启动 VSR 画面字幕去除服务（默认启用）
+
+画面字幕命中默认走 VSR（[Video-Subtitle-Remover](https://github.com/YaoFANGUK/video-subtitle-remover)）做 AI 逐帧修复去除，效果优于 delogo。VSR 依赖 `paddlepaddle 3.0`，与 asr-service 的 `2.6.2` 冲突，因此作为**独立服务**运行：
+
+```powershell
+git clone https://github.com/YaoFANGUK/video-subtitle-remover
+# 在 VSR 的独立 venv 中按其 requirements 安装依赖(PyTorch / paddlepaddle 3.0 等)，首次运行会下载 STTN 模型
+# 同一 venv 再安装本服务依赖：
+pip install -r vsr-service/requirements.txt
+
+$env:VSR_HOME='D:\path\to\video-subtitle-remover'
+python vsr-service/app.py   # 默认端口 9100，无 NVIDIA GPU 时自动用 CPU
+```
+
+后端对应配置（`application.yml`）：
+
+```yaml
+app:
+  subtitle-removal:
+    engine: vsr               # vsr = AI inpainting 去除; delogo = ffmpeg 邻域插值(快,无需此服务)
+    base-url: http://localhost:9100
+    inpaint-mode: sttn_auto   # sttn_auto / sttn_det / lama / propainter / opencv
+    timeout-seconds: 600
+```
+
+说明：
+
+- 仅去除命中敏感词的字幕区域，且仅在违规命中的时间段（后端按时间段切片送 VSR，再把处理后的片段拼回原视频）。
+- VSR 调用失败（未启动 / 超时 / 出错）自动回退 delogo，导出不被阻断。
+- CPU 上 inpainting 较慢，因此只处理违规片段而非整片；若违规片段多，导出会明显变慢。
+- 不需要 AI 去除时把 `engine` 改为 `delogo` 即可，无需启动本服务。
 
 ### AI 复核（OpenAI 兼容）
 
@@ -312,7 +345,7 @@ The system is designed for auditability and precise timeline positioning instead
 - AI review: call an OpenAI-compatible API (Chat Completions or Responses, switchable via `app.ai.api-type`) to review only candidate contexts and return violation, confidence, and reason.
 - Confidence gating: only hits the AI confirms as violations with `confidence >= app.ai.confidence-threshold` (default 0.6) enter the timeline and produce clips; low-confidence hits are kept and explained but not auto-clipped.
 - Timeline view: show where sensitive words appear, with AI confidence and reason.
-- Clip / mask suggestions: based on word-level timestamps, padded by `app.clip.padding-seconds` (default 0.2s); audio hits remove the segment, while video-subtitle hits blur the subtitle area.
+- Clip / mask suggestions: based on word-level timestamps, padded by `app.clip.padding-seconds` (default 0.2s); audio hits remove the segment, while video-subtitle hits are erased via delogo inpainting (falling back to box blur when resolution probing fails).
 - Admin confirmation: confirm, ignore, or adjust suggested clips.
 - Export: generate moderated videos after confirmation without hard subtitle hits causing full-frame jump cuts.
 

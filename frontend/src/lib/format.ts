@@ -25,3 +25,12 @@ export function formatTimeShort(iso?: string): string {
   if (Number.isNaN(d.getTime())) return '-';
   return formatClock(d);
 }
+
+export function formatBytes(value?: number | null): string {
+  if (value === undefined || value === null || Number.isNaN(value) || value < 0) return '-';
+  if (value === 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.min(units.length - 1, Math.floor(Math.log(value) / Math.log(1024)));
+  const size = value / Math.pow(1024, i);
+  return `${size.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}

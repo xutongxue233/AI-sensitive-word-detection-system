@@ -2,9 +2,11 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from opencc import OpenCC
 import whisper
 
@@ -14,6 +16,8 @@ DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 FP16 = os.getenv("WHISPER_FP16", "false").lower() in {"1", "true", "yes", "on"}
 CHINESE_CONVERTER = os.getenv("WHISPER_CHINESE_CONVERTER", "t2s")
 INITIAL_PROMPT = os.getenv("WHISPER_INITIAL_PROMPT", "请使用简体中文转写普通话内容。")
+# beam search:默认 5,数字/口语(如"几十块"易被听成"十块")识别更准;设 0 改用贪心解码,更快(CPU 上明显)
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
 FFMPEG_BIN_DIR = os.getenv("FFMPEG_BIN_DIR")
 PADDLE_OCR_LANG = os.getenv("PADDLE_OCR_LANG", "ch")
 PADDLE_OCR_VERSION = os.getenv("PADDLE_OCR_VERSION", "PP-OCRv4")
@@ -38,6 +42,13 @@ model = None
 converter = OpenCC(CHINESE_CONVERTER) if CHINESE_CONVERTER else None
 ocr_reader = None
 ocr_reader_lang = None
+# 初始化锁:仅保护两个全局模型的懒加载(double-checked locking)。
+_model_lock = threading.Lock()
+_ocr_lock = threading.Lock()
+# 推理锁:同一个全局模型对象不保证并发推理安全(PaddlePaddle 预测器/Whisper 单实例),
+# 故对同类推理串行化;Whisper 与 PaddleOCR 用不同锁,单个检测任务的音频腿与画面腿仍可并行。
+_model_infer_lock = threading.Lock()
+_ocr_infer_lock = threading.Lock()
 
 
 @app.get("/health")
@@ -60,7 +71,9 @@ def normalize_text(text: str) -> str:
 def get_model():
     global model
     if model is None:
-        model = whisper.load_model(MODEL_SIZE, device=DEVICE)
+        with _model_lock:
+            if model is None:
+                model = whisper.load_model(MODEL_SIZE, device=DEVICE)
     return model
 
 
@@ -85,30 +98,33 @@ def get_ocr_reader(lang: str):
         PADDLE_OCR_REC_MODEL or "",
     ])
     if ocr_reader is None or ocr_reader_lang != cache_key:
-        try:
-            from paddleocr import PaddleOCR
-        except Exception as exc:
-            raise HTTPException(
-                status_code=503,
-                detail=f"PaddleOCR 依赖未安装或不可用，请安装 asr-service/requirements.txt: {exc}",
-            ) from exc
-        cleanup_incomplete_paddlex_models()
-        try:
-            ocr_reader = create_paddle_ocr(PaddleOCR, selected_lang)
-        except Exception as exc:
-            cleanup_incomplete_paddlex_models()
-            try:
-                ocr_reader = create_paddle_ocr(PaddleOCR, selected_lang)
-            except Exception as retry_exc:
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        "PaddleOCR 模型初始化失败。系统已尝试清理不完整模型缓存；"
-                        f"请确认网络可下载模型，或手动删除 {Path.home() / '.paddlex' / 'official_models'} 后重试。"
-                        f"原始错误: {retry_exc or exc}"
-                    ),
-                ) from retry_exc
-        ocr_reader_lang = cache_key
+        with _ocr_lock:
+            if ocr_reader is None or ocr_reader_lang != cache_key:
+                try:
+                    from paddleocr import PaddleOCR
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"PaddleOCR 依赖未安装或不可用，请安装 asr-service/requirements.txt: {exc}",
+                    ) from exc
+                cleanup_incomplete_paddlex_models()
+                try:
+                    reader = create_paddle_ocr(PaddleOCR, selected_lang)
+                except Exception as exc:
+                    cleanup_incomplete_paddlex_models()
+                    try:
+                        reader = create_paddle_ocr(PaddleOCR, selected_lang)
+                    except Exception as retry_exc:
+                        raise HTTPException(
+                            status_code=503,
+                            detail=(
+                                "PaddleOCR 模型初始化失败。系统已尝试清理不完整模型缓存；"
+                                f"请确认网络可下载模型，或手动删除 {Path.home() / '.paddlex' / 'official_models'} 后重试。"
+                                f"原始错误: {retry_exc or exc}"
+                            ),
+                        ) from retry_exc
+                ocr_reader = reader
+                ocr_reader_lang = cache_key
     return ocr_reader
 
 
@@ -169,15 +185,22 @@ def cleanup_incomplete_paddlex_models():
 async def transcribe(file: UploadFile = File(...), word_timestamps: bool = True):
     temp_path = await save_upload_to_temp(file, "audio.wav")
     try:
-        result = get_model().transcribe(
-            temp_path,
-            task="transcribe",
-            initial_prompt=INITIAL_PROMPT,
-            language=os.getenv("WHISPER_LANGUAGE") or None,
-            word_timestamps=word_timestamps,
-            fp16=FP16,
-            verbose=False,
-        )
+        def _transcribe():
+            # 同一全局 Whisper 模型不保证并发推理安全(多任务并行时),加推理锁串行化;
+            # 与 OCR 用不同锁,单个任务的音频腿与画面腿仍可并行。
+            with _model_infer_lock:
+                return get_model().transcribe(
+                    temp_path,
+                    task="transcribe",
+                    initial_prompt=INITIAL_PROMPT,
+                    language=os.getenv("WHISPER_LANGUAGE") or None,
+                    word_timestamps=word_timestamps,
+                    fp16=FP16,
+                    beam_size=WHISPER_BEAM_SIZE if WHISPER_BEAM_SIZE > 0 else None,
+                    verbose=False,
+                )
+
+        result = await run_in_threadpool(_transcribe)
         output = []
         for segment in result.get("segments", []):
             words = []
@@ -212,14 +235,19 @@ async def ocr_subtitles(
 ):
     temp_path = await save_upload_to_temp(file, "video.mp4")
     try:
-        reader = get_ocr_reader(lang)
-        segments = recognize_video_subtitles(
-            temp_path,
-            reader,
-            interval_seconds=max(0.2, interval_seconds),
-            crop_bottom_ratio=min(1.0, max(0.05, crop_bottom_ratio)),
-            min_confidence=min(1.0, max(0.0, min_confidence)),
-        )
+        def _ocr():
+            # 同一全局 PaddleOCR 预测器不保证并发推理安全(多任务并行时),加推理锁串行化;
+            # 与 Whisper 用不同锁,单个任务的画面腿与音频腿仍可并行。
+            with _ocr_infer_lock:
+                return recognize_video_subtitles(
+                    temp_path,
+                    get_ocr_reader(lang),
+                    interval_seconds=max(0.2, interval_seconds),
+                    crop_bottom_ratio=min(1.0, max(0.05, crop_bottom_ratio)),
+                    min_confidence=min(1.0, max(0.0, min_confidence)),
+                )
+
+        segments = await run_in_threadpool(_ocr)
         return {"segments": segments}
     finally:
         Path(temp_path).unlink(missing_ok=True)

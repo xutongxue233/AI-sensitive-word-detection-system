@@ -69,7 +69,7 @@ import type {
 } from './types';
 
 import { cn } from '@/lib/utils';
-import { formatClock, formatDateTime, formatTimeShort, seconds } from '@/lib/format';
+import { formatBytes, formatClock, formatDateTime, formatTimeShort, seconds } from '@/lib/format';
 import {
   CLIP_STATUS,
   EmptyState,
@@ -582,7 +582,13 @@ function VideosPage() {
                             <span className="grid h-8 w-8 shrink-0 place-items-center rounded-md bg-muted text-muted-foreground">
                               <Film className="h-4 w-4" />
                             </span>
-                            <span className="font-medium">{video.originalFilename}</span>
+                            <div className="min-w-0">
+                              <div className="font-medium truncate">{video.originalFilename}</div>
+                              <div className="telemetry text-[11px] text-muted-foreground">
+                                {formatBytes(video.sizeBytes)}
+                                {video.width && video.height ? ` · ${video.width}×${video.height}` : ''}
+                              </div>
+                            </div>
                           </div>
                         </TableCell>
                         <TableCell className="telemetry text-[13px] text-muted-foreground">

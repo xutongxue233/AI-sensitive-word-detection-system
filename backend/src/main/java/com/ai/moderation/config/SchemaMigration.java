@@ -21,6 +21,10 @@ public class SchemaMigration implements ApplicationRunner {
         addColumnIfMissing("transcript_segments", "bbox_width", "DOUBLE");
         addColumnIfMissing("transcript_segments", "bbox_height", "DOUBLE");
         addColumnIfMissing("term_hits", "source", "VARCHAR(20) NOT NULL DEFAULT 'AUDIO'");
+        addColumnIfMissing("videos", "size_bytes", "BIGINT");
+        addColumnIfMissing("videos", "content_type", "VARCHAR(100)");
+        addColumnIfMissing("videos", "width", "INT");
+        addColumnIfMissing("videos", "height", "INT");
     }
 
     private void addColumnIfMissing(String tableName, String columnName, String definition) {

@@ -21,17 +21,21 @@ import java.util.regex.PatternSyntaxException;
 @Service
 public class RuleMatchingService {
     private static final Pattern ARABIC_PRICE_WITH_UNIT = Pattern.compile(
-            "(?:￥|¥|RMB\\s*)?\\d+(?:\\.\\d{1,2})?\\s*(?:块钱|块|元|毛|分|人民币|rmb)",
+            "(?:￥|¥|RMB\\s*)?\\d+(?:\\.\\d{1,2})?(?:多|几)?\\s*(?:块钱|块|元|毛|分|人民币|rmb)",
             Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE
     );
     private static final Pattern CHINESE_PRICE_WITH_UNIT = Pattern.compile(
-            "[零一二三四五六七八九十百千万两]+\\s*(?:块钱|块|元|毛|分|人民币)"
+            "[零一二三四五六七八九十百千万两几]+(?:多)?\\s*(?:块钱|块|元|毛|分|人民币)"
     );
     private static final Pattern PRICE_SYMBOL_OR_DECIMAL = Pattern.compile(
             "(?:￥|¥)\\s*\\d+(?:\\.\\d{1,2})?|\\d+\\.\\d{1,2}"
     );
+    // 口语/约数价格(无单位):60几、60多、几十、十几、几百、两三百等;仅在价格上下文中召回,交 AI 判定真伪
+    private static final Pattern APPROX_PRICE = Pattern.compile(
+            "\\d+\\s*[多几]|[一二两三四五六七八九十百千万]+\\s*[多几]|几\\s*[十百千万]|[十百千万]+\\s*几"
+    );
     private static final Pattern PRICE_CONTEXT = Pattern.compile(
-            "价格|售价|报价|多少钱|多少米|到手|优惠|折扣|下单|付款|支付|返现|立减|包邮|买|卖|元|块|rmb|人民币",
+            "价格|售价|报价|多少钱|多少米|到手|优惠|折扣|下单|付款|支付|返现|立减|包邮|买|卖|才|要|花|值|元|块|rmb|人民币",
             Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE
     );
 
@@ -108,9 +112,12 @@ public class RuleMatchingService {
             return List.of();
         }
         List<TermHit> hits = new ArrayList<>();
+        String text = segment.getText() == null ? "" : segment.getText();
+        boolean priceContext = PRICE_CONTEXT.matcher(text).find();
         collectPriceMatches(job, segment, context, term, ARABIC_PRICE_WITH_UNIT, hits, true);
         collectPriceMatches(job, segment, context, term, CHINESE_PRICE_WITH_UNIT, hits, true);
-        collectPriceMatches(job, segment, context, term, PRICE_SYMBOL_OR_DECIMAL, hits, PRICE_CONTEXT.matcher(segment.getText()).find());
+        collectPriceMatches(job, segment, context, term, PRICE_SYMBOL_OR_DECIMAL, hits, priceContext);
+        collectPriceMatches(job, segment, context, term, APPROX_PRICE, hits, priceContext);
         return hits;
     }
 

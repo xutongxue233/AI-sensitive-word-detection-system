@@ -40,8 +40,14 @@ app:
     enabled: true
     ocr-path: /ocr-subtitles
     interval-seconds: 0.75
-    crop-bottom-ratio: 0.35
+    crop-bottom-ratio: 1.0       # 1.0=扫描整个画面(识别任意位置文字); 0.35=仅底部字幕条(更快但漏非底部文字)
     min-confidence: 0.35
+  subtitle-removal:
+    engine: vsr                 # vsr = 调用 vsr-service 做 AI inpainting 去字幕; delogo = ffmpeg 邻域插值(快)
+    base-url: http://localhost:9100
+    remove-path: /remove-subtitle
+    inpaint-mode: sttn_auto     # sttn_auto / sttn_det / lama / propainter / opencv
+    timeout-seconds: 600        # CPU 上 inpainting 较慢,单段处理超时放宽
   ai:
     enabled: false
     api-type: chat

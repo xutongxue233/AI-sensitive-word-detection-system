@@ -26,6 +26,10 @@ CREATE TABLE IF NOT EXISTS videos (
     storage_path VARCHAR(1000) NOT NULL,
     subtitle_path VARCHAR(1000),
     duration_seconds DOUBLE,
+    size_bytes BIGINT,
+    content_type VARCHAR(100),
+    width INT,
+    height INT,
     status VARCHAR(20) NOT NULL,
     created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

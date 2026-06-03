@@ -12,6 +12,10 @@ public record VideoResponse(
         String storagePath,
         String subtitlePath,
         Double durationSeconds,
+        Long sizeBytes,
+        String contentType,
+        Integer width,
+        Integer height,
         VideoStatus status,
         Instant createdAt
 ) {
@@ -23,6 +27,10 @@ public record VideoResponse(
                 video.getStoragePath(),
                 video.getSubtitlePath(),
                 video.getDurationSeconds(),
+                video.getSizeBytes(),
+                video.getContentType(),
+                video.getWidth(),
+                video.getHeight(),
                 video.getStatus(),
                 video.getCreatedAt()
         );

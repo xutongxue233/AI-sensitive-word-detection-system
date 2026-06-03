@@ -33,6 +33,10 @@ export interface VideoFile {
   storagePath: string;
   subtitlePath?: string;
   durationSeconds?: number;
+  sizeBytes?: number;
+  contentType?: string;
+  width?: number;
+  height?: number;
   status: VideoStatus;
   createdAt: string;
 }

@@ -1,0 +1,5 @@
+# 本服务自身依赖。需安装在 video-subtitle-remover 的同一个 venv 中
+# (VSR 本体依赖 PyTorch 2.7 / paddlepaddle 3.0 / onnxruntime 等,按 VSR 仓库的 requirements 安装)。
+fastapi
+uvicorn[standard]
+python-multipart
