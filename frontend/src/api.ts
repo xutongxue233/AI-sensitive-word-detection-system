@@ -1,5 +1,9 @@
 import axios, { AxiosProgressEvent } from 'axios';
 import {
+  AiConnectionTestRequest,
+  AiConnectionTestResponse,
+  AppSettings,
+  AppSettingsUpdate,
   ClipStatus,
   ClipSuggestion,
   DetectionJob,
@@ -97,6 +101,14 @@ export const updateHitStatus = (id: number, status: ReviewStatus) =>
 
 export const exportVideo = (videoId: number) =>
   api.post<ExportResult>(`/videos/${videoId}/exports`).then((res) => res.data);
+
+export const getSettings = () => api.get<AppSettings>('/settings').then((res) => res.data);
+
+export const updateSettings = (payload: AppSettingsUpdate) =>
+  api.put<AppSettings>('/settings', payload).then((res) => res.data);
+
+export const testAiConnection = (payload: AiConnectionTestRequest) =>
+  api.post<AiConnectionTestResponse>('/settings/ai/test', payload).then((res) => res.data);
 
 export const videoContentUrl = (videoId: number) => `/api/v1/videos/${videoId}/content`;
 

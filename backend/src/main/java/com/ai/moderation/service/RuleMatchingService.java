@@ -6,6 +6,8 @@ import com.ai.moderation.repository.TermHitRepository;
 import com.ai.moderation.repository.TranscriptSegmentRepository;
 import com.ai.moderation.repository.TranscriptWordRepository;
 import com.ai.moderation.repository.ViolationTermRepository;
+import com.ai.moderation.service.SegmentTimeLocator.SegmentIndex;
+import com.ai.moderation.service.SegmentTimeLocator.TimeRange;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -38,19 +40,22 @@ public class RuleMatchingService {
     private final TranscriptWordRepository wordRepository;
     private final TermHitRepository hitRepository;
     private final TextNormalizer textNormalizer;
+    private final SegmentTimeLocator segmentTimeLocator;
 
     public RuleMatchingService(
             ViolationTermRepository termRepository,
             TranscriptSegmentRepository segmentRepository,
             TranscriptWordRepository wordRepository,
             TermHitRepository hitRepository,
-            TextNormalizer textNormalizer
+            TextNormalizer textNormalizer,
+            SegmentTimeLocator segmentTimeLocator
     ) {
         this.termRepository = termRepository;
         this.segmentRepository = segmentRepository;
         this.wordRepository = wordRepository;
         this.hitRepository = hitRepository;
         this.textNormalizer = textNormalizer;
+        this.segmentTimeLocator = segmentTimeLocator;
     }
 
     @Transactional
@@ -61,9 +66,9 @@ public class RuleMatchingService {
         List<TermHit> hits = new ArrayList<>();
         for (int i = 0; i < segments.size(); i++) {
             TranscriptSegment segment = segments.get(i);
-            String context = buildContext(segments, i);
+            String context = segmentTimeLocator.buildContext(segments, i);
             List<TranscriptWord> words = wordRepository.findBySegmentIdOrderBySequenceNoAsc(segment.getId());
-            SegmentIndex index = SegmentIndex.from(segment, words);
+            SegmentIndex index = segmentTimeLocator.index(segment, words);
             for (ViolationTerm term : terms) {
                 hits.addAll(matchTerm(job, segment, context, index, term));
             }
@@ -172,6 +177,7 @@ public class RuleMatchingService {
         hit.setCategory(term.getCategory());
         hit.setSeverity(term.getSeverity());
         hit.setRuleSource(term.getMatchType());
+        hit.setSource(segment.getSource() == null ? TranscriptSource.AUDIO : segment.getSource());
         hit.setStartTime(Math.max(segment.getStartTime(), startTime));
         hit.setEndTime(Math.min(segment.getEndTime(), Math.max(endTime, startTime + 0.2)));
         hit.setContextText(context);
@@ -191,70 +197,11 @@ public class RuleMatchingService {
         return values;
     }
 
-    private String buildContext(List<TranscriptSegment> segments, int index) {
-        StringBuilder builder = new StringBuilder();
-        for (int i = Math.max(0, index - 1); i <= Math.min(segments.size() - 1, index + 1); i++) {
-            if (!builder.isEmpty()) {
-                builder.append(' ');
-            }
-            builder.append('[')
-                    .append(formatTime(segments.get(i).getStartTime()))
-                    .append("] ")
-                    .append(segments.get(i).getText());
-        }
-        return builder.toString();
-    }
-
-    private String formatTime(double seconds) {
-        long total = (long) seconds;
-        long minutes = total / 60;
-        long remain = total % 60;
-        return "%02d:%02d".formatted(minutes, remain);
-    }
-
     private double mapSourceOffset(TranscriptSegment segment, int sourceOffset) {
         if (segment.getText() == null || segment.getText().isBlank()) {
             return segment.getStartTime();
         }
         double ratio = Math.min(1.0, Math.max(0, sourceOffset / (double) segment.getText().length()));
         return segment.getStartTime() + (segment.getEndTime() - segment.getStartTime()) * ratio;
-    }
-
-    private record TimeRange(double start, double end) {
-    }
-
-    private record SegmentIndex(String normalizedText, List<TokenTime> tokenTimes, TranscriptSegment segment) {
-        static SegmentIndex from(TranscriptSegment segment, List<TranscriptWord> words) {
-            StringBuilder normalizedText = new StringBuilder();
-            List<TokenTime> tokenTimes = new ArrayList<>();
-            for (TranscriptWord word : words) {
-                if (word.getNormalizedWord() == null || word.getNormalizedWord().isBlank()) {
-                    continue;
-                }
-                int start = normalizedText.length();
-                normalizedText.append(word.getNormalizedWord());
-                tokenTimes.add(new TokenTime(start, normalizedText.length(), word.getStartTime(), word.getEndTime()));
-            }
-            return new SegmentIndex(normalizedText.toString(), tokenTimes, segment);
-        }
-
-        TimeRange locate(int startOffset, int endOffset) {
-            List<TokenTime> matched = tokenTimes.stream()
-                    .filter(token -> token.normalizedEnd() > startOffset && token.normalizedStart() < endOffset)
-                    .toList();
-            if (!matched.isEmpty()) {
-                return new TimeRange(matched.getFirst().startTime(), matched.getLast().endTime());
-            }
-            double duration = segment.getEndTime() - segment.getStartTime();
-            double startRatio = normalizedText.isBlank() ? 0 : startOffset / (double) normalizedText.length();
-            double endRatio = normalizedText.isBlank() ? startRatio : endOffset / (double) normalizedText.length();
-            return new TimeRange(
-                    segment.getStartTime() + duration * startRatio,
-                    segment.getStartTime() + duration * Math.max(endRatio, startRatio)
-            );
-        }
-    }
-
-    private record TokenTime(int normalizedStart, int normalizedEnd, double startTime, double endTime) {
     }
 }

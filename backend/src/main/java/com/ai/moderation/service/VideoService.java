@@ -4,6 +4,7 @@ import com.ai.moderation.common.ApiException;
 import com.ai.moderation.config.StorageProperties;
 import com.ai.moderation.domain.DetectionJob;
 import com.ai.moderation.domain.JobStatus;
+import com.ai.moderation.domain.TermHit;
 import com.ai.moderation.domain.VideoFile;
 import com.ai.moderation.domain.VideoStatus;
 import com.ai.moderation.dto.JobResponse;
@@ -15,20 +16,21 @@ import com.ai.moderation.repository.TermHitRepository;
 import com.ai.moderation.repository.TranscriptSegmentRepository;
 import com.ai.moderation.repository.TranscriptWordRepository;
 import com.ai.moderation.repository.VideoFileRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDate;
+import java.util.Comparator;
 import java.util.List;
-import java.util.Objects;
 import java.util.UUID;
+import java.util.stream.Stream;
 
 @Service
 public class VideoService {
@@ -37,49 +39,46 @@ public class VideoService {
     private final StorageProperties storageProperties;
     private final VideoFileRepository videoRepository;
     private final DetectionJobRepository jobRepository;
-    private final TranscriptWordRepository wordRepository;
-    private final TranscriptSegmentRepository segmentRepository;
-    private final TermHitRepository hitRepository;
-    private final AiReviewRepository aiReviewRepository;
-    private final ClipSuggestionRepository suggestionRepository;
     private final DetectionPipelineService detectionPipelineService;
     private final FfmpegService ffmpegService;
+    private final TermHitRepository hitRepository;
+    private final AiReviewRepository reviewRepository;
+    private final ClipSuggestionRepository clipSuggestionRepository;
+    private final TranscriptSegmentRepository segmentRepository;
+    private final TranscriptWordRepository wordRepository;
 
     public VideoService(
             StorageProperties storageProperties,
             VideoFileRepository videoRepository,
             DetectionJobRepository jobRepository,
-            TranscriptWordRepository wordRepository,
-            TranscriptSegmentRepository segmentRepository,
-            TermHitRepository hitRepository,
-            AiReviewRepository aiReviewRepository,
-            ClipSuggestionRepository suggestionRepository,
             DetectionPipelineService detectionPipelineService,
-            FfmpegService ffmpegService
+            FfmpegService ffmpegService,
+            TermHitRepository hitRepository,
+            AiReviewRepository reviewRepository,
+            ClipSuggestionRepository clipSuggestionRepository,
+            TranscriptSegmentRepository segmentRepository,
+            TranscriptWordRepository wordRepository
     ) {
         this.storageProperties = storageProperties;
         this.videoRepository = videoRepository;
         this.jobRepository = jobRepository;
-        this.wordRepository = wordRepository;
-        this.segmentRepository = segmentRepository;
-        this.hitRepository = hitRepository;
-        this.aiReviewRepository = aiReviewRepository;
-        this.suggestionRepository = suggestionRepository;
         this.detectionPipelineService = detectionPipelineService;
         this.ffmpegService = ffmpegService;
+        this.hitRepository = hitRepository;
+        this.reviewRepository = reviewRepository;
+        this.clipSuggestionRepository = clipSuggestionRepository;
+        this.segmentRepository = segmentRepository;
+        this.wordRepository = wordRepository;
     }
 
-    @Transactional
+    @Transactional(readOnly = true)
     public List<VideoResponse> listVideos() {
-        return videoRepository.findAll().stream()
-                .map(this::fillMissingDuration)
-                .map(VideoResponse::from)
-                .toList();
+        return videoRepository.findAllByOrderByCreatedAtDesc().stream().map(VideoResponse::from).toList();
     }
 
-    @Transactional
+    @Transactional(readOnly = true)
     public VideoResponse getVideo(Long id) {
-        return VideoResponse.from(fillMissingDuration(findVideo(id)));
+        return VideoResponse.from(findVideo(id));
     }
 
     @Transactional
@@ -133,110 +132,68 @@ public class VideoService {
         return jobRepository.findByVideoIdOrderByCreatedAtDesc(videoId).stream().map(JobResponse::from).toList();
     }
 
+    /**
+     * 删除视频及其全部关联数据:逐个检测任务清理 term_hits/ai_reviews/clip_suggestions
+     * 与转写 segments/words,再删任务与视频记录,最后清理磁盘上的视频/字幕文件。
+     */
     @Transactional
     public void deleteVideo(Long id) {
         VideoFile video = findVideo(id);
         List<DetectionJob> jobs = jobRepository.findByVideoIdOrderByCreatedAtDesc(id);
-        boolean activeJob = jobs.stream().anyMatch(job -> job.getStatus() != JobStatus.COMPLETED && job.getStatus() != JobStatus.FAILED);
-        if (activeJob) {
-            throw new ApiException(HttpStatus.CONFLICT, "视频正在检测中，请等待任务结束后再删除");
-        }
-
-        List<String> exportedPaths = jobs.stream()
-                .flatMap(job -> suggestionRepository.findByJobIdOrderByStartTimeAsc(job.getId()).stream())
-                .map(item -> item.getExportPath())
-                .filter(path -> path != null && !path.isBlank())
-                .toList();
         for (DetectionJob job : jobs) {
-            Long jobId = job.getId();
-            List<Long> hitIds = hitRepository.findByJobIdOrderByStartTimeAsc(jobId).stream()
-                    .map(item -> item.getId())
-                    .filter(Objects::nonNull)
-                    .toList();
-            suggestionRepository.deleteByJobId(jobId);
-            aiReviewRepository.deleteByHitIds(hitIds);
-            hitRepository.deleteByJobId(jobId);
-            wordRepository.deleteByJobId(jobId);
-            segmentRepository.deleteByJobId(jobId);
+            List<TermHit> hits = hitRepository.findByJobIdOrderByStartTimeAsc(job.getId());
+            reviewRepository.deleteByHitIds(hits.stream().map(TermHit::getId).toList());
+            hitRepository.deleteByJobId(job.getId());
+            clipSuggestionRepository.deleteByJobId(job.getId());
+            segmentRepository.deleteByJobId(job.getId());
+            wordRepository.deleteByJobId(job.getId());
         }
         jobRepository.deleteByVideoId(id);
         videoRepository.deleteById(id);
-        deleteStoredFiles(video, exportedPaths);
+        deleteStorageFiles(video);
+    }
+
+    /**
+     * 删除磁盘文件,优先删整个 uuid 目录(上传时视频与字幕同放该目录);
+     * 文件缺失或清理失败只记录日志,不影响数据库删除已提交的结果。
+     */
+    private void deleteStorageFiles(VideoFile video) {
+        try {
+            Path videoPath = video.getStoragePath() == null ? null : Path.of(video.getStoragePath());
+            Path uuidDir = videoPath == null ? null : videoPath.getParent();
+            if (uuidDir != null && Files.isDirectory(uuidDir) && isInsideStorageRoot(uuidDir)) {
+                try (Stream<Path> walk = Files.walk(uuidDir)) {
+                    walk.sorted(Comparator.reverseOrder()).forEach(path -> {
+                        try {
+                            Files.deleteIfExists(path);
+                        } catch (IOException ex) {
+                            log.warn("删除文件失败 {}: {}", path, ex.getMessage());
+                        }
+                    });
+                }
+                return;
+            }
+            // 目录结构不符合预期时,退而删除已知的单个文件
+            deleteIfPresent(video.getStoragePath());
+            deleteIfPresent(video.getSubtitlePath());
+        } catch (IOException ex) {
+            log.warn("清理视频存储目录失败 videoId={}: {}", video.getId(), ex.getMessage());
+        }
+    }
+
+    private boolean isInsideStorageRoot(Path dir) {
+        Path root = Path.of(storageProperties.rootPath()).toAbsolutePath().normalize();
+        return dir.toAbsolutePath().normalize().startsWith(root);
+    }
+
+    private void deleteIfPresent(String path) throws IOException {
+        if (path != null && !path.isBlank()) {
+            Files.deleteIfExists(Path.of(path));
+        }
     }
 
     private VideoFile findVideo(Long id) {
         return videoRepository.findById(id).orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, "视频不存在"));
-    }
-
-    private VideoFile fillMissingDuration(VideoFile video) {
-        if (video.getDurationSeconds() != null && video.getDurationSeconds() > 0) {
-            return video;
-        }
-        Double duration = ffmpegService.probeDuration(Path.of(video.getStoragePath()));
-        if (duration != null && duration > 0) {
-            video.setDurationSeconds(duration);
-            videoRepository.save(video);
-        }
-        return video;
-    }
-
-    private void deleteStoredFiles(VideoFile video, List<String> exportedPaths) {
-        Path storageRoot = Path.of(storageProperties.rootPath()).toAbsolutePath().normalize();
-        Path videoPath = Path.of(video.getStoragePath()).toAbsolutePath().normalize();
-        Path uploadDir = videoPath.getParent();
-        if (uploadDir == null || !uploadDir.startsWith(storageRoot)) {
-            return;
-        }
-        try {
-            deleteIfInsideStorage(video.getSubtitlePath(), storageRoot);
-            for (String exportPath : exportedPaths) {
-                deleteIfInsideStorage(exportPath, storageRoot);
-                deleteEmptyParents(Path.of(exportPath).toAbsolutePath().normalize(), storageRoot);
-            }
-            deleteDirectory(uploadDir);
-        } catch (IOException ex) {
-            // Keep the record deletion durable even if Windows still has a preview/export file open.
-            log.warn("Failed to delete stored files for video {}", video.getId(), ex);
-        }
-    }
-
-    private void deleteIfInsideStorage(String rawPath, Path storageRoot) throws IOException {
-        if (rawPath == null || rawPath.isBlank()) {
-            return;
-        }
-        Path path = Path.of(rawPath).toAbsolutePath().normalize();
-        if (path.startsWith(storageRoot)) {
-            Files.deleteIfExists(path);
-        }
-    }
-
-    private void deleteDirectory(Path directory) throws IOException {
-        if (!Files.exists(directory)) {
-            return;
-        }
-        try (var paths = Files.walk(directory)) {
-            List<Path> sorted = paths.sorted((left, right) -> right.compareTo(left)).toList();
-            for (Path path : sorted) {
-                Files.deleteIfExists(path);
-            }
-        }
-    }
-
-    private void deleteEmptyParents(Path path, Path storageRoot) throws IOException {
-        Path parent = path.getParent();
-        while (parent != null && parent.startsWith(storageRoot) && !parent.equals(storageRoot)) {
-            if (!Files.exists(parent)) {
-                parent = parent.getParent();
-                continue;
-            }
-            try (var entries = Files.list(parent)) {
-                if (entries.findAny().isPresent()) {
-                    return;
-                }
-            }
-            Files.deleteIfExists(parent);
-            parent = parent.getParent();
-        }
     }
 
     private String sanitize(String name) {

@@ -50,10 +50,13 @@ public class ModerationQueryService {
                         hit.getMatchedText(),
                         hit.getCategory(),
                         hit.getSeverity(),
+                        hit.getSource(),
                         hit.getReviewStatus(),
                         hit.getStartTime(),
                         hit.getEndTime(),
-                        hit.getContextText()
+                        hit.getContextText(),
+                        hit.getAiConfidence(),
+                        reviewRepository.findByHitId(hit.getId()).map(AiReview::getReason).orElse(null)
                 ))
                 .toList();
     }
@@ -70,4 +73,3 @@ public class ModerationQueryService {
     public record HitStatusRequest(ReviewStatus status) {
     }
 }
-

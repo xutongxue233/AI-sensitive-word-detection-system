@@ -22,4 +22,14 @@ public class TranscriptSegment implements Identifiable {
     private double endTime;
 
     private String text;
+
+    private TranscriptSource source = TranscriptSource.AUDIO;
+
+    private Double bboxX;
+
+    private Double bboxY;
+
+    private Double bboxWidth;
+
+    private Double bboxHeight;
 }

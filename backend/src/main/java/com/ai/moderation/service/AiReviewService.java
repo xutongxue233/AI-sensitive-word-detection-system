@@ -6,42 +6,58 @@ import com.ai.moderation.domain.ReviewStatus;
 import com.ai.moderation.domain.TermHit;
 import com.ai.moderation.repository.AiReviewRepository;
 import com.ai.moderation.repository.TermHitRepository;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import org.springframework.http.HttpHeaders;
+import com.ai.moderation.service.AiModerationClient.AiDecision;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.util.StringUtils;
-import org.springframework.web.client.RestClient;
 
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 
 @Service
 public class AiReviewService {
-    private final AiProperties properties;
+    private static final Logger log = LoggerFactory.getLogger(AiReviewService.class);
+
+    private final SettingsService settingsService;
+    private final AiModerationClient moderationClient;
     private final TermHitRepository hitRepository;
     private final AiReviewRepository reviewRepository;
-    private final ObjectMapper objectMapper;
 
     public AiReviewService(
-            AiProperties properties,
+            SettingsService settingsService,
+            AiModerationClient moderationClient,
             TermHitRepository hitRepository,
-            AiReviewRepository reviewRepository,
-            ObjectMapper objectMapper
+            AiReviewRepository reviewRepository
     ) {
-        this.properties = properties;
+        this.settingsService = settingsService;
+        this.moderationClient = moderationClient;
         this.hitRepository = hitRepository;
         this.reviewRepository = reviewRepository;
-        this.objectMapper = objectMapper;
     }
 
     @Transactional
     public void reviewJob(Long jobId) {
-        List<TermHit> hits = hitRepository.findByJobIdOrderByStartTimeAsc(jobId);
+        reviewHits(hitRepository.findByJobIdOrderByStartTimeAsc(jobId), settingsService.currentAi());
+    }
+
+    /**
+     * 对给定命中逐条复核并按阈值把关。AI 启用时调用模型,未启用时保留规则命中。
+     * 传入的命中可为已持久化记录(update)或新建命中(insert),由 save 按 id 决定;
+     * 先落库拿到自增 id,再写对应 ai_reviews,保证新建命中的 hitId 不为空。
+     */
+    @Transactional
+    public void reviewHits(List<TermHit> hits, AiProperties ai) {
+        double threshold = ai.confidenceThreshold();
         for (TermHit hit : hits) {
-            AiDecision decision = properties.enabled() ? callAi(hit) : localFallback(hit);
+            AiDecision decision = ai.enabled() ? review(hit) : localFallback(hit);
+
+            // 置信度把关:只有 AI 确认命中且置信度达到阈值,才标记为违规进入时间轴/剪辑。
+            // 低置信命中保留记录与原因,但置为 SAFE,不会自动生成剪辑。
+            boolean pass = decision.violation() && decision.confidence() >= threshold;
+            hit.setReviewStatus(pass ? ReviewStatus.VIOLATION : ReviewStatus.SAFE);
+            hit.setAiConfidence(decision.confidence());
+            hitRepository.save(hit);
+
             AiReview review = new AiReview();
             review.setHitId(hit.getId());
             review.setViolation(decision.violation());
@@ -50,75 +66,21 @@ public class AiReviewService {
             review.setReason(decision.reason());
             review.setRawResponse(decision.rawResponse());
             reviewRepository.save(review);
-            hit.setReviewStatus(decision.violation() ? ReviewStatus.VIOLATION : ReviewStatus.SAFE);
-            hit.setAiConfidence(decision.confidence());
-            hitRepository.save(hit);
+        }
+    }
+
+    private AiDecision review(TermHit hit) {
+        try {
+            return moderationClient.review(hit);
+        } catch (Exception ex) {
+            log.warn("AI 复核失败 hitId={} matchedText={} : {}", hit.getId(), hit.getMatchedText(), ex.toString());
+            String reason = "AI 复核失败，保留规则命中结果：" + ex.getMessage();
+            return new AiDecision(true, 0.60, hit.getCategory(), reason, reason);
         }
     }
 
     private AiDecision localFallback(TermHit hit) {
         String reason = "AI 未启用，系统保留规则命中结果，建议人工确认。";
         return new AiDecision(true, 0.70, hit.getCategory(), reason, reason);
-    }
-
-    private AiDecision callAi(TermHit hit) {
-        try {
-            Map<String, Object> request = new LinkedHashMap<>();
-            request.put("model", properties.model());
-            request.put("temperature", 0);
-            request.put("response_format", Map.of("type", "json_object"));
-            request.put("messages", List.of(
-                    Map.of(
-                            "role", "system",
-                            "content", "你是视频内容审核助手。只判断候选违规词在上下文中是否构成真实违规，返回严格 JSON。"
-                    ),
-                    Map.of(
-                            "role", "user",
-                            "content", """
-                                    请根据上下文判断候选词是否违规。
-                                    如果匹配方式是 SEMANTIC，候选词只是类型候选，不是固定违规词；请重点判断它在上下文里是否属于该分类。
-                                    返回 JSON：{"violation":true|false,"confidence":0到1,"category":"分类","reason":"一句中文原因"}
-                                    候选词：%s
-                                    分类：%s
-                                    严重级别：%s
-                                    匹配方式：%s
-                                    上下文：%s
-                                    """.formatted(hit.getMatchedText(), hit.getCategory(), hit.getSeverity(), hit.getRuleSource(), hit.getContextText())
-                    )
-            ));
-            RestClient.Builder builder = RestClient.builder().baseUrl(properties.baseUrl());
-            if (StringUtils.hasText(properties.apiKey())) {
-                builder.defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + properties.apiKey());
-            }
-            JsonNode response = builder.build()
-                    .post()
-                    .uri("/v1/chat/completions")
-                    .body(request)
-                    .retrieve()
-                    .body(JsonNode.class);
-            String content = response == null ? "" : response.at("/choices/0/message/content").asText("");
-            JsonNode json = objectMapper.readTree(stripCodeFence(content));
-            return new AiDecision(
-                    json.path("violation").asBoolean(true),
-                    Math.max(0, Math.min(1, json.path("confidence").asDouble(0.6))),
-                    json.path("category").asText(hit.getCategory()),
-                    json.path("reason").asText("AI 已完成复核。"),
-                    content
-            );
-        } catch (Exception ex) {
-            String reason = "AI 复核失败，保留规则命中结果：" + ex.getMessage();
-            return new AiDecision(true, 0.60, hit.getCategory(), reason, reason);
-        }
-    }
-
-    private String stripCodeFence(String content) {
-        String value = content == null ? "" : content.trim();
-        if (value.startsWith("```")) {
-            value = value.replaceFirst("^```(?:json)?", "").replaceFirst("```$", "").trim();
-        }
-        return value;
-    }
-
-    private record AiDecision(boolean violation, double confidence, String category, String reason, String rawResponse) {
     }
 }

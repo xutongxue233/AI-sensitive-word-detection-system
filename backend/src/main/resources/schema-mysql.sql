@@ -50,6 +50,11 @@ CREATE TABLE IF NOT EXISTS transcript_segments (
     start_time DOUBLE NOT NULL,
     end_time DOUBLE NOT NULL,
     text TEXT NOT NULL,
+    source VARCHAR(20) NOT NULL DEFAULT 'AUDIO',
+    bbox_x DOUBLE,
+    bbox_y DOUBLE,
+    bbox_width DOUBLE,
+    bbox_height DOUBLE,
     KEY idx_segments_job (job_id),
     CONSTRAINT fk_segments_job FOREIGN KEY (job_id) REFERENCES detection_jobs(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -78,6 +83,7 @@ CREATE TABLE IF NOT EXISTS term_hits (
     category VARCHAR(80),
     severity VARCHAR(20) NOT NULL,
     rule_source VARCHAR(20) NOT NULL,
+    source VARCHAR(20) NOT NULL DEFAULT 'AUDIO',
     start_time DOUBLE NOT NULL,
     end_time DOUBLE NOT NULL,
     context_text TEXT,
@@ -101,6 +107,21 @@ CREATE TABLE IF NOT EXISTS ai_reviews (
     raw_response TEXT,
     created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     CONSTRAINT fk_ai_reviews_hit FOREIGN KEY (hit_id) REFERENCES term_hits(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    id BIGINT PRIMARY KEY,
+    ai_enabled TINYINT(1) NOT NULL DEFAULT 0,
+    ai_api_type VARCHAR(20) NOT NULL DEFAULT 'CHAT',
+    ai_base_url VARCHAR(500),
+    ai_api_key VARCHAR(500),
+    ai_model VARCHAR(120),
+    ai_temperature DOUBLE NOT NULL DEFAULT 0,
+    ai_confidence_threshold DOUBLE NOT NULL DEFAULT 0.6,
+    ai_timeout_seconds INT NOT NULL DEFAULT 60,
+    clip_padding_seconds DOUBLE NOT NULL DEFAULT 0.2,
+    clip_precise_export TINYINT(1) NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS clip_suggestions (

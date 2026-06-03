@@ -19,30 +19,43 @@ public class ClipSuggestionService {
     private final ClipSuggestionRepository suggestionRepository;
     private final TermHitRepository hitRepository;
     private final DetectionJobRepository jobRepository;
+    private final SettingsService settingsService;
 
     public ClipSuggestionService(
             ClipSuggestionRepository suggestionRepository,
             TermHitRepository hitRepository,
-            DetectionJobRepository jobRepository
+            DetectionJobRepository jobRepository,
+            SettingsService settingsService
     ) {
         this.suggestionRepository = suggestionRepository;
         this.hitRepository = hitRepository;
         this.jobRepository = jobRepository;
+        this.settingsService = settingsService;
+    }
+
+    /**
+     * 使用运行时设置的剪辑留白(app.clip.padding-seconds，默认 0.2s，可在前台调整)生成剪辑建议。
+     * 收紧 padding 是避免"切掉过多时间轴"的核心:命中时间戳本身已是 Whisper 词级边界。
+     */
+    @Transactional
+    public List<ClipSuggestionResponse> createSuggestions(Long jobId) {
+        return createSuggestions(jobId, settingsService.currentClip().paddingSeconds());
     }
 
     @Transactional
     public List<ClipSuggestionResponse> createSuggestions(Long jobId, double paddingSeconds) {
         DetectionJob job = jobRepository.findById(jobId)
                 .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, "检测任务不存在"));
+        double padding = Math.max(0, paddingSeconds);
         suggestionRepository.deleteByJobId(jobId);
         List<TermHit> hits = hitRepository.findByJobIdAndReviewStatusOrderByStartTimeAsc(jobId, ReviewStatus.VIOLATION);
         List<ClipSuggestion> suggestions = hits.stream().map(hit -> {
             ClipSuggestion suggestion = new ClipSuggestion();
             suggestion.setJobId(job.getId());
             suggestion.setHitId(hit.getId());
-            suggestion.setPaddingSeconds(paddingSeconds);
-            suggestion.setStartTime(Math.max(0, hit.getStartTime() - paddingSeconds));
-            suggestion.setEndTime(hit.getEndTime() + paddingSeconds);
+            suggestion.setPaddingSeconds(padding);
+            suggestion.setStartTime(Math.max(0, hit.getStartTime() - padding));
+            suggestion.setEndTime(hit.getEndTime() + padding);
             suggestion.setStatus(ClipStatus.PENDING);
             return suggestion;
         }).toList();
@@ -73,9 +86,10 @@ public class ClipSuggestionService {
     }
 
     private ClipSuggestionResponse toResponse(ClipSuggestion suggestion) {
-        String matchedText = hitRepository.findById(suggestion.getHitId())
-                .map(TermHit::getMatchedText)
-                .orElse("-");
-        return ClipSuggestionResponse.from(suggestion, matchedText);
+        TermHit hit = hitRepository.findById(suggestion.getHitId()).orElse(null);
+        String matchedText = hit == null ? "-" : hit.getMatchedText();
+        Double aiConfidence = hit == null ? null : hit.getAiConfidence();
+        TranscriptSource source = hit == null || hit.getSource() == null ? TranscriptSource.AUDIO : hit.getSource();
+        return ClipSuggestionResponse.from(suggestion, matchedText, source, aiConfidence);
     }
 }

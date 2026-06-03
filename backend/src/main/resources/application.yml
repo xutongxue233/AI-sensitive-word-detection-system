@@ -36,9 +36,21 @@ app:
     enabled: true
     base-url: http://localhost:9000
     transcribe-path: /transcribe
+  subtitle-ocr:
+    enabled: true
+    ocr-path: /ocr-subtitles
+    interval-seconds: 0.75
+    crop-bottom-ratio: 0.35
+    min-confidence: 0.35
   ai:
     enabled: false
+    api-type: chat
     base-url: http://localhost:11434
     api-key:
     model: qwen2.5
+    temperature: 0
+    confidence-threshold: 0.6
     timeout-seconds: 60
+  clip:
+    padding-seconds: 0.2
+    precise-export: false

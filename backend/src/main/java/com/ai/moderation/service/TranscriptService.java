@@ -1,10 +1,12 @@
 package com.ai.moderation.service;
 
 import com.ai.moderation.asr.TextNormalizer;
+import com.ai.moderation.asr.TextToken;
 import com.ai.moderation.asr.TranscriptionResult;
 import com.ai.moderation.asr.TranscriptionSegment;
 import com.ai.moderation.asr.TranscriptionWord;
 import com.ai.moderation.domain.DetectionJob;
+import com.ai.moderation.domain.TranscriptSource;
 import com.ai.moderation.domain.TranscriptSegment;
 import com.ai.moderation.domain.TranscriptWord;
 import com.ai.moderation.dto.TranscriptSegmentResponse;
@@ -48,10 +50,17 @@ public class TranscriptService {
             segment.setStartTime(item.start());
             segment.setEndTime(item.end());
             segment.setText(item.text() == null ? "" : item.text());
+            segment.setSource(item.source() == null ? TranscriptSource.AUDIO : item.source());
+            segment.setBboxX(item.bboxX());
+            segment.setBboxY(item.bboxY());
+            segment.setBboxWidth(item.bboxWidth());
+            segment.setBboxHeight(item.bboxHeight());
             TranscriptSegment savedSegment = segmentRepository.save(segment);
 
             List<TranscriptWord> words = new ArrayList<>();
-            List<TranscriptionWord> sourceWords = item.words() == null ? List.of() : item.words();
+            List<TranscriptionWord> sourceWords = item.words() == null || item.words().isEmpty()
+                    ? inferWords(segment.getText(), item.start(), item.end())
+                    : item.words();
             for (TranscriptionWord sourceWord : sourceWords) {
                 String normalized = textNormalizer.normalizeForMatch(sourceWord.word());
                 if (normalized.isBlank()) {
@@ -69,6 +78,22 @@ public class TranscriptService {
             }
             wordRepository.saveAll(words);
         }
+    }
+
+    private List<TranscriptionWord> inferWords(String text, double start, double end) {
+        List<TextToken> tokens = textNormalizer.tokenize(text);
+        if (tokens.isEmpty()) {
+            return List.of();
+        }
+        double duration = Math.max(0.01, end - start);
+        double step = duration / tokens.size();
+        List<TranscriptionWord> words = new ArrayList<>();
+        for (int i = 0; i < tokens.size(); i++) {
+            double wordStart = start + step * i;
+            double wordEnd = i == tokens.size() - 1 ? end : start + step * (i + 1);
+            words.add(new TranscriptionWord(tokens.get(i).text(), wordStart, wordEnd));
+        }
+        return words;
     }
 
     @Transactional(readOnly = true)
