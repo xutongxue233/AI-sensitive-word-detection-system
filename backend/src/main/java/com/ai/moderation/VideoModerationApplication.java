@@ -6,13 +6,17 @@ import com.ai.moderation.config.ClipProperties;
 import com.ai.moderation.config.FfmpegProperties;
 import com.ai.moderation.config.StorageProperties;
 import com.ai.moderation.config.SubtitleOcrProperties;
-import com.ai.moderation.config.SubtitleRemovalProperties;
 import org.mybatis.spring.annotation.MapperScan;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.scheduling.annotation.EnableAsync;
 
+/**
+ * 应用启动入口。{@code @EnableAsync} 支撑检测管线 {@code DetectionPipelineService.processAsync} 的异步执行;
+ * {@code @MapperScan} 扫描 repository 包下的 MyBatis-Plus mapper;{@code @EnableConfigurationProperties}
+ * 集中注册六组运行时配置(存储/FFmpeg/ASR/AI/剪辑/字幕 OCR)。
+ */
 @EnableAsync
 @MapperScan("com.ai.moderation.repository")
 @SpringBootApplication
@@ -22,8 +26,7 @@ import org.springframework.scheduling.annotation.EnableAsync;
         AsrProperties.class,
         AiProperties.class,
         ClipProperties.class,
-        SubtitleOcrProperties.class,
-        SubtitleRemovalProperties.class
+        SubtitleOcrProperties.class
 })
 public class VideoModerationApplication {
     public static void main(String[] args) {

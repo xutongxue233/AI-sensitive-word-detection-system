@@ -2,18 +2,21 @@ package com.ai.moderation.service;
 
 import com.ai.moderation.common.ApiException;
 import com.ai.moderation.config.AiProperties;
-import com.ai.moderation.config.AiProperties.ApiType;
+import com.ai.moderation.config.ApiType;
 import com.ai.moderation.domain.TermHit;
 import com.ai.moderation.domain.TranscriptSegment;
 import com.ai.moderation.domain.ViolationTerm;
 import com.ai.moderation.dto.AiConnectionTestRequest;
 import com.ai.moderation.dto.AiConnectionTestResponse;
+import com.ai.moderation.service.support.AiDecision;
+import com.ai.moderation.service.support.ExtractedHit;
+import com.ai.moderation.service.support.FormatMode;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
@@ -41,19 +44,6 @@ public class AiModerationClient {
     private static final Logger log = LoggerFactory.getLogger(AiModerationClient.class);
     private static final String SCHEMA_NAME = "moderation_decision";
     private static final String EXTRACTION_SCHEMA_NAME = "moderation_extraction";
-
-    /**
-     * 结构化输出兼容档位,从严到松:
-     * - JSON_SCHEMA: response_format/text.format = json_schema(OpenAI Structured Outputs)
-     * - JSON_OBJECT: response_format/text.format = json_object(JSON mode,兼容性更广)
-     * - NONE:        不下发结构化约束,纯靠 prompt + 容错解析
-     * 不同端点支持程度不一,首条命中按档位探测,遇到不支持的 400 自动降级并记忆。
-     */
-    private enum FormatMode {
-        JSON_SCHEMA,
-        JSON_OBJECT,
-        NONE
-    }
 
     // 记忆当前端点已探测出的可用档位,避免每条命中都从 json_schema 重试。
     // key 由 apiType|baseUrl|model 组成,设置变更时重新探测。
@@ -114,8 +104,7 @@ public class AiModerationClient {
                 if (next == null) {
                     throw ex;
                 }
-                log.warn("结构化输出档位 {} 不被端点支持(HTTP {}),降级为 {} 重试",
-                        mode, ex.getStatusCode().value(), next);
+                log.warn("结构化输出档位 {} 不被端点支持(HTTP {}),降级为 {} 重试", mode, ex.getStatusCode().value(), next);
                 mode = next;
             }
         }
@@ -748,13 +737,5 @@ public class AiModerationClient {
         schema.put("required", List.of("hits"));
         schema.put("additionalProperties", false);
         return schema;
-    }
-
-    public record AiDecision(boolean violation, double confidence, String category, String reason, String rawResponse) {
-    }
-
-    public record ExtractedHit(int segmentSeq, String matchedText, String term,
-                               String category, String severity,
-                               double confidence, String reason) {
     }
 }

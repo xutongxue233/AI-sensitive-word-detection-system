@@ -1,10 +1,16 @@
 package com.ai.moderation.service;
 
-import com.ai.moderation.asr.SubtitleRemovalClient;
 import com.ai.moderation.common.ApiException;
 import com.ai.moderation.config.StorageProperties;
-import com.ai.moderation.config.SubtitleRemovalProperties;
-import com.ai.moderation.domain.*;
+import com.ai.moderation.domain.ClipStatus;
+import com.ai.moderation.domain.ClipSuggestion;
+import com.ai.moderation.domain.DetectionJob;
+import com.ai.moderation.domain.JobStatus;
+import com.ai.moderation.domain.TermHit;
+import com.ai.moderation.domain.TranscriptSegment;
+import com.ai.moderation.domain.TranscriptSource;
+import com.ai.moderation.domain.VideoFile;
+import com.ai.moderation.domain.VideoStatus;
 import com.ai.moderation.dto.ExportResponse;
 import com.ai.moderation.repository.ClipSuggestionRepository;
 import com.ai.moderation.repository.DetectionJobRepository;
@@ -15,10 +21,8 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -26,8 +30,23 @@ import java.util.Objects;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+/**
+ * 导出编排服务:把已确认的剪辑建议落地为最终视频文件。
+ *
+ * <p>按命中来源 {@link TranscriptSource} 把已确认命中分流到两条 FFmpeg 路径:
+ * <ul>
+ *   <li>{@link TranscriptSource#AUDIO} 音频命中 → {@link FfmpegService#exportWithoutClips}
+ *       删除违规时间片段、concat 保留段;</li>
+ *   <li>{@link TranscriptSource#VIDEO_SUBTITLE} 画面字幕命中 → {@link FfmpegService#exportWithSubtitleBlur}
+ *       delogo 邻域插值去字幕 + 高斯柔化 + 边缘羽化。</li>
+ * </ul>
+ *
+ * <p>导出顺序刻意为<b>先擦字幕再删音频片段</b>:擦字幕在完整时间轴上按 segment 时段定位,
+ * 若先删片段会令后续 delogo 的时间戳错位。导出完成后回写视频状态为 {@link VideoStatus#EXPORTED}。
+ */
 @Service
 public class ExportService {
+
     private final StorageProperties storageProperties;
     private final VideoFileRepository videoRepository;
     private final DetectionJobRepository jobRepository;
@@ -36,8 +55,6 @@ public class ExportService {
     private final TranscriptSegmentRepository segmentRepository;
     private final FfmpegService ffmpegService;
     private final SettingsService settingsService;
-    private final SubtitleRemovalClient subtitleRemovalClient;
-    private final SubtitleRemovalProperties subtitleRemovalProperties;
 
     public ExportService(
             StorageProperties storageProperties,
@@ -47,9 +64,7 @@ public class ExportService {
             TermHitRepository hitRepository,
             TranscriptSegmentRepository segmentRepository,
             FfmpegService ffmpegService,
-            SettingsService settingsService,
-            SubtitleRemovalClient subtitleRemovalClient,
-            SubtitleRemovalProperties subtitleRemovalProperties
+            SettingsService settingsService
     ) {
         this.storageProperties = storageProperties;
         this.videoRepository = videoRepository;
@@ -59,10 +74,19 @@ public class ExportService {
         this.segmentRepository = segmentRepository;
         this.ffmpegService = ffmpegService;
         this.settingsService = settingsService;
-        this.subtitleRemovalClient = subtitleRemovalClient;
-        this.subtitleRemovalProperties = subtitleRemovalProperties;
     }
 
+    /**
+     * 导出某视频已确认的剪辑片段为最终成片。
+     *
+     * <p>流程:取该视频最近一次 {@link JobStatus#COMPLETED} 任务下、状态为
+     * {@link ClipStatus#CONFIRMED} 的建议;按命中来源拆成音频时段与字幕遮罩时段;
+     * 先 delogo 去字幕得到中间产物,再在其上删除音频片段;最后把所有建议回写为
+     * {@link ClipStatus#EXPORTED} 并标记视频 {@link VideoStatus#EXPORTED}。
+     *
+     * @param videoId 待导出的视频 id
+     * @return 导出结果(输出路径与导出片段数)
+     */
     @Transactional
     public ExportResponse exportConfirmedClips(Long videoId) {
         VideoFile video = videoRepository.findById(videoId)
@@ -100,14 +124,8 @@ public class ExportService {
                 .toList();
         Path outputDir = Path.of(storageProperties.rootPath(), "exports", "video-" + videoId, "job-" + job.getId());
         Path videoPath = Path.of(video.getStoragePath());
-        Path source;
-        if (!subtitleRanges.isEmpty() && subtitleRemovalProperties.useVsr()) {
-            // 画面命中走 VSR 切片去字幕;失败回退 delogo,保证导出不被 VSR 阻断
-            Path removed = exportSubtitlesWithVsr(videoPath, outputDir, subtitleRanges, durationValue);
-            source = removed != null ? removed : ffmpegService.exportWithSubtitleBlur(videoPath, outputDir, subtitleRanges);
-        } else {
-            source = ffmpegService.exportWithSubtitleBlur(videoPath, outputDir, subtitleRanges);
-        }
+        // 画面字幕命中统一走 delogo(邻域插值去字幕 + 高斯柔化 + 边缘羽化);无命中时方法内直接返回原视频
+        Path source = ffmpegService.exportWithSubtitleBlur(videoPath, outputDir, subtitleRanges);
         Path output = audioRanges.isEmpty()
                 ? source
                 : ffmpegService.exportWithoutClips(
@@ -123,11 +141,18 @@ public class ExportService {
         return new ExportResponse(videoId, job.getId(), output.toString(), suggestions.size());
     }
 
+    /**
+     * 判断该剪辑建议对应的命中是否走音频删片段路径。
+     * 命中缺失或 source 未标注时保守按音频处理(删片段是更安全的兜底)。
+     */
     private boolean isAudioSuggestion(ClipSuggestion suggestion, Map<Long, TermHit> hitsById) {
         TermHit hit = hitsById.get(suggestion.getHitId());
         return hit == null || hit.getSource() == null || hit.getSource() == TranscriptSource.AUDIO;
     }
 
+    /**
+     * 把画面字幕命中转换为 FFmpeg delogo 的遮罩时段+归一化矩形区域;命中缺失则返回 null 跳过。
+     */
     private FfmpegService.SubtitleMaskRange toSubtitleMaskRange(
             ClipSuggestion suggestion,
             Map<Long, TermHit> hitsById,
@@ -138,100 +163,16 @@ public class ExportService {
             return null;
         }
         TranscriptSegment segment = segmentsById.get(hit.getSegmentId());
+        // 默认 bbox(x0.08/y0.74/w0.84/h0.16)是 OCR 未写入字幕框时的兜底:
+        // 取画面底部居中的典型字幕区(归一化 0~1),覆盖绝大多数硬字幕位置。
         double x = segment == null || segment.getBboxX() == null ? 0.08 : segment.getBboxX();
         double y = segment == null || segment.getBboxY() == null ? 0.74 : segment.getBboxY();
         double width = segment == null || segment.getBboxWidth() == null ? 0.84 : segment.getBboxWidth();
         double height = segment == null || segment.getBboxHeight() == null ? 0.16 : segment.getBboxHeight();
-        return new FfmpegService.SubtitleMaskRange(suggestion.getStartTime(), suggestion.getEndTime(), x, y, width, height);
-    }
-
-    /**
-     * 用 VSR 按违规时间段切片去字幕:keep 段保留原样,违规段切出送 vsr-service inpainting 再拼回,
-     * 只去除命中字幕的像素区域。任一步失败返回 null,由调用方回退 delogo。
-     */
-    private Path exportSubtitlesWithVsr(Path input, Path outputDir,
-                                        List<FfmpegService.SubtitleMaskRange> ranges, double duration) {
-        int[] resolution = ffmpegService.probeResolution(input);
-        if (resolution == null) {
-            return null;
-        }
-        int width = resolution[0];
-        int height = resolution[1];
-        List<VsrSegment> segments = mergeRanges(ranges);
-        if (segments.isEmpty()) {
-            return input;
-        }
-        Path workDir = outputDir.resolve("vsr-work-" + System.currentTimeMillis());
-        try {
-            Files.createDirectories(workDir);
-            List<Path> parts = new ArrayList<>();
-            double cursor = 0;
-            int idx = 0;
-            for (VsrSegment seg : segments) {
-                double segStart = Math.max(0, seg.start());
-                double segEnd = Math.min(duration, seg.end());
-                if (segEnd <= segStart) {
-                    continue;
-                }
-                if (segStart > cursor + 0.04) {
-                    parts.add(ffmpegService.cutSegment(input, cursor, segStart, workDir.resolve("keep-" + idx + ".mp4")));
-                }
-                Path clip = ffmpegService.cutSegment(input, segStart, segEnd, workDir.resolve("clip-" + idx + ".mp4"));
-                List<int[]> areas = toPixelAreas(seg.boxes(), width, height);
-                Path cleaned = workDir.resolve("clean-" + idx + ".mp4");
-                if (!subtitleRemovalClient.removeSubtitle(clip, areas, cleaned)) {
-                    return null;
-                }
-                parts.add(ffmpegService.reencodeStandard(cleaned, workDir.resolve("part-" + idx + ".mp4")));
-                cursor = segEnd;
-                idx++;
-            }
-            if (cursor < duration - 0.04) {
-                parts.add(ffmpegService.cutSegment(input, cursor, duration, workDir.resolve("keep-tail.mp4")));
-            }
-            if (parts.isEmpty()) {
-                return input;
-            }
-            Path output = outputDir.resolve("subtitle-vsr-" + System.currentTimeMillis() + ".mp4");
-            return ffmpegService.concatSegments(parts, output);
-        } catch (Exception ex) {
-            return null;
-        }
-    }
-
-    /** 按时间排序,把重叠或相邻(间隔<0.3s)的画面命中段合并,聚合各段的字幕框。 */
-    private List<VsrSegment> mergeRanges(List<FfmpegService.SubtitleMaskRange> ranges) {
-        List<FfmpegService.SubtitleMaskRange> sorted = ranges.stream()
-                .sorted(Comparator.comparingDouble(FfmpegService.SubtitleMaskRange::start))
-                .toList();
-        List<VsrSegment> merged = new ArrayList<>();
-        for (FfmpegService.SubtitleMaskRange range : sorted) {
-            if (!merged.isEmpty() && range.start() <= merged.get(merged.size() - 1).end() + 0.3) {
-                VsrSegment last = merged.remove(merged.size() - 1);
-                last.boxes().add(range);
-                merged.add(new VsrSegment(last.start(), Math.max(last.end(), range.end()), last.boxes()));
-            } else {
-                List<FfmpegService.SubtitleMaskRange> boxes = new ArrayList<>();
-                boxes.add(range);
-                merged.add(new VsrSegment(range.start(), range.end(), boxes));
-            }
-        }
-        return merged;
-    }
-
-    /** 归一化字幕框转 VSR 的整数像素区域 [ymin,ymax,xmin,xmax]。 */
-    private List<int[]> toPixelAreas(List<FfmpegService.SubtitleMaskRange> boxes, int width, int height) {
-        List<int[]> areas = new ArrayList<>();
-        for (FfmpegService.SubtitleMaskRange box : boxes) {
-            int ymin = Math.max(0, Math.min(height - 1, (int) Math.round(box.y() * height)));
-            int ymax = Math.max(ymin + 1, Math.min(height, (int) Math.round((box.y() + box.height()) * height)));
-            int xmin = Math.max(0, Math.min(width - 1, (int) Math.round(box.x() * width)));
-            int xmax = Math.max(xmin + 1, Math.min(width, (int) Math.round((box.x() + box.width()) * width)));
-            areas.add(new int[]{ymin, ymax, xmin, xmax});
-        }
-        return areas;
-    }
-
-    private record VsrSegment(double start, double end, List<FfmpegService.SubtitleMaskRange> boxes) {
+        // 擦除时段用字幕整条显示时长(segment start~end),而非命中词的零点几秒,
+        // 使擦除连续覆盖整条字幕、不闪烁;segment 缺失时回退到命中词时段。
+        double maskStart = segment == null ? suggestion.getStartTime() : segment.getStartTime();
+        double maskEnd = segment == null ? suggestion.getEndTime() : segment.getEndTime();
+        return new FfmpegService.SubtitleMaskRange(maskStart, maskEnd, x, y, width, height);
     }
 }

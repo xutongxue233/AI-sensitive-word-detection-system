@@ -1,14 +1,14 @@
 package com.ai.moderation.service;
 
 import com.ai.moderation.config.AiProperties;
-import com.ai.moderation.config.AiProperties.ApiType;
+import com.ai.moderation.config.ApiType;
 import com.ai.moderation.domain.AiReview;
 import com.ai.moderation.domain.ReviewStatus;
 import com.ai.moderation.domain.Severity;
 import com.ai.moderation.domain.TermHit;
 import com.ai.moderation.repository.AiReviewRepository;
 import com.ai.moderation.repository.TermHitRepository;
-import com.ai.moderation.service.AiModerationClient.AiDecision;
+import com.ai.moderation.service.support.AiDecision;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;

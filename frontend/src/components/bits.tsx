@@ -1,3 +1,11 @@
+/**
+ * 审核工作台共享的小型展示组件,以及"后端枚举 → 中文 label / 色调"映射的集中地。
+ *
+ * 这里聚合了徽章(Pill / SeverityBadge)、统计卡(StatCard)、空态(EmptyState)、
+ * 视频帧(VideoFrame)等纯展示原子,App 等多处复用;并集中维护 SEVERITY /
+ * MATCH_TYPE / VIDEO_STATUS / JOB_STATUS / REVIEW_STATUS / CLIP_STATUS 六张映射表,
+ * 把散落各处的中文文案与色调统一在此,便于与后端枚举同步。
+ */
 import * as React from 'react';
 import type { LucideIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -50,6 +58,7 @@ export function Pill({
   );
 }
 
+/** 严重级别枚举到中文文案 + CSS 色彩变量名的映射,须与后端 Severity 同步。 */
 export const SEVERITY: Record<Severity, { label: string; varName: string }> = {
   LOW: { label: '低', varName: '--sev-low' },
   MEDIUM: { label: '中', varName: '--sev-medium' },
@@ -76,6 +85,7 @@ export function SeverityBadge({ severity, className }: { severity: Severity; cla
   );
 }
 
+/** 规则匹配类型枚举到中文文案,对应后端 MatchType 的四类召回方式。 */
 export const MATCH_TYPE: Record<MatchType, string> = {
   EXACT: '精确',
   VARIANT: '变体',
@@ -83,6 +93,7 @@ export const MATCH_TYPE: Record<MatchType, string> = {
   SEMANTIC: '语义'
 };
 
+/** 视频状态枚举到中文文案 + 色调,须与后端 VideoStatus 同步。 */
 export const VIDEO_STATUS: Record<VideoStatus, { label: string; tone: Tone }> = {
   UPLOADED: { label: '待检测', tone: 'neutral' },
   DETECTING: { label: '检测中', tone: 'primary' },
@@ -91,6 +102,7 @@ export const VIDEO_STATUS: Record<VideoStatus, { label: string; tone: Tone }> = 
   FAILED: { label: '失败', tone: 'danger' }
 };
 
+/** 检测任务状态枚举到中文文案 + 色调,各值对应检测管线的依次阶段,须与后端 JobStatus 同步。 */
 export const JOB_STATUS: Record<JobStatus, { label: string; tone: Tone }> = {
   QUEUED: { label: '排队中', tone: 'neutral' },
   EXTRACTING_AUDIO: { label: '抽取音频', tone: 'primary' },
@@ -102,6 +114,10 @@ export const JOB_STATUS: Record<JobStatus, { label: string; tone: Tone }> = {
   FAILED: { label: '失败', tone: 'danger' }
 };
 
+/**
+ * 命中复核状态枚举到中文文案 + 色调,须与后端 ReviewStatus 同步。
+ * 其中 VIOLATION / SAFE 由 AI 置信度是否达到阈值决定(达标→VIOLATION 进时间轴,否则→SAFE)。
+ */
 export const REVIEW_STATUS: Record<ReviewStatus, { label: string; tone: Tone }> = {
   PENDING: { label: '待复核', tone: 'neutral' },
   VIOLATION: { label: '违规', tone: 'danger' },
@@ -110,6 +126,7 @@ export const REVIEW_STATUS: Record<ReviewStatus, { label: string; tone: Tone }> 
   IGNORED: { label: '已忽略', tone: 'neutral' }
 };
 
+/** 剪辑建议状态枚举到中文文案 + 色调,须与后端 ClipStatus 同步。 */
 export const CLIP_STATUS: Record<ClipStatus, { label: string; tone: Tone }> = {
   PENDING: { label: '待确认', tone: 'warn' },
   CONFIRMED: { label: '已确认', tone: 'success' },
@@ -182,6 +199,14 @@ export function EmptyState({
   );
 }
 
+/**
+ * 视频帧播放器:加载失败时降级为"视频源不可用"占位。
+ * 用于在后端未启动或地址错误时给出可解释的反馈,而非空白播放器。
+ *
+ * @param src 视频源地址
+ * @param label 帧标题(如"原始视频"/"导出结果")
+ * @param icon 标题栏与占位态使用的图标
+ */
 export function VideoFrame({
   src,
   label,

@@ -1,7 +1,7 @@
 package com.ai.moderation.service;
 
 import com.ai.moderation.config.AiProperties;
-import com.ai.moderation.config.AiProperties.ApiType;
+import com.ai.moderation.config.ApiType;
 import com.ai.moderation.config.ClipProperties;
 import com.ai.moderation.domain.AppSetting;
 import com.ai.moderation.dto.SettingsResponse;
@@ -33,6 +33,7 @@ public class SettingsService {
         this.clipDefaults = clipDefaults;
     }
 
+    /** 当前 AI 设置投影:把 {@link AppSetting} 行映射为不可变 {@link AiProperties},各项为空时回落到内置默认值。 */
     public AiProperties currentAi() {
         AppSetting s = load();
         return new AiProperties(
@@ -47,6 +48,7 @@ public class SettingsService {
         );
     }
 
+    /** 当前剪辑设置投影:把 {@link AppSetting} 行映射为不可变 {@link ClipProperties},为空时回落默认值。 */
     public ClipProperties currentClip() {
         AppSetting s = load();
         return new ClipProperties(
@@ -55,6 +57,7 @@ public class SettingsService {
         );
     }
 
+    /** 面向前台的设置快照:出于安全不回传明文 ApiKey,仅以 {@code aiApiKeyConfigured} 标记是否已配置。 */
     public SettingsResponse currentResponse() {
         AppSetting s = load();
         AiProperties ai = currentAi();
@@ -73,6 +76,7 @@ public class SettingsService {
         );
     }
 
+    /** 更新设置:仅覆盖请求中非空字段,置信度阈值钳到 [0,1]、超时/留白做下限保护,落库后刷新内存缓存。 */
     @Transactional
     public SettingsResponse update(SettingsUpdateRequest request) {
         AppSetting s = load();
@@ -112,6 +116,7 @@ public class SettingsService {
         return currentResponse();
     }
 
+    /** 懒加载当前设置:volatile 缓存 + synchronized 双重检查锁,避免每次 AI 调用查库;首次无记录则 {@link #seedDefaults}。 */
     private AppSetting load() {
         AppSetting current = cache;
         if (current != null) {
@@ -127,6 +132,7 @@ public class SettingsService {
         }
     }
 
+    /** 仅当 DB 无记录时,用 application.yml 的 {@link AiProperties}/{@link ClipProperties} 默认值落库种子行。 */
     private AppSetting seedDefaults() {
         AppSetting row = new AppSetting();
         row.setId(ROW_ID);

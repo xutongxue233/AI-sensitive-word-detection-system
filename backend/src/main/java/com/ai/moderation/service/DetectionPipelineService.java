@@ -34,6 +34,22 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
+/**
+ * 检测管线编排器:整个视频审核流程的中枢。
+ *
+ * <p>{@link #processAsync} 以 {@code @Async} 异步执行,串起六个阶段——抽音频转写、落库转写、规则召回、
+ * AI 复核、剪辑建议、收尾——每阶段都通过 {@link #mark} 写 {@link JobStatus} 与进度百分比,供前端轮询展示。
+ *
+ * <p>关键设计:
+ * <ul>
+ *   <li>音画两腿并行集中在 {@link #buildTranscript}——音频腿(Whisper)失败即任务失败,画面 OCR 腿失败降级为空。
+ *   <li>任一阶段抛异常即把整个任务置为 {@link JobStatus#FAILED},不做部分成功。
+ *   <li>{@code finally} 始终调 {@link #cleanupWorkDir} 清理 {@code job-{id}} 临时目录(主要是抽出的 audio.wav),
+ *       无论成败都不残留中间产物。
+ * </ul>
+ *
+ * 由 {@link VideoService#createDetectionJob} 在创建任务后触发。
+ */
 @Service
 public class DetectionPipelineService {
     private static final Logger log = LoggerFactory.getLogger(DetectionPipelineService.class);
@@ -86,11 +102,21 @@ public class DetectionPipelineService {
         this.clipSuggestionService = clipSuggestionService;
     }
 
+    /** 容器销毁时优雅关闭转写线程池,避免守护线程残留。 */
     @PreDestroy
     public void shutdownTranscriptExecutor() {
         transcriptExecutor.shutdown();
     }
 
+    /**
+     * 异步执行整条检测管线:抽音频转写 → 落库 → 规则召回 → AI 复核 → 剪辑建议 → 收尾。
+     *
+     * <p>每个阶段先 {@link #mark} 写状态与进度;全程顺利则置 {@link JobStatus#COMPLETED}+视频 {@link VideoStatus#DETECTED};
+     * 任一阶段抛出任意 {@link Throwable} 即整任务 {@link JobStatus#FAILED}+视频 {@link VideoStatus#FAILED} 并记录根因;
+     * 无论成败,{@code finally} 都清理 {@code job-{id}} 临时目录。
+     *
+     * @param jobId 待处理的检测任务 id,由 {@link VideoService#createDetectionJob} 创建并传入
+     */
     @Async
     public void processAsync(Long jobId) {
         DetectionJob job = jobRepository.findById(jobId).orElseThrow();
@@ -131,6 +157,7 @@ public class DetectionPipelineService {
         }
     }
 
+    /** 删除本次检测的临时工作目录 {@code job-{id}}(主要是抽出的 audio.wav);失败只记日志不影响主流程。 */
     private void cleanupWorkDir(VideoFile video, Long jobId) {
         if (video.getStoragePath() == null) {
             return;
@@ -156,6 +183,22 @@ public class DetectionPipelineService {
         }
     }
 
+    /**
+     * 构建转写结果:音频腿与画面腿并行,合并去重后返回。
+     *
+     * <p>两腿在 {@link #transcriptExecutor} 上并行:
+     * <ul>
+     *   <li>腿A 音频:FFmpeg 抽 16k mono wav → Whisper 转写,失败即任务失败(不降级)。
+     *   <li>腿B 画面:仅当无外部字幕文件时跑 OCR,失败经 {@code handle} 降级为空,不拖垮音频腿。
+     * </ul>
+     * 有外部 {@code .srt/.vtt} 时跳过腿B,改用 {@link SubtitleParser} 解析。各层经 {@link TranscriptionMerger#merge}
+     * 按来源+时间重叠去重合并;若合并后无任何片段则抛 {@link ApiException}(若 OCR 曾失败附上根因便于排障)。
+     *
+     * @param job   当前检测任务,用于推导 {@code job-{id}} 工作目录
+     * @param video 视频记录,提供存储路径与可选外部字幕路径
+     * @return 合并后的转写结果(至少含一条片段)
+     * @throws Exception 音频腿异常或两腿均无有效结果时抛出
+     */
     private TranscriptionResult buildTranscript(DetectionJob job, VideoFile video) throws Exception {
         Path videoPath = Path.of(video.getStoragePath());
 
@@ -230,6 +273,7 @@ public class DetectionPipelineService {
         return new ApiException(HttpStatus.BAD_GATEWAY, message);
     }
 
+    /** 取异常根因消息(展开 CompletionException 的 cause),无消息则回退到异常简单类名。 */
     private String rootMessage(Throwable ex) {
         Throwable cause = ex instanceof CompletionException && ex.getCause() != null ? ex.getCause() : ex;
         return cause.getMessage() == null ? cause.getClass().getSimpleName() : cause.getMessage();
@@ -239,6 +283,7 @@ public class DetectionPipelineService {
         return result != null && result.segments() != null && !result.segments().isEmpty();
     }
 
+    /** 写入任务阶段状态与进度;首次进入(startedAt 为空)时记录开始时间。 */
     private void mark(DetectionJob job, JobStatus status, int progress) {
         job.setStatus(status);
         job.setProgress(progress);

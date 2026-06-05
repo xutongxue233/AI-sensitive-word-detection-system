@@ -8,6 +8,7 @@ frontend/*.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
 asr-service/.venv/
+ocr-service/.venv/
 __pycache__/
 *.pyc
 tmp-smoke/

@@ -1,3 +1,12 @@
+/**
+ * 前端唯一的后端 REST 客户端:统一封装对 `/api/v1` 的访问。
+ *
+ * 按业务域分组导出函数:词库 / 视频 / 任务 / 转写 / 命中 / 时间轴 / 剪辑建议 /
+ * 导出 / 设置。约定每个调用都返回 `res.data` 解包后的领域对象(类型见 {@link ./types}),
+ * 调用方拿到的直接是 DTO,无需再处理 axios 响应包装。
+ *
+ * 与后端 controller(统一前缀 `/api/v1`)一一对应;后端改动接口路径/形状时须同步此处。
+ */
 import axios, { AxiosProgressEvent } from 'axios';
 import {
   AiConnectionTestRequest,
@@ -20,6 +29,16 @@ import {
 export const api = axios.create({
   baseURL: '/api/v1'
 });
+
+/**
+ * 从未知异常中提取可展示给用户的错误文案。
+ *
+ * 兜底顺序 `data.message → data.error → error.message → fallback`:因国产 AI 网关
+ * 与各后端返回的错误结构不统一(有的放 `message`、有的放 `error`),需逐级回退。
+ *
+ * @param error 捕获到的异常,可能是 AxiosError、普通 Error 或任意值
+ * @param fallback 全部字段缺失时的默认文案
+ */
 
 export function getErrorMessage(error: unknown, fallback = '操作失败') {
   if (axios.isAxiosError(error)) {
@@ -48,6 +67,17 @@ export const importTerms = (file: File) => {
 
 export const listVideos = () => api.get<VideoFile[]>('/videos').then((res) => res.data);
 
+/**
+ * 上传视频,可选携带外部字幕文件。
+ *
+ * 通过 multipart 表单提交;`subtitle` 缺省时不附带(后端据此决定是否跑画面 OCR 腿)。
+ * 上传进度经 `onUploadProgress` 把 `loaded/total` 换算为 0~100 的整数百分比回调;
+ * 当 `total` 缺失(部分浏览器/代理不给总长度)时不触发回调,避免传出错误进度。
+ *
+ * @param video 待上传的视频文件
+ * @param subtitle 可选的外部字幕文件(.srt/.vtt)
+ * @param onProgress 可选的进度回调,入参为 0~100 的整数百分比
+ */
 export const uploadVideo = (video: File, subtitle?: File, onProgress?: (percent: number) => void) => {
   const form = new FormData();
   form.append('video', video);

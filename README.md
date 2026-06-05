@@ -41,7 +41,8 @@ AI 敏感词检测系统是一个基于 `Spring Boot + React` 的视频内容审
 .
 ├── backend/      # Spring Boot 后端 API、检测管线、MyBatis-Plus Mapper
 ├── frontend/     # React + Vite 前端审核工作台
-├── asr-service/  # FastAPI + openai/whisper + PaddleOCR 本地识别服务
+├── asr-service/  # FastAPI + openai/whisper 语音识别(GPU: install-gpu.bat 装 torch cu130)
+├── ocr-service/  # FastAPI + PaddleOCR 画面字幕识别(GPU: install-ocr-gpu.bat, 独立 venv 不含 torch)
 └── README.md
 ```
 
@@ -150,6 +151,7 @@ $env:PADDLE_OCR_ENABLE_MKLDNN='false'
 - CPU 环境保持 `WHISPER_FP16=false`；使用 CUDA 时可按硬件情况改为 `true`。
 - 默认启用 beam search（`WHISPER_BEAM_SIZE=5`）提升数字/口语识别（如「几十块」不易被听成「十块」）；CPU 上更慢，可设 `WHISPER_BEAM_SIZE=0` 改用更快的贪心解码。
 - 默认输出会使用简体中文提示词，并通过 OpenCC 做繁转简。
+- **NVIDIA GPU 加速**：以上为 CPU 默认配置；有 NVIDIA 显卡时见下方「GPU 加速」章节一键切到 CUDA（含 RTX 50 系 Blackwell）。
 
 ### 启动后端
 
@@ -188,39 +190,66 @@ app:
 - `crop-bottom-ratio` 表示从画面底部向上扫描的高度占比：`1.0` 扫描整个画面（识别任意位置文字，默认）；`0.35` 仅扫底部字幕条（更快，但会漏掉非底部的文字）。
 - `interval-seconds` 越小越不容易漏字幕，但 OCR 更慢。
 - OCR 结果会与音频 ASR 结果合并为两层；同一时间段口播和字幕文本相同也会保留两条来源，因为音频和字幕需要分别处理。
-- 导出时，音频来源命中按现有方式删除对应时间片段；画面字幕来源命中默认调用 VSR 做 AI 修复去除（见下节），VSR 不可用时回退 ffmpeg delogo 邻域插值（超宽字幕条自动横向分块），仍不可用时回退盒式模糊。
+- 导出时，音频来源命中按现有方式删除对应时间片段；画面字幕来源命中走 ffmpeg delogo 邻域插值修复（抹除字幕并尽量融入背景，超宽字幕条自动横向分块，再做高斯柔化与边缘羽化），无法探测分辨率时回退盒式模糊。
 
-### 启动 VSR 画面字幕去除服务（默认启用）
+### GPU 加速（NVIDIA 显卡 / RTX 50 系 Blackwell sm_120）
 
-画面字幕命中默认走 VSR（[Video-Subtitle-Remover](https://github.com/YaoFANGUK/video-subtitle-remover)）做 AI 逐帧修复去除，效果优于 delogo。VSR 依赖 `paddlepaddle 3.0`，与 asr-service 的 `2.6.2` 冲突，因此作为**独立服务**运行：
+两处本地推理（Whisper 语音识别、PaddleOCR 画面字幕）默认跑在 CPU。有 NVIDIA 显卡时可切到 GPU 大幅提速。核心动作是把深度学习框架换成**包含对应 GPU 计算核（kernel）的 CUDA 构建**——旧版本在新显卡上会报 `no kernel image is available for execution on the device`。
+
+> RTX 50 系（Blackwell，计算能力 sm_120）需要较新的框架：PyTorch 走 CUDA 13.0（cu130）构建，PaddlePaddle 走 CUDA 12.9（cu129）构建。下面命令以此为准；更早的显卡可改用对应的 cu121/cu124 等构建。
+
+> **重要架构说明**：torch（Whisper, CUDA 13）与 paddlepaddle-gpu（OCR, CUDA 12）共用同名 `cudnn64_9.dll`，**无法在同一进程共存**（报 `WinError 127`），且 paddleocr 在检测到 torch 时会拉起它。因此 Whisper 与 OCR 用**两个独立 venv、两个进程**：asr venv 装 torch（GPU）跑 Whisper（9000）；OCR 用独立目录 ocr-service 的专用 venv（装 paddle GPU + paddleocr、**不装 torch**，paddleocr 自动降级为纯 paddle）跑 `ocr_app.py`（9001）。
+
+#### 1. 安装两个 GPU 环境
+
+**Whisper（asr-service/.venv，torch cu130）**：
 
 ```powershell
-git clone https://github.com/YaoFANGUK/video-subtitle-remover
-# 在 VSR 的独立 venv 中按其 requirements 安装依赖(PyTorch / paddlepaddle 3.0 等)，首次运行会下载 STTN 模型
-# 同一 venv 再安装本服务依赖：
-pip install -r vsr-service/requirements.txt
-
-$env:VSR_HOME='D:\path\to\video-subtitle-remover'
-python vsr-service/app.py   # 默认端口 9100，无 NVIDIA GPU 时自动用 CPU
+cd asr-service
+.\install-gpu.bat
 ```
 
-后端对应配置（`application.yml`）：
+**OCR（ocr-service/.venv，paddle GPU + paddleocr，不含 torch）**：
 
-```yaml
-app:
-  subtitle-removal:
-    engine: vsr               # vsr = AI inpainting 去除; delogo = ffmpeg 邻域插值(快,无需此服务)
-    base-url: http://localhost:9100
-    inpaint-mode: sttn_auto   # sttn_auto / sttn_det / lama / propainter / opencv
-    timeout-seconds: 600
+```powershell
+cd ocr-service
+.\install-ocr-gpu.bat
 ```
 
-说明：
+`install-ocr-gpu.bat` 会新建 `.venv` 并装 `paddlepaddle-gpu==3.2.1`(cu129) + `nvidia-cuda-nvrtc-cu12`(cuDNN 运行时编译所需) + `paddleocr` + 服务依赖；它**不装 torch**——这是 OCR 能用 GPU 的关键（有 torch 会和 paddle 的 cuDNN 冲突）。脚本结尾会校验该 venv 里确实没有 torch。
 
-- 仅去除命中敏感词的字幕区域，且仅在违规命中的时间段（后端按时间段切片送 VSR，再把处理后的片段拼回原视频）。
-- VSR 调用失败（未启动 / 超时 / 出错）自动回退 delogo，导出不被阻断。
-- CPU 上 inpainting 较慢，因此只处理违规片段而非整片；若违规片段多，导出会明显变慢。
-- 不需要 AI 去除时把 `engine` 改为 `delogo` 即可，无需启动本服务。
+#### 2. 启动（GPU 模式）
+
+根目录提供启动脚本，一键拉起全部服务：
+
+```powershell
+start-all.bat
+```
+
+会分别打开 ASR(9000) / OCR(9001) / Backend(8090) / Frontend(5174) 四个窗口，各自已内置 GPU 环境变量与 Java 21 路径。也可单独运行 `_run-asr.bat` / `_run-ocr.bat` / `_run-backend.bat` / `_run-frontend.bat`。
+
+> 脚本内置的环境变量：Whisper 用 `WHISPER_DEVICE=cuda` / `WHISPER_FP16=true`（模型默认 `large-v3-turbo`，适配 8GB）；OCR 用 `PADDLE_OCR_USE_GPU=true`。后端 `_run-backend.bat` 把 `JAVA_HOME` 指向 Java 21（你的 `mvn` 默认可能是 JDK8，会编译失败，必须用 21）。
+
+验证 GPU 是否真正生效：
+- Whisper：`http://127.0.0.1:9000/health` → `gpu.torchCudaAvailable=true`、`gpu.torchHasSm120=true`。
+- OCR：`http://127.0.0.1:9001/health` → `gpu.paddleCompiledWithCuda=true`。
+
+后端 `application.yml` 的 `app.subtitle-ocr.base-url` 已指向 `http://localhost:9001`（独立 OCR 服务）。
+
+> 说明：PaddleOCR 升级到 3.x 后，旧的 `use_gpu` / `show_log` / `enable_mkldnn` / `use_angle_cls` 参数已移除或更名，GPU 改由 `device='gpu'` 控制（后端按 `PADDLE_OCR_USE_GPU` 自动注入）；`PADDLE_OCR_VERSION` 默认 `PP-OCRv4`，需要时可设为空或 `PP-OCRv5`。
+
+#### 3. 显存说明（8GB 卡重要）
+
+- Whisper `large-v3`（FP16）推理峰值约 5–8GB，随音频时长与 `WHISPER_BEAM_SIZE` 变化。8GB 卡偏紧，若 OOM：把 `WHISPER_BEAM_SIZE` 调小，或把 `WHISPER_MODEL` 换成 `large-v3-turbo`（质量接近、显存友好）。
+- Whisper 与 OCR 是两个进程、各自占显存，单任务的音频腿与画面腿并发时会叠加。8GB 卡若吃紧，可让 OCR 服务设 `PADDLE_OCR_USE_GPU=false` 回 CPU，把显存让给 Whisper。
+
+#### 4. GPU 故障排查
+
+- `no kernel image is available`：装了不含当前显卡计算核的旧框架，重跑 `install-gpu.bat`（RTX 50 系务必用 cu130 / cu129 构建，不要用 PyPI 默认的 `paddlepaddle-gpu`，那是旧 cu102 构建，不含 sm_120）。
+- OCR 报 `cudnn_cnn64_9.dll ... WinError 127`：多半是 OCR 和 Whisper 跑在了同一进程。确认 OCR 用独立的 `ocr_app.py`（端口 9001）启动、且未在该进程引入 torch，`application.yml` 的 `app.subtitle-ocr.base-url` 指向 9001。
+- 配了 `WHISPER_DEVICE=cuda` 却仍很慢/报错：多半装的是 CPU 版 torch（版本号带 `+cpu`）。`/health` 的 `gpu.torchCudaAvailable` 会显示 `false`；按上面重装。
+- `paddleocr` 升级后把 `numpy` 顶到 2.x 导致 whisper/numba 报错：`.\.venv\Scripts\python.exe -m pip install numpy==1.26.4` 钉回。
+- 编译 backend 报 `record` / text block 之类语法错误：用了 JDK8，请改用 Java 21（`set JAVA_HOME=...\jdk21`）后再 `mvn`。
 
 ### AI 复核（OpenAI 兼容）
 
@@ -365,7 +394,8 @@ The system is designed for auditability and precise timeline positioning instead
 .
 ├── backend/      # Spring Boot APIs, detection pipeline, MyBatis-Plus mappers
 ├── frontend/     # React + Vite moderation console
-├── asr-service/  # FastAPI + openai/whisper + PaddleOCR local recognition service
+├── asr-service/  # FastAPI + openai/whisper speech recognition (GPU: install-gpu.bat, torch cu130)
+├── ocr-service/  # FastAPI + PaddleOCR hard-subtitle recognition (GPU: install-ocr-gpu.bat, separate venv, no torch)
 └── README.md
 ```
 
@@ -470,6 +500,7 @@ Notes:
 - The default is `large-v3`; CPU inference is slower, so use `base` or `small` only for quick workflow checks.
 - Keep `WHISPER_FP16=false` on CPU; set it to `true` only when your CUDA hardware supports it.
 - Simplified Chinese is enforced with both prompt guidance and OpenCC fallback conversion.
+- For NVIDIA GPU acceleration (including RTX 50 series / Blackwell sm_120), see the "GPU 加速" section above. In GPU mode the OCR runs as a separate process (`ocr_app.py`, port 9001) from Whisper (`app.py`, port 9000), since torch and paddle cannot share one process on CUDA.
 
 ### Start Backend
 

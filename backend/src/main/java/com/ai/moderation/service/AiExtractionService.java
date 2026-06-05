@@ -2,14 +2,23 @@ package com.ai.moderation.service;
 
 import com.ai.moderation.asr.TextNormalizer;
 import com.ai.moderation.config.AiProperties;
-import com.ai.moderation.domain.*;
+import com.ai.moderation.domain.AiReview;
+import com.ai.moderation.domain.MatchType;
+import com.ai.moderation.domain.ReviewStatus;
+import com.ai.moderation.domain.Severity;
+import com.ai.moderation.domain.TermHit;
+import com.ai.moderation.domain.TranscriptSegment;
+import com.ai.moderation.domain.TranscriptSource;
+import com.ai.moderation.domain.TranscriptWord;
+import com.ai.moderation.domain.ViolationTerm;
 import com.ai.moderation.repository.AiReviewRepository;
 import com.ai.moderation.repository.TermHitRepository;
 import com.ai.moderation.repository.TranscriptSegmentRepository;
 import com.ai.moderation.repository.TranscriptWordRepository;
 import com.ai.moderation.repository.ViolationTermRepository;
-import com.ai.moderation.service.AiModerationClient.ExtractedHit;
-import com.ai.moderation.service.SegmentTimeLocator.TimeRange;
+import com.ai.moderation.service.support.ExtractedHit;
+import com.ai.moderation.service.support.PreparedAiHit;
+import com.ai.moderation.service.support.SegmentTimeRange;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -68,6 +77,16 @@ public class AiExtractionService {
         this.termRepository = termRepository;
     }
 
+    /**
+     * AI 复核阶段入口:决定走「整篇提取」主路径还是「逐条复核」回退路径。
+     * AI 未启用、或无字幕/无词库时,直接回退 {@link AiReviewService#reviewJob}(规则候选逐条复核)。
+     * 否则把字幕按 {@link #BATCH_SIZE} 分批交给模型整篇提取命中:
+     * 只要有任一批成功即采用提取结果(失败批仅告警跳过,不拖垮整体);全部批失败才整体回退逐条复核。
+     * 提取命中经去重、与规则候选合并去重后,清掉原始候选并按置信度阈值落库;
+     * 未被任一 AI 命中覆盖的规则残余候选仍交逐条复核兜底。
+     *
+     * @param jobId 当前检测任务 id
+     */
     @Transactional
     public void extractAndReview(Long jobId) {
         AiProperties ai = settingsService.currentAi();
@@ -117,6 +136,18 @@ public class AiExtractionService {
         aiReviewService.reviewHits(residualRuleHits, ai);
     }
 
+    /**
+     * 把模型返回的提取命中({@link ExtractedHit})转成可落库的 {@link TermHit}(包裹为 {@link PreparedAiHit} 以携带原因)。
+     * 用 sequenceNo 回查所属段(段号越界则丢弃,不按下标盲猜定位),再用段内词级时间戳定位 matchedText 的起止秒;
+     * 词库词条按归一化文本/分类回查,匹配到则继承其分类/严重级别/匹配类型,否则用模型给出的值兜底。
+     * 词列表按段缓存避免重复查询。
+     *
+     * @param jobId     当前任务 id
+     * @param segments  本任务全部转写段(按段号回查与构建上下文)
+     * @param terms     全量启用词库(用于回查命中对应的词条)
+     * @param extracted 模型返回的提取命中
+     * @return 已定位时间轴、可落库的 AI 命中列表
+     */
     private List<PreparedAiHit> toAiHits(Long jobId, List<TranscriptSegment> segments,
                                          List<ViolationTerm> terms, List<ExtractedHit> extracted) {
         Map<Integer, TranscriptSegment> segmentBySeq = new HashMap<>();
@@ -135,7 +166,7 @@ public class AiExtractionService {
             }
             List<TranscriptWord> words = wordsCache.computeIfAbsent(
                     segment.getId(), wordRepository::findBySegmentIdOrderBySequenceNoAsc);
-            TimeRange range = segmentTimeLocator.locate(segment, words, eh.matchedText());
+            SegmentTimeRange range = segmentTimeLocator.locate(segment, words, eh.matchedText());
             ViolationTerm term = findTerm(terms, eh);
 
             TermHit hit = new TermHit();
@@ -274,8 +305,5 @@ public class AiExtractionService {
 
     private static String emptyToNull(String value) {
         return value == null || value.isBlank() ? null : value;
-    }
-
-    private record PreparedAiHit(TermHit hit, String reason) {
     }
 }

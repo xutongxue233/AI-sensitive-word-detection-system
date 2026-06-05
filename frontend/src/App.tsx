@@ -17,6 +17,7 @@ import {
   Play,
   Plus,
   RefreshCw,
+  CheckCheck,
   Scissors,
   Search,
   Settings,
@@ -129,6 +130,10 @@ import { Toaster } from '@/components/ui/sonner';
 
 type NavKey = 'videos' | 'terms';
 
+/**
+ * 左侧导航与顶栏共用的页面元数据。
+ * key 决定主区渲染哪个页面;eyebrow 是顶栏上方的英文小标识;title/desc 用于顶栏标题区。
+ */
 const NAV = [
   {
     key: 'videos' as const,
@@ -148,12 +153,21 @@ const NAV = [
   }
 ];
 
+/**
+ * 把后端 {@link TranscriptSource} 三类转写来源映射为前端中文标签与色调。
+ * 三类对应不同的导出处理方式:AUDIO/SUBTITLE_FILE 命中按删音频段处理,VIDEO_SUBTITLE 命中按去字幕(遮盖)处理。
+ */
 const TRANSCRIPT_SOURCE: Record<TranscriptSource, { label: string; tone: 'neutral' | 'primary' | 'success' | 'info' | 'warn' | 'danger' }> = {
   AUDIO: { label: '音频', tone: 'primary' },
   SUBTITLE_FILE: { label: '字幕文件', tone: 'info' },
   VIDEO_SUBTITLE: { label: '画面字幕', tone: 'warn' }
 };
 
+/**
+ * 管理明暗主题。
+ * 初值取自 document.documentElement 上的 dark class,以兼容首屏内联脚本提前设置的主题(避免闪烁);
+ * 主题变更时切换 root 的 dark class 并持久化到 localStorage('vm-theme')。
+ */
 function useTheme() {
   const [theme, setTheme] = useState<'light' | 'dark'>(() =>
     typeof document !== 'undefined' && document.documentElement.classList.contains('dark') ? 'dark' : 'light'
@@ -164,7 +178,7 @@ function useTheme() {
     try {
       localStorage.setItem('vm-theme', theme);
     } catch {
-      /* ignore */
+      /* 隐私模式下 localStorage 不可写,忽略即可 */
     }
   }, [theme]);
   return { theme, toggle: () => setTheme((t) => (t === 'dark' ? 'light' : 'dark')) };
@@ -268,6 +282,15 @@ function StatusLine({ label, ok, note }: { label: string; ok: boolean; note?: st
   );
 }
 
+/**
+ * 顶栏:展示当前页面标题区、小屏导航、实时时钟与设置/主题切换按钮。
+ *
+ * @param active 当前激活的页面 key,用于查 {@link NAV} 取标题元数据
+ * @param onNavigate 小屏导航切换页面回调
+ * @param theme 当前主题,决定切换按钮显示太阳/月亮图标
+ * @param onToggleTheme 切换明暗主题回调
+ * @param onOpenSettings 打开系统设置弹窗回调
+ */
 function TopBar({
   active,
   onNavigate,
@@ -284,6 +307,7 @@ function TopBar({
   const current = NAV.find((n) => n.key === active)!;
   const [clock, setClock] = useState(() => new Date());
   useEffect(() => {
+    // 每秒刷新时钟;卸载时清理定时器避免泄漏
     const timer = window.setInterval(() => setClock(new Date()), 1000);
     return () => window.clearInterval(timer);
   }, []);
@@ -335,6 +359,10 @@ function TopBar({
   );
 }
 
+/**
+ * 根组件:持有导航激活页、主题与设置弹窗的开关状态,
+ * 编排 {@link Sidebar} / {@link TopBar} 与主区({@link VideosPage} 或 {@link TermsPage})。
+ */
 export default function App() {
   const { theme, toggle } = useTheme();
   const [active, setActive] = useState<NavKey>('videos');
@@ -367,6 +395,23 @@ export default function App() {
 
 /* ============================ 视频检测 ============================ */
 
+/**
+ * 视频检测工作台:上传视频与可选字幕文件、触发检测任务、轮询查看任务详情、导出去违规版本、删除视频。
+ * 顶部展示队列统计卡片,下方为可分页的视频队列表格;点击「详情」在侧拉抽屉内渲染 {@link JobDetail}。
+ */
+/** 客户端分页:维护页码、按数据条数自动钳制页码到合法区间,并切出当前页数据。视频/命中/词库三处列表共用。 */
+function usePagination<T>(items: T[], pageSize: number) {
+  const [page, setPage] = useState(1);
+  const pageCount = Math.max(1, Math.ceil(items.length / pageSize));
+  // 数据条数变化(删除、检索等)后把页码钳制回合法区间,避免停留在已不存在的页
+  useEffect(() => {
+    setPage((p) => Math.min(p, pageCount));
+  }, [pageCount]);
+  const safePage = Math.min(page, pageCount);
+  const pageItems = items.slice((safePage - 1) * pageSize, safePage * pageSize);
+  return { page: safePage, setPage, pageCount, pageItems };
+}
+
 function VideosPage() {
   const [videos, setVideos] = useState<VideoFile[]>([]);
   const [loading, setLoading] = useState(false);
@@ -376,8 +421,8 @@ function VideosPage() {
   const [selected, setSelected] = useState<{ videoId: number; jobId?: number } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<VideoFile | null>(null);
   const [deleting, setDeleting] = useState(false);
-  const [page, setPage] = useState(1);
   const pageSize = 6;
+  const { page, setPage, pageCount, pageItems } = usePagination(videos, pageSize);
   const subtitleInputRef = useRef<HTMLInputElement>(null);
 
   const load = async () => {
@@ -394,11 +439,6 @@ function VideosPage() {
   useEffect(() => {
     load();
   }, []);
-
-  useEffect(() => {
-    const pc = Math.max(1, Math.ceil(videos.length / pageSize));
-    setPage((p) => Math.min(p, pc));
-  }, [videos.length]);
 
   const handleUpload = async (files: File[]) => {
     const video = files[0];
@@ -464,9 +504,6 @@ function VideosPage() {
     const exported = videos.filter((v) => v.status === 'EXPORTED').length;
     return { total: videos.length, done, processing, exported };
   }, [videos]);
-
-  const pageCount = Math.max(1, Math.ceil(videos.length / pageSize));
-  const pageItems = videos.slice((Math.min(page, pageCount) - 1) * pageSize, Math.min(page, pageCount) * pageSize);
 
   return (
     <div className="flex flex-col gap-5">
@@ -636,7 +673,7 @@ function VideosPage() {
                   })}
                 </TableBody>
               </Table>
-              <DataPagination page={Math.min(page, pageCount)} pageSize={pageSize} total={videos.length} onPageChange={setPage} />
+              <DataPagination page={page} pageSize={pageSize} total={videos.length} onPageChange={setPage} />
             </>
           )}
         </CardContent>
@@ -690,6 +727,12 @@ function VideosPage() {
 
 /* ============================ 检测详情 ============================ */
 
+/**
+ * 单个检测任务详情:原始视频与去违规版本对照、任务进度轮询、违规词时间轴、剪辑建议(可编辑/确认/重生成)、命中与 AI 复核明细、字幕片段。
+ *
+ * @param videoId 所属视频 id
+ * @param initialJobId 初次打开时已知的任务 id;缺省时取该视频最近一次任务
+ */
 function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: number }) {
   const [video, setVideo] = useState<VideoFile | null>(null);
   const [job, setJob] = useState<DetectionJob | null>(null);
@@ -699,7 +742,8 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
   const [suggestions, setSuggestions] = useState<ClipSuggestion[]>([]);
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
-  const [hitPage, setHitPage] = useState(1);
+  const hitPageSize = 6;
+  const { page: hitPage, setPage: setHitPage, pageCount: hitPageCount, pageItems: hitItems } = usePagination(hits, hitPageSize);
 
   const activeJobId = job?.id ?? initialJobId;
 
@@ -716,6 +760,7 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
       if (jobId) {
         const currentJob = await getJob(jobId);
         setJob(currentJob);
+        // 仅终态(COMPLETED/FAILED)才并行拉取四类结果数据;非终态结果尚不完整,继续轮询即可
         if (currentJob.status === 'COMPLETED' || currentJob.status === 'FAILED') {
           const [nextSegments, nextHits, nextTimeline, nextSuggestions] = await Promise.all([
             listSegments(jobId),
@@ -743,23 +788,22 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
 
   const loadRef = useRef(load);
   useEffect(() => {
+    // loadRef 始终镜像最新的 load,供下方 setInterval 闭包调用,避免捕获到陈旧的 load 引用
     loadRef.current = load;
   });
-
-  useEffect(() => {
-    setHitPage((p) => Math.min(p, Math.max(1, Math.ceil(hits.length / 6))));
-  }, [hits.length]);
 
   useEffect(() => {
     if (!job || job.status === 'COMPLETED' || job.status === 'FAILED') {
       return undefined;
     }
+    // 非终态任务每 2.5s 轮询一次进度,直至完成/失败后由上面的守卫停止
     const timer = window.setInterval(() => loadRef.current(), 2500);
     return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [job?.id, job?.status]);
 
   const duration = useMemo(() => {
+    // 时间轴总时长取视频时长、各违规命中结束时间、各句段结束时间三者最大值,并兜底 1 防止后续按比例换算时除零
     const ends = [
       video?.durationSeconds ?? 0,
       ...timeline.map((t) => t.endTime + 1),
@@ -792,6 +836,25 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
     }
   };
 
+  const confirmAllSuggestions = async () => {
+    const pending = suggestions.filter((item) => item.status === 'PENDING');
+    if (pending.length === 0) {
+      toast.success('没有需要确认的剪辑建议');
+      return;
+    }
+    try {
+      await Promise.all(
+        pending.map((item) =>
+          updateClipSuggestion(item.id, { startTime: item.startTime, endTime: item.endTime, status: 'CONFIRMED' })
+        )
+      );
+      if (activeJobId) setSuggestions(await listClipSuggestions(activeJobId));
+      toast.success(`已确认 ${pending.length} 条剪辑建议`);
+    } catch (error) {
+      toast.error(getErrorMessage(error, '一键确认失败'));
+    }
+  };
+
   const handleExport = async () => {
     if (!video) return;
     setExporting(true);
@@ -812,10 +875,6 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
   const exportedSuggestion = suggestions.find((item) => item.status === 'EXPORTED');
   const jobStatus = job ? JOB_STATUS[job.status] : null;
   const violationCount = timeline.length;
-
-  const hitPageSize = 6;
-  const hitPageCount = Math.max(1, Math.ceil(hits.length / hitPageSize));
-  const hitItems = hits.slice((Math.min(hitPage, hitPageCount) - 1) * hitPageSize, Math.min(hitPage, hitPageCount) * hitPageSize);
 
   return (
     <>
@@ -1013,10 +1072,21 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
           <Card>
             <CardHeader className="flex-row items-center justify-between gap-3 space-y-0">
               <CardTitle>剪辑建议</CardTitle>
-              <Button variant="outline" size="sm" onClick={regenerateSuggestions} disabled={!activeJobId}>
-                <Wand2 className="h-4 w-4" />
-                重新生成
-              </Button>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="default"
+                  size="sm"
+                  onClick={confirmAllSuggestions}
+                  disabled={!activeJobId || !suggestions.some((item) => item.status === 'PENDING')}
+                >
+                  <CheckCheck className="h-4 w-4" />
+                  一键确认
+                </Button>
+                <Button variant="outline" size="sm" onClick={regenerateSuggestions} disabled={!activeJobId}>
+                  <Wand2 className="h-4 w-4" />
+                  重新生成
+                </Button>
+              </div>
             </CardHeader>
             <CardContent>
               {suggestions.length === 0 ? (
@@ -1155,7 +1225,7 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
                     </TableBody>
                   </Table>
                   <DataPagination
-                    page={Math.min(hitPage, hitPageCount)}
+                    page={hitPage}
                     pageSize={hitPageSize}
                     total={hits.length}
                     onPageChange={setHitPage}
@@ -1201,15 +1271,18 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
 
 /* ============================ 违规词库 ============================ */
 
+/** 新增/编辑违规词对话框的受控表单模型。 */
 interface TermForm {
   term: string;
   category: string;
   severity: Severity;
   matchType: MatchType;
   enabled: boolean;
+  /** 逗号或换行分隔的变体词文本,提交后端后按分隔符拆分为多个变体 */
   variants: string;
 }
 
+/** 新增违规词时表单的初始空值。 */
 const EMPTY_FORM: TermForm = {
   term: '',
   category: '',
@@ -1219,6 +1292,10 @@ const EMPTY_FORM: TermForm = {
   variants: ''
 };
 
+/**
+ * 违规词库管理:词条 CRUD、关键词搜索、CSV 批量导入,以及启用状态的即时开关。
+ * 词库是规则召回的基础,AI 仅复核规则召回出的候选上下文。
+ */
 function TermsPage() {
   const [terms, setTerms] = useState<ViolationTerm[]>([]);
   const [loading, setLoading] = useState(false);
@@ -1228,8 +1305,8 @@ function TermsPage() {
   const [form, setForm] = useState<TermForm>(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<ViolationTerm | null>(null);
-  const [page, setPage] = useState(1);
   const pageSize = 8;
+  const { page, setPage, pageCount, pageItems } = usePagination(terms, pageSize);
   const importInputRef = useRef<HTMLInputElement>(null);
 
   const load = async (kw = keyword) => {
@@ -1247,11 +1324,6 @@ function TermsPage() {
     load('');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  useEffect(() => {
-    const pc = Math.max(1, Math.ceil(terms.length / pageSize));
-    setPage((p) => Math.min(p, pc));
-  }, [terms.length]);
 
   const openCreate = () => {
     setEditing(null);
@@ -1296,6 +1368,7 @@ function TermsPage() {
   };
 
   const toggleEnabled = async (term: ViolationTerm, enabled: boolean) => {
+    // 乐观更新:先就地改 UI 状态,后端失败再回滚为原值,避免开关明显卡顿
     setTerms((items) => items.map((item) => (item.id === term.id ? { ...item, enabled } : item)));
     try {
       await updateTerm(term.id, { enabled });
@@ -1329,8 +1402,6 @@ function TermsPage() {
   };
 
   const enabledCount = terms.filter((t) => t.enabled).length;
-  const pageCount = Math.max(1, Math.ceil(terms.length / pageSize));
-  const pageItems = terms.slice((Math.min(page, pageCount) - 1) * pageSize, Math.min(page, pageCount) * pageSize);
 
   return (
     <div className="flex flex-col gap-5">
@@ -1458,7 +1529,7 @@ function TermsPage() {
                   ))}
                 </TableBody>
               </Table>
-              <DataPagination page={Math.min(page, pageCount)} pageSize={pageSize} total={terms.length} onPageChange={setPage} />
+              <DataPagination page={page} pageSize={pageSize} total={terms.length} onPageChange={setPage} />
             </>
           )}
         </CardContent>

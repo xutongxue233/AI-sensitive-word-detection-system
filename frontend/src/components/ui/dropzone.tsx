@@ -1,15 +1,30 @@
 import * as React from 'react';
 import { cn } from '@/lib/utils';
 
+/**
+ * {@link Dropzone} 组件的属性。
+ */
 interface DropzoneProps {
+  /** 选中或拖入文件后的回调,入参为文件数组(已转为 File[])。 */
   onFiles: (files: File[]) => void;
+  /** 接受的文件类型,透传给底层 input 的 accept 属性。 */
   accept?: string;
+  /** 禁用时不响应点击/键盘/拖放,并降低透明度。 */
   disabled?: boolean;
+  /** 是否允许多选。 */
   multiple?: boolean;
   className?: string;
+  /** 上传区内的提示内容(图标、文案等)。 */
   children?: React.ReactNode;
 }
 
+/**
+ * 文件上传区:支持点击与拖放两种方式上传,并带键盘可访问性
+ * (role=button + tabIndex,Enter/Space 触发文件选择)。
+ *
+ * 内部隐藏一个原生 file input,所有交互最终都转化为对它的 click。
+ * 供审核工作台上传视频/字幕文件复用。
+ */
 export function Dropzone({
   onFiles,
   accept,
@@ -60,7 +75,7 @@ export function Dropzone({
         className
       )}
     >
-      {/* scanning beam */}
+      {/* 扫描光束:hover 时浮现的横向掠过动画装饰 */}
       <div className="pointer-events-none absolute inset-0 opacity-0 transition-opacity group-hover:opacity-100">
         <div className="absolute top-0 h-full w-16 -skew-x-12 bg-gradient-to-r from-transparent via-accent/10 to-transparent animate-scan-x" />
       </div>
@@ -72,6 +87,7 @@ export function Dropzone({
         className="hidden"
         onChange={(e) => {
           handleFiles(e.target.files);
+          // 重置 input 值,确保重复选择同一文件仍能触发 onChange
           e.target.value = '';
         }}
       />

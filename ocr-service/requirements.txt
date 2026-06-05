@@ -1,0 +1,13 @@
+# ocr-service: 画面硬字幕 OCR(PaddleOCR)服务依赖。
+# GPU 安装请运行 install-ocr-gpu.bat(新建 .venv,装 paddlepaddle-gpu cu129 + paddleocr,刻意不含 torch)。
+# 下面是该服务运行所需的非框架依赖(install-ocr-gpu.bat 已一并安装):
+fastapi
+uvicorn[standard]
+python-multipart
+opencc-python-reimplemented
+opencv-python-headless
+numpy==1.26.4
+# 框架(由 install-ocr-gpu.bat 从专用源安装,不要直接 pip install -r 本文件装 GPU 版):
+#   paddlepaddle-gpu==3.2.1  -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
+#   nvidia-cuda-nvrtc-cu12
+#   paddleocr>=3.0,<4.0

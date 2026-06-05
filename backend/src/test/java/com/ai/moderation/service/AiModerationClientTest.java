@@ -1,7 +1,7 @@
 package com.ai.moderation.service;
 
-import com.ai.moderation.config.AiProperties.ApiType;
-import com.ai.moderation.service.AiModerationClient.AiDecision;
+import com.ai.moderation.config.ApiType;
+import com.ai.moderation.service.support.AiDecision;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;

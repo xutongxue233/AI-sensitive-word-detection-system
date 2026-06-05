@@ -3,7 +3,7 @@ package com.ai.moderation.service;
 import com.ai.moderation.asr.TextNormalizer;
 import com.ai.moderation.domain.TranscriptSegment;
 import com.ai.moderation.domain.TranscriptWord;
-import com.ai.moderation.service.SegmentTimeLocator.TimeRange;
+import com.ai.moderation.service.support.SegmentTimeRange;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -31,7 +31,7 @@ class SegmentTimeLocatorTest {
                 word("词", 2.8, 3.2)
         );
 
-        TimeRange range = locator.locate(segment, words, "违规词");
+        SegmentTimeRange range = locator.locate(segment, words, "违规词");
 
         assertThat(range.start()).isEqualTo(2.0);
         assertThat(range.end()).isEqualTo(3.2);
@@ -45,7 +45,7 @@ class SegmentTimeLocatorTest {
                 word("里", 2.0, 2.5)
         );
 
-        TimeRange range = locator.locate(segment, words, "完全不存在的词");
+        SegmentTimeRange range = locator.locate(segment, words, "完全不存在的词");
 
         assertThat(range.start()).isEqualTo(1.5);
         assertThat(range.end()).isEqualTo(6.0);

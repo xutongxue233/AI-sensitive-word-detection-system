@@ -1,7 +1,31 @@
+/**
+ * 前端领域类型契约。
+ *
+ * 各类型对应后端 `com.ai.moderation` 的 domain 实体与 dto;字段一律驼峰命名,
+ * 与后端序列化出的 JSON 键名对齐。改动后端 DTO/实体字段时,须同步更新此处,
+ * 否则前端拿到的对象会与类型声明不符。
+ */
 export type Severity = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
 export type MatchType = 'EXACT' | 'VARIANT' | 'REGEX' | 'SEMANTIC';
 export type VideoStatus = 'UPLOADED' | 'DETECTING' | 'DETECTED' | 'EXPORTED' | 'FAILED';
+/**
+ * 转写来源,决定该条文本在导出阶段的处理方式(同后端 `TranscriptSource` 枚举):
+ * - `AUDIO`:语音转写命中 → 导出时删除对应音频时间片段
+ * - `SUBTITLE_FILE`:外部字幕文件,作为辅助文本来源
+ * - `VIDEO_SUBTITLE`:画面硬字幕(OCR)命中 → 导出时用 delogo 去字幕
+ */
 export type TranscriptSource = 'AUDIO' | 'SUBTITLE_FILE' | 'VIDEO_SUBTITLE';
+/**
+ * 检测任务状态,对应后端管线各阶段(同 `JobStatus` 枚举),前端据此展示进度:
+ * - `QUEUED`:已入队,待执行
+ * - `EXTRACTING_AUDIO`:抽音频(音画两腿并行起点)
+ * - `TRANSCRIBING`:转写落库
+ * - `MATCHING_TERMS`:规则召回候选
+ * - `AI_REVIEWING`:AI 上下文复核
+ * - `SUGGESTING_CLIPS`:生成剪辑/去字幕建议
+ * - `COMPLETED`:完成
+ * - `FAILED`:失败(音频腿失败即整体失败,不降级)
+ */
 export type JobStatus =
   | 'QUEUED'
   | 'EXTRACTING_AUDIO'
@@ -11,7 +35,22 @@ export type JobStatus =
   | 'SUGGESTING_CLIPS'
   | 'COMPLETED'
   | 'FAILED';
+/**
+ * 命中复核状态(同后端 `ReviewStatus` 枚举),区分 AI 自动判定与人工干预:
+ * - `PENDING`:待复核(尚未判定)
+ * - `VIOLATION`:AI 自动判定为违规(violation 且置信度达阈值)
+ * - `SAFE`:AI 自动判定为安全(保留记录与原因,但不自动生成剪辑)
+ * - `CONFIRMED`:人工确认违规
+ * - `IGNORED`:人工忽略
+ */
 export type ReviewStatus = 'PENDING' | 'VIOLATION' | 'SAFE' | 'CONFIRMED' | 'IGNORED';
+/**
+ * 剪辑建议生命周期(同后端 `ClipStatus` 枚举):
+ * - `PENDING`:待确认
+ * - `CONFIRMED`:已确认(将参与导出)
+ * - `IGNORED`:已忽略
+ * - `EXPORTED`:已导出
+ */
 export type ClipStatus = 'PENDING' | 'CONFIRMED' | 'IGNORED' | 'EXPORTED';
 
 export interface ViolationTerm {
@@ -67,10 +106,10 @@ export interface TranscriptSegment {
   endTime: number;
   text: string;
   source: TranscriptSource;
-  bboxX?: number;
-  bboxY?: number;
-  bboxWidth?: number;
-  bboxHeight?: number;
+  bboxX?: number; // OCR 写入的归一化(0~1)字幕框左上角 X,仅 VIDEO_SUBTITLE 有值,供 delogo 定位
+  bboxY?: number; // 归一化(0~1)字幕框左上角 Y,仅 VIDEO_SUBTITLE 有值
+  bboxWidth?: number; // 归一化(0~1)字幕框宽度,仅 VIDEO_SUBTITLE 有值
+  bboxHeight?: number; // 归一化(0~1)字幕框高度,仅 VIDEO_SUBTITLE 有值
   words: TranscriptWord[];
 }
 
@@ -118,10 +157,10 @@ export interface ClipSuggestion {
   hitId: number;
   matchedText: string;
   source: TranscriptSource;
-  action: 'REMOVE_AUDIO_SEGMENT' | 'BLUR_SUBTITLE';
+  action: 'REMOVE_AUDIO_SEGMENT' | 'BLUR_SUBTITLE'; // 处置动作:删音频段(AUDIO)或去字幕(VIDEO_SUBTITLE)
   startTime: number;
   endTime: number;
-  paddingSeconds: number;
+  paddingSeconds: number; // 命中时段前后各扩充的秒数,避免剪切边界过紧导致内容残留
   status: ClipStatus;
   exportPath?: string;
   aiConfidence?: number;
@@ -140,13 +179,13 @@ export interface AppSettings {
   aiEnabled: boolean;
   aiApiType: AiApiType;
   aiBaseUrl: string;
-  aiApiKeyConfigured: boolean;
+  aiApiKeyConfigured: boolean; // 后端不回传明文 API Key,仅以此布尔指示是否已配置
   aiModel: string;
   aiTemperature: number;
   aiConfidenceThreshold: number;
   aiTimeoutSeconds: number;
   clipPaddingSeconds: number;
-  clipPreciseExport: boolean;
+  clipPreciseExport: boolean; // 是否精确导出(按词级时间戳精剪),关闭则按整段处理
 }
 
 export interface AppSettingsUpdate {

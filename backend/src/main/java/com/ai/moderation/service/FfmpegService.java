@@ -12,27 +12,39 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 
+/**
+ * FFmpeg/ffprobe 命令行封装:检测管线与导出阶段对外部 FFmpeg 进程的唯一入口。
+ * 职责:
+ * - {@link #extractAudio} 抽取 16k 单声道 wav,供 Whisper ASR 转写;
+ * - {@link #probeDuration}/{@link #probeResolution} 用 ffprobe 探测时长与首个视频流分辨率;
+ * - {@link #exportWithoutClips} 删除命中时间片段(切出保留段再 concat 拼接),用于音频命中导出;
+ * - {@link #exportWithSubtitleBlur} 用 delogo 邻域插值去字幕(失败回退盒式模糊),用于画面硬字幕命中导出。
+ * DELOGO_* 常量为 delogo 修复参数(外扩与分块,见各常量注释)。
+ * FFmpeg 可执行路径由 {@link FfmpegProperties} 提供;任何 FFmpeg 调用失败统一抛 {@link ApiException}。
+ */
 @Service
 public class FfmpegService {
     private final FfmpegProperties properties;
 
     // delogo 字幕修复参数:外扩比例(覆盖字幕描边/抗锯齿边缘),以及超宽字幕条的横向分块阈值与单块像素上限
     // (分块让每块 delogo 的上下边界采样更贴合该列局部背景,减轻整条插值发虚)
-    private static final double DELOGO_PADDING_X = 0.012;
-    private static final double DELOGO_PADDING_Y = 0.010;
+    private static final double DELOGO_PADDING_X = 0.035;
+    private static final double DELOGO_PADDING_Y = 0.016;
     private static final int DELOGO_CHUNK_TRIGGER_PX = 700;
     private static final int DELOGO_MAX_CHUNK_PX = 350;
-
-    // VSR 切片/拼接统一编码参数:keep 段与 VSR 处理段都重编码为此参数,才能用 concat 流复制无缝拼接
-    private static final List<String> STANDARD_ENCODE = List.of(
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-ar", "44100"
-    );
 
     public FfmpegService(FfmpegProperties properties) {
         this.properties = properties;
     }
 
+    /**
+     * 抽取视频音轨为 16kHz 单声道 wav(Whisper 要求的输入规格),写到 outputDir/audio.wav。
+     * 这是音频转写腿的第一步,失败即视为任务失败(不降级)。
+     *
+     * @param videoPath 源视频路径
+     * @param outputDir 输出目录(不存在则创建)
+     * @return 生成的 audio.wav 路径
+     */
     public Path extractAudio(Path videoPath, Path outputDir) {
         try {
             Files.createDirectories(outputDir);
@@ -50,6 +62,12 @@ public class FfmpegService {
         }
     }
 
+    /**
+     * 用 ffprobe 探测视频时长(秒)。探测失败或输出非法时返回 null,由调用方决定如何兜底(如另行估算)。
+     *
+     * @param videoPath 源视频路径
+     * @return 时长秒数;不可用时为 null
+     */
     public Double probeDuration(Path videoPath) {
         try {
             ProcessBuilder builder = new ProcessBuilder(
@@ -108,10 +126,27 @@ public class FfmpegService {
         }
     }
 
+    /**
+     * 删除命中片段导出的便捷重载:默认非精确(precise=false,流复制、边界吸附关键帧、倾向少切)。
+     * 详见 {@link #exportWithoutClips(Path, Path, List, double, boolean)}。
+     *
+     * @param removeRanges    需删除的时间片段
+     * @param durationSeconds 视频总时长(用于反推保留片段)
+     * @return 导出的成品视频路径
+     */
     public Path exportWithoutClips(Path inputVideo, Path outputDir, List<TimeRange> removeRanges, double durationSeconds) {
         return exportWithoutClips(inputVideo, outputDir, removeRanges, durationSeconds, false);
     }
 
+    /**
+     * 画面硬字幕命中的导出:对各字幕遮盖区域去字幕后输出新视频。
+     * 首选 delogo 邻域插值修复(融入背景,避免盒式模糊残留笔画的马赛克感);
+     * 当分辨率探测失败或所有区域换算后无效时,回退盒式模糊,保证遮盖不被静默跳过。
+     * maskRanges 为空时直接返回原视频(无需处理)。
+     *
+     * @param maskRanges 归一化字幕遮盖框 + 生效时段({@link SubtitleMaskRange})
+     * @return 处理后的成品视频路径;无遮盖区域时返回入参原视频
+     */
     public Path exportWithSubtitleBlur(Path inputVideo, Path outputDir, List<SubtitleMaskRange> maskRanges) {
         if (maskRanges == null || maskRanges.isEmpty()) {
             return inputVideo;
@@ -144,8 +179,14 @@ public class FfmpegService {
     }
 
     /**
-     * @param precise true 时对保留片段重编码以实现帧级精确切割,避免流复制按关键帧吸附;
-     *                false 时使用流复制(快速,边界吸附到关键帧,倾向少切)。
+     * 音频命中的导出:把 removeRanges 反推成保留片段,逐段切出后用 concat 拼接成新视频。
+     * 删除片段覆盖整段视频(无保留片段)时报 400。
+     *
+     * @param removeRanges    需删除的时间片段
+     * @param durationSeconds 视频总时长(用于反推保留片段)
+     * @param precise         true 时对保留片段重编码以实现帧级精确切割,避免流复制按关键帧吸附;
+     *                        false 时使用流复制(快速,边界吸附到关键帧,倾向少切)。
+     * @return 导出的成品视频路径
      */
     public Path exportWithoutClips(Path inputVideo, Path outputDir, List<TimeRange> removeRanges, double durationSeconds, boolean precise) {
         try {
@@ -234,7 +275,7 @@ public class FfmpegService {
                     .append(":h=ih*").append(formatRatio(range.height()))
                     .append(":x=iw*").append(formatRatio(range.x()))
                     .append(":y=ih*").append(formatRatio(range.y()))
-                    .append(",boxblur=14:4,format=yuv420p[")
+                    .append(",boxblur=10:3,format=yuv420p[")
                     .append(patch).append("];");
             filter.append('[').append(base).append("][").append(patch)
                     .append("]overlay=x=main_w*").append(formatRatio(range.x()))
@@ -254,57 +295,77 @@ public class FfmpegService {
     }
 
     /**
-     * 为每个字幕遮盖区域构建 delogo 滤镜链(filter_complex)。归一化坐标按视频像素宽高换算为整数,
-     * 并做硬 clamp 满足 delogo 约束(x&gt;=1,y&gt;=1,x+w&lt;=W-1,y+h&lt;=H-1);超宽字幕条横向分块。
-     * 每个 delogo 带 enable='between(t,start,end)' 仅在字幕出现时段生效。全部区域无效时返回空串。
+     * 为每个字幕遮盖区域构建"delogo 去字幕 + 高斯模糊 + 边缘羽化"的柔滑滤镜链(filter_complex):
+     * 先 delogo 邻域插值抹除字幕,再对该区域高斯模糊柔化插值痕迹,并用 alpha 渐变羽化边缘后叠回,
+     * 消除矩形硬边与拉伸接缝。归一化坐标按像素换算并 clamp;每段带 enable 仅在字幕出现时段生效。
      */
     private String buildSubtitleDelogoFilter(List<SubtitleMaskRange> ranges, int width, int height) {
-        List<String> parts = new ArrayList<>();
+        List<int[]> boxes = new ArrayList<>();
+        List<double[]> spans = new ArrayList<>();
         for (SubtitleMaskRange range : ranges) {
-            // 在归一化坐标上适度外扩,覆盖字幕描边/抗锯齿边缘
+            // 归一化坐标外扩一点(覆盖描边/抗锯齿)后换算为像素,并 clamp 满足 delogo 约束(区域外留 >=1px)
             double nx = range.x() - DELOGO_PADDING_X;
             double ny = range.y() - DELOGO_PADDING_Y;
             double nw = range.width() + 2 * DELOGO_PADDING_X;
             double nh = range.height() + 2 * DELOGO_PADDING_Y;
-            int x = (int) Math.round(nx * width);
-            int y = (int) Math.round(ny * height);
-            int w = (int) Math.round(nw * width);
-            int h = (int) Math.round(nh * height);
-            // delogo 硬约束:区域外需留至少 1px 供采样
-            x = clampInt(x, 1, width - 2);
-            y = clampInt(y, 1, height - 2);
-            w = clampInt(w, 1, width - 1 - x);
-            h = clampInt(h, 1, height - 1 - y);
-            if (w < 1 || h < 1) {
+            int x = clampInt((int) Math.round(nx * width), 1, width - 2);
+            int y = clampInt((int) Math.round(ny * height), 1, height - 2);
+            int w = clampInt((int) Math.round(nw * width), 1, width - 1 - x);
+            int h = clampInt((int) Math.round(nh * height), 1, height - 1 - y);
+            if (w < 4 || h < 4) {
                 continue;
             }
-            double start = Math.max(0, range.start());
-            double end = Math.max(start + 0.1, range.end());
-            String enable = ":enable='between(t," + formatSeconds(start) + "," + formatSeconds(end) + ")'";
-            if (w > DELOGO_CHUNK_TRIGGER_PX) {
-                // 超宽字幕条横向分块,相邻块连续不留缝(delogo 主要靠上下边界采样,块间无需留列)
-                int chunks = (int) Math.ceil((double) w / DELOGO_MAX_CHUNK_PX);
-                int baseWidth = w / chunks;
-                int cx = x;
-                for (int k = 0; k < chunks; k++) {
-                    int cw = k == chunks - 1 ? x + w - cx : baseWidth;
-                    if (cx + cw > width - 1) {
-                        cw = width - 1 - cx;
-                    }
-                    if (cw < 1) {
-                        break;
-                    }
-                    parts.add("delogo=x=" + cx + ":y=" + y + ":w=" + cw + ":h=" + h + enable);
-                    cx += cw;
-                }
-            } else {
-                parts.add("delogo=x=" + x + ":y=" + y + ":w=" + w + ":h=" + h + enable);
-            }
+            boxes.add(new int[]{x, y, w, h});
+            spans.add(new double[]{Math.max(0, range.start()), Math.max(range.start() + 0.1, range.end())});
         }
-        if (parts.isEmpty()) {
+        if (boxes.isEmpty()) {
             return "";
         }
-        return "[0:v]" + String.join(",", parts) + "[vout]";
+        StringBuilder f = new StringBuilder();
+        // 1) 逐区域 delogo 抹除字幕(仅该字幕出现时段生效)
+        f.append("[0:v]");
+        for (int i = 0; i < boxes.size(); i++) {
+            int[] b = boxes.get(i);
+            double[] s = spans.get(i);
+            if (i > 0) {
+                f.append(',');
+            }
+            f.append("delogo=x=").append(b[0]).append(":y=").append(b[1])
+                    .append(":w=").append(b[2]).append(":h=").append(b[3])
+                    .append(":enable='between(t,").append(formatSeconds(s[0])).append(',').append(formatSeconds(s[1])).append(")'");
+        }
+        f.append("[dl];");
+        // 2) 分出 base 与每个区域,各区域高斯模糊 + 边缘羽化(alpha 距边 feather 像素内 0->1 渐变)
+        f.append("[dl]split=").append(boxes.size() + 1).append("[base]");
+        for (int i = 0; i < boxes.size(); i++) {
+            f.append("[r").append(i).append(']');
+        }
+        f.append(';');
+        for (int i = 0; i < boxes.size(); i++) {
+            int[] b = boxes.get(i);
+            int feather = Math.max(8, Math.min(properties.subtitleFeatherMax(), Math.min(b[2], b[3]) * 2 / 5));
+            f.append("[r").append(i).append("]crop=").append(b[2]).append(':').append(b[3])
+                    .append(':').append(b[0]).append(':').append(b[1])
+                    .append(",gblur=sigma=").append(formatRatio(properties.subtitleBlurSigma()))
+                    .append(",format=yuva420p,geq=lum='lum(X\\,Y)':cb='cb(X\\,Y)':cr='cr(X\\,Y)':a='clip(min(min(X\\,")
+                    .append(b[2] - 1).append("-X)\\,min(Y\\,").append(b[3] - 1).append("-Y))/").append(feather)
+                    .append("\\,0\\,1)*255'[s").append(i).append("];");
+        }
+        // 3) 羽化后的柔化块按时段叠回,边缘自然过渡
+        String cur = "base";
+        for (int i = 0; i < boxes.size(); i++) {
+            int[] b = boxes.get(i);
+            double[] s = spans.get(i);
+            String next = i == boxes.size() - 1 ? "vout" : "m" + i;
+            f.append('[').append(cur).append("][s").append(i).append("]overlay=x=").append(b[0]).append(":y=").append(b[1])
+                    .append(":enable='between(t,").append(formatSeconds(s[0])).append(',').append(formatSeconds(s[1])).append(")'[")
+                    .append(next).append(']');
+            if (i < boxes.size() - 1) {
+                f.append(';');
+            }
+            cur = next;
+        }
+        return f.toString();
     }
 
     private static int clampInt(int value, int min, int max) {
@@ -312,66 +373,6 @@ public class FfmpegService {
             return min;
         }
         return Math.max(min, Math.min(max, value));
-    }
-
-    /** 切出 [start,end] 片段并标准化编码(便于与其他段无缝 concat)。供 VSR 按违规时间段切片用。 */
-    public Path cutSegment(Path input, double start, double end, Path output) {
-        try {
-            Files.createDirectories(output.getParent());
-            List<String> command = new ArrayList<>(List.of(
-                    properties.ffmpegPath(), "-y",
-                    "-ss", formatSeconds(Math.max(0, start)),
-                    "-i", input.toString(),
-                    "-t", formatSeconds(Math.max(0.04, end - start))
-            ));
-            command.addAll(STANDARD_ENCODE);
-            command.add(output.toString());
-            run(command);
-            return output;
-        } catch (IOException ex) {
-            throw new ApiException(HttpStatus.INTERNAL_SERVER_ERROR,
-                    "切分视频片段失败: 找不到或无法执行 FFmpeg，请检查 app.ffmpeg.ffmpeg-path=" + properties.ffmpegPath());
-        }
-    }
-
-    /** 把任意来源视频(如 VSR 输出)重编码为标准参数,使其能与切片无缝 concat。 */
-    public Path reencodeStandard(Path input, Path output) {
-        try {
-            Files.createDirectories(output.getParent());
-            List<String> command = new ArrayList<>(List.of(properties.ffmpegPath(), "-y", "-i", input.toString()));
-            command.addAll(STANDARD_ENCODE);
-            command.add(output.toString());
-            run(command);
-            return output;
-        } catch (IOException ex) {
-            throw new ApiException(HttpStatus.INTERNAL_SERVER_ERROR,
-                    "重编码视频片段失败: 找不到或无法执行 FFmpeg，请检查 app.ffmpeg.ffmpeg-path=" + properties.ffmpegPath());
-        }
-    }
-
-    /** 按顺序拼接多个已标准化编码的片段(流复制,无缝)。 */
-    public Path concatSegments(List<Path> parts, Path output) {
-        try {
-            Files.createDirectories(output.getParent());
-            Path listFile = output.getParent().resolve("vsr-concat-" + System.currentTimeMillis() + ".txt");
-            StringBuilder listContent = new StringBuilder();
-            for (Path part : parts) {
-                String path = part.toAbsolutePath().toString().replace("\\", "/").replace("'", "'\\''");
-                listContent.append("file '").append(path).append("'\n");
-            }
-            Files.writeString(listFile, listContent.toString());
-            run(List.of(
-                    properties.ffmpegPath(), "-y",
-                    "-f", "concat", "-safe", "0",
-                    "-i", listFile.toString(),
-                    "-c", "copy",
-                    output.toString()
-            ));
-            return output;
-        } catch (IOException ex) {
-            throw new ApiException(HttpStatus.INTERNAL_SERVER_ERROR,
-                    "拼接视频片段失败: 找不到或无法执行 FFmpeg，请检查 app.ffmpeg.ffmpeg-path=" + properties.ffmpegPath());
-        }
     }
 
     private void run(List<String> command) throws IOException {
@@ -396,13 +397,36 @@ public class FfmpegService {
         return String.format(Locale.ROOT, "%.4f", value);
     }
 
+    /**
+     * 时间区间(秒)。用作删除/保留片段的表示,贯穿 {@link #exportWithoutClips} 与 {@link #buildKeepRanges}。
+     *
+     * @param start 起始秒
+     * @param end   结束秒
+     */
     public record TimeRange(double start, double end) {
     }
 
+    /**
+     * 字幕遮盖区:ffmpeg 去字幕滤镜的入参,坐标为相对画面的归一化值(0~1),并带生效时段。
+     * 注意:本类是 {@link FfmpegService} 私有内嵌 record,专供构建 ffmpeg 滤镜表达式;
+     * 与 service/support 包下的同名类 SubtitleMaskRange 用途不同(那个是业务层传递的遮盖数据载体),
+     * 二者刻意不合并、不互相引用。
+     *
+     * @param start  字幕出现起始秒
+     * @param end    字幕出现结束秒
+     * @param x      遮盖框左上角归一化横坐标(0~1)
+     * @param y      遮盖框左上角归一化纵坐标(0~1)
+     * @param width  遮盖框归一化宽度(0~1)
+     * @param height 遮盖框归一化高度(0~1)
+     */
     public record SubtitleMaskRange(double start, double end, double x, double y, double width, double height) {
+        /**
+         * 把遮盖框四周外扩一点(覆盖字幕描边/抗锯齿边缘)并 clamp 到合法范围,同时保证最小尺寸与最短时段,
+         * 供盒式模糊滤镜使用。
+         */
         SubtitleMaskRange expanded() {
-            double paddingX = 0.025;
-            double paddingY = 0.018;
+            double paddingX = 0.04;
+            double paddingY = 0.022;
             double nx = clamp(x - paddingX, 0, 0.98);
             double ny = clamp(y - paddingY, 0, 0.98);
             double right = clamp(x + width + paddingX, 0.02, 1);

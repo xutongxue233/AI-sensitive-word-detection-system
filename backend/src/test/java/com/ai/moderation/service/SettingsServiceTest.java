@@ -1,7 +1,7 @@
 package com.ai.moderation.service;
 
 import com.ai.moderation.config.AiProperties;
-import com.ai.moderation.config.AiProperties.ApiType;
+import com.ai.moderation.config.ApiType;
 import com.ai.moderation.config.ClipProperties;
 import com.ai.moderation.domain.AppSetting;
 import com.ai.moderation.dto.SettingsResponse;

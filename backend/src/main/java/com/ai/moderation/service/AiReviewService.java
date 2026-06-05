@@ -6,7 +6,7 @@ import com.ai.moderation.domain.ReviewStatus;
 import com.ai.moderation.domain.TermHit;
 import com.ai.moderation.repository.AiReviewRepository;
 import com.ai.moderation.repository.TermHitRepository;
-import com.ai.moderation.service.AiModerationClient.AiDecision;
+import com.ai.moderation.service.support.AiDecision;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -14,6 +14,18 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 
+/**
+ * 逐条复核服务(回退策略):对规则召回的候选命中逐条判定违规与否,并按置信阈值把关写
+ * {@link ReviewStatus}。是整篇提取(主策略)之外的兜底,用于 AI 未启用、整篇提取整体失败、
+ * 或整篇提取未覆盖的规则残余候选。
+ *
+ * <p>三种来源的置信度策略:
+ * <ul>
+ *   <li>AI 启用且模型返回 → 用模型给出的置信度;</li>
+ *   <li>AI 复核异常(网络/解析失败)→ 保守置 0.60,标记疑似违规但低于默认阈值,交人工确认;</li>
+ *   <li>AI 未启用(本地兜底)→ 置 0.70,保留规则命中为疑似违规,提示人工复核。</li>
+ * </ul>
+ */
 @Service
 public class AiReviewService {
     private static final Logger log = LoggerFactory.getLogger(AiReviewService.class);
@@ -35,6 +47,7 @@ public class AiReviewService {
         this.reviewRepository = reviewRepository;
     }
 
+    /** 复核某任务全部命中,使用当前运行时 AI 设置(启用状态/阈值即时生效)。 */
     @Transactional
     public void reviewJob(Long jobId) {
         reviewHits(hitRepository.findByJobIdOrderByStartTimeAsc(jobId), settingsService.currentAi());
@@ -69,18 +82,22 @@ public class AiReviewService {
         }
     }
 
+    /** 调用模型复核单条命中;异常时不抛出,降级为保守判定保留规则命中结果。 */
     private AiDecision review(TermHit hit) {
         try {
             return moderationClient.review(hit);
         } catch (Exception ex) {
             log.warn("AI 复核失败 hitId={} matchedText={} : {}", hit.getId(), hit.getMatchedText(), ex.toString());
             String reason = "AI 复核失败，保留规则命中结果：" + ex.getMessage();
+            // 复核失败兜底:0.60 故意低于默认阈值(0.6 边界),保留为疑似违规但不自动判违规,交人工确认。
             return new AiDecision(true, 0.60, hit.getCategory(), reason, reason);
         }
     }
 
+    /** AI 未启用时的本地兜底:不调用模型,直接保留规则命中为疑似违规。 */
     private AiDecision localFallback(TermHit hit) {
         String reason = "AI 未启用，系统保留规则命中结果，建议人工确认。";
+        // 本地兜底:0.70 高于默认阈值以便规则命中默认进入时间轴,但仍标注建议人工确认。
         return new AiDecision(true, 0.70, hit.getCategory(), reason, reason);
     }
 }

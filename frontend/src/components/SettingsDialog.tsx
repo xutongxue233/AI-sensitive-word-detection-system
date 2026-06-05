@@ -25,13 +25,19 @@ import {
 } from '@/components/ui/select';
 import { NumberField } from '@/components/ui/number-field';
 
+/**
+ * 表单态:在完整 {@link AppSettings} 基础上去掉只读标志 aiApiKeyConfigured。
+ * 后端不下发明文 Key,该标志由 keyConfigured 单独存储,故不进入可编辑表单。
+ */
 type Form = Omit<AppSettings, 'aiApiKeyConfigured'>;
 
+/** 接口形态枚举到中文说明的映射,须与后端 AiApiType 同步。 */
 const API_TYPE_LABEL: Record<AiApiType, string> = {
   CHAT: 'Chat Completions（/v1/chat/completions）',
   RESPONSES: 'Responses（/v1/responses）'
 };
 
+/** 表单项容器:统一标签 + 控件 + 可选提示文案的纵向布局。 */
 function Field({
   label,
   hint,
@@ -50,10 +56,23 @@ function Field({
   );
 }
 
+/**
+ * AI 复核与剪辑参数的运行时设置面板。
+ *
+ * 对话框 open 时调用 {@link getSettings} 拉取后端当前配置;保存后通过
+ * {@link updateSettings} 落库,对**新建检测任务**即时生效,无需重启后端。
+ *
+ * API Key 采用 keyConfigured + apiKey 双状态:后端出于安全不下发明文 Key,
+ * 仅以 aiApiKeyConfigured 标志告知是否已配置;apiKey 输入框留空即表示沿用
+ * 后端已有 Key,仅在用户实际填入时才随保存载荷下发。
+ *
+ * @param open 对话框是否打开,关闭→打开切换时触发设置加载
+ * @param onOpenChange 开关状态回调,保存成功或点击取消时关闭对话框
+ */
 export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const [form, setForm] = useState<Form | null>(null);
-  const [keyConfigured, setKeyConfigured] = useState(false);
-  const [apiKey, setApiKey] = useState('');
+  const [keyConfigured, setKeyConfigured] = useState(false); // 后端已配置 Key 的只读标志,决定占位文案与提示
+  const [apiKey, setApiKey] = useState(''); // 用户新输入的 Key;留空则保存时不改动后端原 Key
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -81,11 +100,17 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
 
   const patch = (next: Partial<Form>) => setForm((prev) => (prev ? { ...prev, ...next } : prev));
 
+  /**
+   * 修改表单字段并清空上次"测试连接"的结果。
+   * 凡涉及 AI 连通性的字段(端点/形态/模型/温度/超时等)都走此函数,
+   * 改动后旧的测试结论即失效,避免展示与当前配置不符的连通状态。
+   */
   const patchAndClearTest = (next: Partial<Form>) => {
     setTestResult(null);
     patch(next);
   };
 
+  /** 用当前表单值临时探测模型连通性;不保存设置,Key 留空时后端沿用已存 Key。 */
   const testConnection = async () => {
     if (!form) return;
     setTesting(true);
@@ -111,6 +136,7 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
     }
   };
 
+  /** 保存设置:仅当 apiKey 非空才下发,否则保留后端原 Key;成功后关闭对话框。 */
   const save = async () => {
     if (!form) return;
     setSaving(true);

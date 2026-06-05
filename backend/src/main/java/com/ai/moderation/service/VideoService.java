@@ -33,6 +33,18 @@ import java.util.Locale;
 import java.util.UUID;
 import java.util.stream.Stream;
 
+/**
+ * 视频生命周期管理:覆盖上传存盘、检测任务创建与级联删除。
+ *
+ * <p>职责:
+ * <ul>
+ *   <li>{@link #upload} 把上传的视频(及可选字幕)落盘到 {@code videos/yyyy-MM-dd/uuid/} 布局,
+ *       并用 {@link FfmpegService} 探测分辨率与时长等元数据。
+ *   <li>{@link #createDetectionJob} 创建 {@link JobStatus#QUEUED} 任务并交
+ *       {@link DetectionPipelineService#processAsync} 异步处理,返回时管线尚未跑完。
+ *   <li>{@link #deleteVideo} 级联删除任务、命中、复核、剪辑建议与转写数据,最后清理磁盘文件。
+ * </ul>
+ */
 @Service
 public class VideoService {
     private static final Logger log = LoggerFactory.getLogger(VideoService.class);
@@ -82,6 +94,16 @@ public class VideoService {
         return VideoResponse.from(findVideo(id));
     }
 
+    /**
+     * 接收上传:视频(必填)与字幕(可选)落盘到 {@code videos/yyyy-MM-dd/uuid/} 目录下。
+     *
+     * <p>存盘文件名只用 UUID(加原始扩展名),不含原始文件名以规避非法字符与冲突;原始名另存进
+     * {@code originalFilename} 字段。随后用 {@link FfmpegService} 探测分辨率与时长,探测失败则留空分辨率不阻断上传。
+     *
+     * @param video    上传的视频文件,为空时抛 400
+     * @param subtitle 可选外部字幕文件;为空则跳过,后续检测改走画面 OCR
+     * @return 已落库的视频元数据响应
+     */
     @Transactional
     public VideoResponse upload(MultipartFile video, MultipartFile subtitle) {
         if (video == null || video.isEmpty()) {
@@ -122,6 +144,15 @@ public class VideoService {
         }
     }
 
+    /**
+     * 创建检测任务并异步触发管线。
+     *
+     * <p>把视频置为 {@link VideoStatus#DETECTING},建一条 {@link JobStatus#QUEUED} 任务后调
+     * {@link DetectionPipelineService#processAsync}。该调用异步返回,管线此时尚未完成,前端凭返回的 jobId 轮询进度。
+     *
+     * @param videoId 目标视频 id
+     * @return 新建任务的响应(状态为 QUEUED)
+     */
     public JobResponse createDetectionJob(Long videoId) {
         VideoFile video = findVideo(videoId);
         video.setStatus(VideoStatus.DETECTING);

@@ -3,9 +3,10 @@ package com.ai.moderation.service;
 import com.ai.moderation.asr.TextNormalizer;
 import com.ai.moderation.domain.TranscriptSegment;
 import com.ai.moderation.domain.TranscriptWord;
+import com.ai.moderation.service.support.SegmentIndex;
+import com.ai.moderation.service.support.SegmentTimeRange;
 import org.springframework.stereotype.Component;
 
-import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -21,6 +22,9 @@ public class SegmentTimeLocator {
         this.textNormalizer = textNormalizer;
     }
 
+    /**
+     * 为字幕段构建归一化索引(供按字符偏移区间反查起止秒)。
+     */
     public SegmentIndex index(TranscriptSegment segment, List<TranscriptWord> words) {
         return SegmentIndex.from(segment, words);
     }
@@ -29,7 +33,7 @@ public class SegmentTimeLocator {
      * 按命中原文子串在段内定位起止秒。子串经同源归一化后在段归一化文本里查找,
      * 命中则用词级时间戳映射;找不到则退回段级起止时间(命中不丢,仅时间精度降级)。
      */
-    public TimeRange locate(TranscriptSegment segment, List<TranscriptWord> words, String matchedText) {
+    public SegmentTimeRange locate(TranscriptSegment segment, List<TranscriptWord> words, String matchedText) {
         SegmentIndex index = index(segment, words);
         String target = textNormalizer.normalizeForMatch(matchedText);
         if (!target.isBlank()) {
@@ -38,7 +42,7 @@ public class SegmentTimeLocator {
                 return index.locate(found, found + target.length());
             }
         }
-        return new TimeRange(segment.getStartTime(), segment.getEndTime());
+        return new SegmentTimeRange(segment.getStartTime(), segment.getEndTime());
     }
 
     /**
@@ -63,43 +67,5 @@ public class SegmentTimeLocator {
         long minutes = total / 60;
         long remain = total % 60;
         return "%02d:%02d".formatted(minutes, remain);
-    }
-
-    public record TimeRange(double start, double end) {
-    }
-
-    public record SegmentIndex(String normalizedText, List<TokenTime> tokenTimes, TranscriptSegment segment) {
-        static SegmentIndex from(TranscriptSegment segment, List<TranscriptWord> words) {
-            StringBuilder normalizedText = new StringBuilder();
-            List<TokenTime> tokenTimes = new ArrayList<>();
-            for (TranscriptWord word : words) {
-                if (word.getNormalizedWord() == null || word.getNormalizedWord().isBlank()) {
-                    continue;
-                }
-                int start = normalizedText.length();
-                normalizedText.append(word.getNormalizedWord());
-                tokenTimes.add(new TokenTime(start, normalizedText.length(), word.getStartTime(), word.getEndTime()));
-            }
-            return new SegmentIndex(normalizedText.toString(), tokenTimes, segment);
-        }
-
-        public TimeRange locate(int startOffset, int endOffset) {
-            List<TokenTime> matched = tokenTimes.stream()
-                    .filter(token -> token.normalizedEnd() > startOffset && token.normalizedStart() < endOffset)
-                    .toList();
-            if (!matched.isEmpty()) {
-                return new TimeRange(matched.getFirst().startTime(), matched.getLast().endTime());
-            }
-            double duration = segment.getEndTime() - segment.getStartTime();
-            double startRatio = normalizedText.isBlank() ? 0 : startOffset / (double) normalizedText.length();
-            double endRatio = normalizedText.isBlank() ? startRatio : endOffset / (double) normalizedText.length();
-            return new TimeRange(
-                    segment.getStartTime() + duration * startRatio,
-                    segment.getStartTime() + duration * Math.max(endRatio, startRatio)
-            );
-        }
-    }
-
-    public record TokenTime(int normalizedStart, int normalizedEnd, double startTime, double endTime) {
     }
 }

@@ -29,10 +29,10 @@ export function NumberField({
   const focused = React.useRef(false);
 
   React.useEffect(() => {
-    // 仅在未处于聚焦编辑时同步外部值，避免打断/回弹用户输入
+    // 仅在未处于聚焦编辑时同步外部值，避免打断/回弹用户输入；按 precision 取整显示，避免多位小数
     if (focused.current) return;
-    setText(value === undefined || value === null ? '' : String(value));
-  }, [value]);
+    setText(value === undefined || value === null ? '' : String(Number(value.toFixed(precision))));
+  }, [value, precision]);
 
   const clamp = (n: number) => {
     let next = n;

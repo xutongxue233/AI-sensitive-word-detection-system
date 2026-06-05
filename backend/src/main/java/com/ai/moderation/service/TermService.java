@@ -1,10 +1,13 @@
 package com.ai.moderation.service;
 
 import com.ai.moderation.common.ApiException;
+import com.ai.moderation.domain.MatchType;
+import com.ai.moderation.domain.Severity;
 import com.ai.moderation.domain.TermCategory;
 import com.ai.moderation.domain.ViolationTerm;
 import com.ai.moderation.dto.TermCategoryRequest;
 import com.ai.moderation.dto.TermCategoryResponse;
+import com.ai.moderation.dto.TermImportResponse;
 import com.ai.moderation.dto.ViolationTermRequest;
 import com.ai.moderation.dto.ViolationTermResponse;
 import com.ai.moderation.repository.TermCategoryRepository;
@@ -20,6 +23,12 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.List;
 
+/**
+ * 违规词与分类的管理服务:违规词/分类的 CRUD 与 CSV 批量导入。
+ *
+ * <p>维护的词库是规则召回的数据源,供 {@link RuleMatchingService} 在检测时匹配候选命中。
+ * 词条以 {@code term + matchType} 组合唯一,导入与新增都按此约束去重。
+ */
 @Service
 public class TermService {
     private final ViolationTermRepository termRepository;
@@ -38,6 +47,7 @@ public class TermService {
         return terms.stream().map(ViolationTermResponse::from).toList();
     }
 
+    /** 新增违规词。唯一性约束为 {@code term + matchType} 组合:同词同匹配方式已存在则抛 409 冲突。 */
     @Transactional
     public ViolationTermResponse createTerm(ViolationTermRequest request) {
         if (termRepository.existsByTermIgnoreCaseAndMatchType(request.term().trim(), request.matchType())) {
@@ -65,8 +75,23 @@ public class TermService {
         termRepository.deleteById(id);
     }
 
+    /**
+     * CSV 批量导入违规词。列序约定(0 基):
+     * <ol start="0">
+     *   <li>term:词条,必填,空则跳过并计入 skipped;
+     *   <li>category:分类,可空;
+     *   <li>severity:严重度,缺省 {@link Severity#MEDIUM};
+     *   <li>matchType:匹配方式,缺省 {@link MatchType#EXACT};
+     *   <li>variants:变体,可空。
+     * </ol>
+     * 首行表头({@code term,} 开头)与已存在的重复词条({@code term+matchType})跳过并计入 skipped;
+     * 非法枚举值整体抛 400。
+     *
+     * @param file 上传的 CSV 文件,为空时抛 400
+     * @return 导入统计:成功 imported 条、跳过 skipped 条
+     */
     @Transactional
-    public com.ai.moderation.dto.TermImportResponse importCsv(MultipartFile file) {
+    public TermImportResponse importCsv(MultipartFile file) {
         if (file == null || file.isEmpty()) {
             throw new ApiException(HttpStatus.BAD_REQUEST, "请上传 CSV 文件");
         }
@@ -83,9 +108,9 @@ public class TermService {
                     skipped++;
                     continue;
                 }
-                com.ai.moderation.domain.MatchType matchType = columns.length > 3 && StringUtils.hasText(columns[3])
-                        ? com.ai.moderation.domain.MatchType.valueOf(columns[3].trim().toUpperCase())
-                        : com.ai.moderation.domain.MatchType.EXACT;
+                MatchType matchType = columns.length > 3 && StringUtils.hasText(columns[3])
+                        ? MatchType.valueOf(columns[3].trim().toUpperCase())
+                        : MatchType.EXACT;
                 if (termRepository.existsByTermIgnoreCaseAndMatchType(columns[0].trim(), matchType)) {
                     skipped++;
                     continue;
@@ -94,15 +119,15 @@ public class TermService {
                 term.setTerm(columns[0].trim());
                 term.setCategory(columns.length > 1 ? blankToNull(columns[1]) : null);
                 term.setSeverity(columns.length > 2 && StringUtils.hasText(columns[2])
-                        ? com.ai.moderation.domain.Severity.valueOf(columns[2].trim().toUpperCase())
-                        : com.ai.moderation.domain.Severity.MEDIUM);
+                        ? Severity.valueOf(columns[2].trim().toUpperCase())
+                        : Severity.MEDIUM);
                 term.setMatchType(matchType);
                 term.setEnabled(true);
                 term.setVariants(columns.length > 4 ? blankToNull(columns[4]) : null);
                 termRepository.save(term);
                 imported++;
             }
-            return new com.ai.moderation.dto.TermImportResponse(imported, skipped);
+            return new TermImportResponse(imported, skipped);
         } catch (IllegalArgumentException ex) {
             throw new ApiException(HttpStatus.BAD_REQUEST, "CSV 中存在非法枚举值: " + ex.getMessage());
         } catch (IOException ex) {

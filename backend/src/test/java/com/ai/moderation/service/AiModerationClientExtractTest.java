@@ -1,7 +1,7 @@
 package com.ai.moderation.service;
 
-import com.ai.moderation.config.AiProperties.ApiType;
-import com.ai.moderation.service.AiModerationClient.ExtractedHit;
+import com.ai.moderation.config.ApiType;
+import com.ai.moderation.service.support.ExtractedHit;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;

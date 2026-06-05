@@ -1,3 +1,6 @@
+# asr-service: 本地 Whisper 语音识别服务的依赖(CPU 默认)。
+# NVIDIA GPU(RTX 50 系 / Blackwell sm_120 等)用户运行 install-gpu.bat 把 torch 换成 CUDA 版(cu130)。
+# 画面硬字幕 OCR 已独立为 ocr-service(单独的 venv 与依赖),不在本文件。
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
 python-multipart==0.0.27
@@ -6,6 +9,3 @@ requests==2.32.5
 opencc-python-reimplemented==0.1.7
 numpy==1.26.4
 PyYAML==6.0.2
-opencv-python-headless==4.10.0.84
-paddlepaddle==2.6.2
-paddleocr==2.7.3
