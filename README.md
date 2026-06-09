@@ -202,22 +202,27 @@ app:
 
 ### Windows 源码一键启动（推荐分发方式）
 
-如果你是把源码发给别人本地使用，根目录已提供单窗口启动脚本：
+如果你是把源码发给别人本地使用，根目录只保留一个启动脚本：
 
 ```text
-start-local.bat   # 启动；首次缺少依赖/构建产物时会自动执行 setup
-setup-local.bat   # 手动执行首次环境准备
-stop-local.bat    # 停止后台托管进程
-status-local.bat  # 查看进程与 HTTP 健康状态
+start-local.bat
 ```
 
-首次启动可以直接双击 `start-local.bat`。它会在当前窗口中完成依赖安装与构建，然后隐藏启动 ASR、OCR、后端三个托管进程，并打开：
+环境准备好后直接双击 `start-local.bat`。首次缺少 Python venv、前端依赖或后端 Jar 时，它会在当前窗口中自动安装依赖并构建，然后隐藏启动 ASR、OCR、后端三个托管进程，并打开：
 
 ```text
 http://127.0.0.1:8090/
 ```
 
-启动后不会再弹出 ASR/OCR/后端的多个服务窗口；运行日志统一写入根目录 `logs/`，进程 PID 写入 `.runtime/`。停止时双击 `stop-local.bat`。
+启动后不会再弹出 ASR/OCR/后端的多个服务窗口；运行日志统一写入根目录 `logs/`，进程 PID 写入 `.runtime/`。
+
+同一个脚本也支持少量维护命令：
+
+```powershell
+.\start-local.bat stop     # 停止由脚本托管的服务
+.\start-local.bat status   # 查看服务状态
+.\start-local.bat rebuild  # 强制重新构建前端与后端 Jar
+```
 
 源码模式需要 Java 21、Maven 3.9+、Node.js、Python 3.10 与 FFmpeg。可以全局安装，也可以把轻量环境包解压到以下目录，脚本会优先使用本地环境：
 
@@ -231,30 +236,7 @@ http://127.0.0.1:8090/
 
 默认按 CPU 模式启动。需要改端口、GPU 或模型配置时，编辑 `config/local.env`；如果文件不存在，脚本会从 `config/local.env.example` 自动复制一份。
 
-### Windows 一键本地部署包
-
-如果不想让使用者安装 Maven/Node/Python，也可以由开发者提前生成 Windows 解压包。生成包会把前端静态资源打进后端 Jar，并复制 ASR/OCR 服务、可选 Python `.venv`、FFmpeg 与 `start.bat` / `stop.bat` / `status.bat`。
-
-```powershell
-.\packaging\windows\build-local-package.ps1 -JdkHome D:\Environment\jdk21
-```
-
-如果要发给另一台机器直接解压使用，建议同时打包 JDK 与 Python 运行时：
-
-```powershell
-.\packaging\windows\build-local-package.ps1 `
-  -JdkHome D:\Environment\jdk21 `
-  -IncludeJdk:$true `
-  -IncludePythonRuntime:$true
-```
-
-快速验证打包结构但不复制大型 Python 虚拟环境、不压缩：
-
-```powershell
-.\packaging\windows\build-local-package.ps1 -JdkHome D:\Environment\jdk21 -IncludePythonVenv:$false -NoZip
-```
-
-生成目录默认在 `release\AI-sensitive-word-detection-system-local`，最终用户解压后双击 `start.bat`，访问 `http://127.0.0.1:8090/`。更多说明见 `packaging/windows/README.md`。
+关于“少装一个 Python 环境”：C# 项目看起来能直接执行 Python，通常是因为它把 Python 解释器和依赖一起内置了，或把 Python 代码打成 exe；底层仍然需要 Python runtime。当前项目的 ASR/OCR 依赖 Whisper、torch、PaddleOCR、OpenCV，尤其 GPU 版本体积大且对 CUDA 版本敏感，因此推荐把 Python 3.10 放到 `.runtime/python`，让脚本首次启动时自动创建 ASR/OCR venv。这样最终用户不需要把 Python 安装到系统 PATH。不要使用 Python embeddable package，它默认不适合 `venv` 和 `pip`。
 
 ### GPU 加速（NVIDIA 显卡 / RTX 50 系 Blackwell sm_120）
 
@@ -298,7 +280,7 @@ PADDLE_OCR_USE_GPU=true
 .\start-local.bat
 ```
 
-脚本会隐藏启动 ASR(9000) / OCR(9001) / Backend(8090) 三个托管进程，并打开 `http://127.0.0.1:8090/`。如果需要确认 GPU 是否生效，访问 ASR/OCR 的 `/health` 或运行 `status-local.bat` 后查看服务状态与日志。
+脚本会隐藏启动 ASR(9000) / OCR(9001) / Backend(8090) 三个托管进程，并打开 `http://127.0.0.1:8090/`。如果需要确认 GPU 是否生效，访问 ASR/OCR 的 `/health` 或运行 `start-local.bat status` 后查看服务状态与日志。
 
 验证 GPU 是否真正生效：
 - Whisper：`http://127.0.0.1:9000/health` → `gpu.torchCudaAvailable=true`、`gpu.torchHasSm120=true`。
@@ -550,16 +532,21 @@ $env:FFPROBE_PATH='D:\path\to\ffprobe.exe'
 
 ### Windows One-Click Source Startup
 
-For source-code distribution, use the root scripts:
+For source-code distribution, use the single root startup script:
 
 ```text
-start-local.bat   # start; runs setup automatically on first use
-setup-local.bat   # prepare dependencies and build the backend jar
-stop-local.bat    # stop managed background processes
-status-local.bat  # print process and HTTP status
+start-local.bat
 ```
 
-The scripts start ASR, OCR, and backend as hidden managed processes, so no extra service windows are opened. Logs are written to `logs/`, PID files to `.runtime/`, and the browser opens `http://127.0.0.1:8090/`.
+Double-click `start-local.bat` to start. It runs missing setup work automatically, starts ASR, OCR, and backend as hidden managed processes, and opens `http://127.0.0.1:8090/`. Logs are written to `logs/`, and PID files to `.runtime/`.
+
+The same script also supports:
+
+```powershell
+.\start-local.bat stop
+.\start-local.bat status
+.\start-local.bat rebuild
+```
 
 Install Java 21, Maven 3.9+, Node.js, Python 3.10, and FFmpeg globally, or unzip a lightweight environment bundle into `.runtime/jdk`, `.runtime/maven`, `.runtime/node`, `.runtime/python`, and `.runtime/ffmpeg`; local runtime directories are preferred over global tools.
 
