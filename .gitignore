@@ -3,6 +3,7 @@ backend/data/
 backend/storage/
 backend/tools/
 backend/video_moderation.db*
+video_moderation.db*
 frontend/node_modules/
 frontend/dist/
 frontend/*.tsbuildinfo
@@ -12,6 +13,10 @@ asr-service/.venv/
 ocr-service/.venv/
 __pycache__/
 *.pyc
+.runtime/
+config/local.env
+logs/
+storage/
 tmp-smoke/
 *.log
 *.mp4
@@ -23,3 +28,4 @@ tmp-smoke/
 Thumbs.db
 .idea/
 frontend/.preview/
+release/

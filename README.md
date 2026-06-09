@@ -80,9 +80,11 @@ flowchart LR
 当前默认配置：
 
 - 后端端口：`8090`
-- 前端端口：`5174`
+- 源码一键启动访问：`http://127.0.0.1:8090/`
+- 前端开发端口：`5174`（仅手动 `npm run dev` 时使用）
 - ASR 服务端口：`9000`
-- SQLite 数据库文件：`backend/video_moderation.db`
+- OCR 服务端口：`9001`
+- SQLite 数据库文件：一键启动为根目录 `video_moderation.db`，手动在 `backend` 目录启动时为 `backend/video_moderation.db`
 
 ### 数据库
 
@@ -198,6 +200,62 @@ app:
 - OCR 结果会与音频 ASR 结果合并为两层；同一时间段口播和字幕文本相同也会保留两条来源，因为音频和字幕需要分别处理。
 - 导出时，音频来源命中按现有方式删除对应时间片段；画面字幕来源命中走 ffmpeg delogo 邻域插值修复（抹除字幕并尽量融入背景，超宽字幕条自动横向分块，再做高斯柔化与边缘羽化），无法探测分辨率时回退盒式模糊。
 
+### Windows 源码一键启动（推荐分发方式）
+
+如果你是把源码发给别人本地使用，根目录已提供单窗口启动脚本：
+
+```text
+start-local.bat   # 启动；首次缺少依赖/构建产物时会自动执行 setup
+setup-local.bat   # 手动执行首次环境准备
+stop-local.bat    # 停止后台托管进程
+status-local.bat  # 查看进程与 HTTP 健康状态
+```
+
+首次启动可以直接双击 `start-local.bat`。它会在当前窗口中完成依赖安装与构建，然后隐藏启动 ASR、OCR、后端三个托管进程，并打开：
+
+```text
+http://127.0.0.1:8090/
+```
+
+启动后不会再弹出 ASR/OCR/后端的多个服务窗口；运行日志统一写入根目录 `logs/`，进程 PID 写入 `.runtime/`。停止时双击 `stop-local.bat`。
+
+源码模式需要 Java 21、Maven 3.9+、Node.js、Python 3.10 与 FFmpeg。可以全局安装，也可以把轻量环境包解压到以下目录，脚本会优先使用本地环境：
+
+```text
+.runtime/jdk      # Java 21
+.runtime/maven    # Maven
+.runtime/node     # Node.js，目录内需有 npm.cmd
+.runtime/python   # Python 3.10，目录内需有 python.exe
+.runtime/ffmpeg   # FFmpeg，目录内需有 bin/ffmpeg.exe 与 bin/ffprobe.exe
+```
+
+默认按 CPU 模式启动。需要改端口、GPU 或模型配置时，编辑 `config/local.env`；如果文件不存在，脚本会从 `config/local.env.example` 自动复制一份。
+
+### Windows 一键本地部署包
+
+如果不想让使用者安装 Maven/Node/Python，也可以由开发者提前生成 Windows 解压包。生成包会把前端静态资源打进后端 Jar，并复制 ASR/OCR 服务、可选 Python `.venv`、FFmpeg 与 `start.bat` / `stop.bat` / `status.bat`。
+
+```powershell
+.\packaging\windows\build-local-package.ps1 -JdkHome D:\Environment\jdk21
+```
+
+如果要发给另一台机器直接解压使用，建议同时打包 JDK 与 Python 运行时：
+
+```powershell
+.\packaging\windows\build-local-package.ps1 `
+  -JdkHome D:\Environment\jdk21 `
+  -IncludeJdk:$true `
+  -IncludePythonRuntime:$true
+```
+
+快速验证打包结构但不复制大型 Python 虚拟环境、不压缩：
+
+```powershell
+.\packaging\windows\build-local-package.ps1 -JdkHome D:\Environment\jdk21 -IncludePythonVenv:$false -NoZip
+```
+
+生成目录默认在 `release\AI-sensitive-word-detection-system-local`，最终用户解压后双击 `start.bat`，访问 `http://127.0.0.1:8090/`。更多说明见 `packaging/windows/README.md`。
+
 ### GPU 加速（NVIDIA 显卡 / RTX 50 系 Blackwell sm_120）
 
 两处本地推理（Whisper 语音识别、PaddleOCR 画面字幕）默认跑在 CPU。有 NVIDIA 显卡时可切到 GPU 大幅提速。核心动作是把深度学习框架换成**包含对应 GPU 计算核（kernel）的 CUDA 构建**——旧版本在新显卡上会报 `no kernel image is available for execution on the device`。
@@ -226,15 +284,21 @@ cd ocr-service
 
 #### 2. 启动（GPU 模式）
 
-根目录提供启动脚本，一键拉起全部服务：
+编辑根目录 `config/local.env`，把本地推理切到 GPU：
 
-```powershell
-start-all.bat
+```env
+WHISPER_DEVICE=cuda
+WHISPER_FP16=true
+PADDLE_OCR_USE_GPU=true
 ```
 
-会分别打开 ASR(9000) / OCR(9001) / Backend(8090) / Frontend(5174) 四个窗口，各自已内置 GPU 环境变量与 Java 21 路径。也可单独运行 `_run-asr.bat` / `_run-ocr.bat` / `_run-backend.bat` / `_run-frontend.bat`。
+然后使用同一个单窗口启动入口：
 
-> 脚本内置的环境变量：Whisper 用 `WHISPER_DEVICE=cuda` / `WHISPER_FP16=true`（模型默认 `large-v3-turbo`，适配 8GB）；OCR 用 `PADDLE_OCR_USE_GPU=true`。后端 `_run-backend.bat` 把 `JAVA_HOME` 指向 Java 21（你的 `mvn` 默认可能是 JDK8，会编译失败，必须用 21）。
+```powershell
+.\start-local.bat
+```
+
+脚本会隐藏启动 ASR(9000) / OCR(9001) / Backend(8090) 三个托管进程，并打开 `http://127.0.0.1:8090/`。如果需要确认 GPU 是否生效，访问 ASR/OCR 的 `/health` 或运行 `status-local.bat` 后查看服务状态与日志。
 
 验证 GPU 是否真正生效：
 - Whisper：`http://127.0.0.1:9000/health` → `gpu.torchCudaAvailable=true`、`gpu.torchHasSm120=true`。
@@ -288,7 +352,7 @@ app:
 - 关闭 AI 时，规则命中按 0.70 置信度全部保留为违规，便于人工兜底。
 - 出于安全考虑，`GET /api/v1/settings` 不回传明文 API Key，仅返回 `aiApiKeyConfigured` 标记是否已配置；前台保存时留空即保持原 Key 不变。
 
-### 启动前端
+### 前端开发模式
 
 ```powershell
 cd frontend
@@ -296,11 +360,13 @@ npm install
 npm run dev
 ```
 
-访问：
+仅调试前端时访问：
 
 ```text
 http://127.0.0.1:5174/
 ```
+
+普通本地使用请运行根目录 `start-local.bat`，由后端 Jar 直接提供前端页面，访问 `http://127.0.0.1:8090/`。
 
 ### REST API
 
@@ -439,9 +505,11 @@ flowchart LR
 Default services:
 
 - Backend: `8090`
-- Frontend: `5174`
+- One-click source startup: `http://127.0.0.1:8090/`
+- Frontend dev server: `5174` (only for manual `npm run dev`)
 - ASR: `9000`
-- SQLite database file: `backend/video_moderation.db`
+- OCR: `9001`
+- SQLite database file: root `video_moderation.db` for one-click startup, or `backend/video_moderation.db` when manually starting from the `backend` directory
 
 ### Database
 
@@ -479,6 +547,21 @@ This directory is not committed. You can either place FFmpeg there or override p
 $env:FFMPEG_PATH='D:\path\to\ffmpeg.exe'
 $env:FFPROBE_PATH='D:\path\to\ffprobe.exe'
 ```
+
+### Windows One-Click Source Startup
+
+For source-code distribution, use the root scripts:
+
+```text
+start-local.bat   # start; runs setup automatically on first use
+setup-local.bat   # prepare dependencies and build the backend jar
+stop-local.bat    # stop managed background processes
+status-local.bat  # print process and HTTP status
+```
+
+The scripts start ASR, OCR, and backend as hidden managed processes, so no extra service windows are opened. Logs are written to `logs/`, PID files to `.runtime/`, and the browser opens `http://127.0.0.1:8090/`.
+
+Install Java 21, Maven 3.9+, Node.js, Python 3.10, and FFmpeg globally, or unzip a lightweight environment bundle into `.runtime/jdk`, `.runtime/maven`, `.runtime/node`, `.runtime/python`, and `.runtime/ffmpeg`; local runtime directories are preferred over global tools.
 
 ### Start ASR
 
@@ -546,7 +629,7 @@ app:
     min-confidence: 0.35
 ```
 
-### Start Frontend
+### Frontend Development Mode
 
 ```powershell
 cd frontend
@@ -554,11 +637,13 @@ npm install
 npm run dev
 ```
 
-Open:
+Open this only when debugging the frontend dev server:
 
 ```text
 http://127.0.0.1:5174/
 ```
+
+For normal local usage, run `start-local.bat` from the repository root and open `http://127.0.0.1:8090/`; the backend jar serves the built frontend.
 
 ### REST API
 
