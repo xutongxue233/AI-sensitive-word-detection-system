@@ -143,3 +143,22 @@ CREATE TABLE IF NOT EXISTS clip_suggestions (
     CONSTRAINT fk_clips_job FOREIGN KEY (job_id) REFERENCES detection_jobs(id),
     CONSTRAINT fk_clips_hit FOREIGN KEY (hit_id) REFERENCES term_hits(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS export_tasks (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    video_id BIGINT NOT NULL,
+    job_id BIGINT,
+    status VARCHAR(20) NOT NULL,
+    progress INT NOT NULL DEFAULT 0,
+    export_path VARCHAR(1000),
+    removed_clip_count INT,
+    error_message TEXT,
+    started_at TIMESTAMP(6),
+    completed_at TIMESTAMP(6),
+    created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    KEY idx_export_tasks_video (video_id),
+    KEY idx_export_tasks_status (status, created_at),
+    CONSTRAINT fk_export_tasks_video FOREIGN KEY (video_id) REFERENCES videos(id),
+    CONSTRAINT fk_export_tasks_job FOREIGN KEY (job_id) REFERENCES detection_jobs(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

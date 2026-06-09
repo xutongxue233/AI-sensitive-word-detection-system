@@ -12,6 +12,7 @@
 import os
 import tempfile
 import threading
+import warnings
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -39,9 +40,20 @@ CHINESE_CONVERTER = os.getenv("WHISPER_CHINESE_CONVERTER", "t2s")
 INITIAL_PROMPT = os.getenv("WHISPER_INITIAL_PROMPT", "请使用简体中文转写普通话内容。")
 # beam search:默认 5,数字/口语(如"几十块"易被听成"十块")识别更准;设 0 改用贪心解码,更快(CPU 上明显)
 WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
+# openai-whisper 在缺少本机 CUDA toolkit 时会对词级时间戳的 Triton 加速内核打 UserWarning,
+# 但会自动回退到可用实现,不影响转写结果。默认隐藏这类性能降级噪声;排查性能时可设 true 打开。
+SHOW_TRITON_WARNINGS = os.getenv("WHISPER_SHOW_TRITON_WARNINGS", "false").lower() in {"1", "true", "yes", "on"}
 # FFmpeg 二进制目录:Whisper 内部解码音频需要 ffmpeg 在 PATH 上;
 # 未显式指定时回退到仓库内置的 backend/tools/ffmpeg/bin。
 FFMPEG_BIN_DIR = os.getenv("FFMPEG_BIN_DIR")
+
+if not SHOW_TRITON_WARNINGS:
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Failed to launch Triton kernels.*",
+        category=UserWarning,
+        module=r"whisper\.timing",
+    )
 
 if FFMPEG_BIN_DIR:
     os.environ["PATH"] = FFMPEG_BIN_DIR + os.pathsep + os.environ.get("PATH", "")
@@ -57,6 +69,18 @@ converter = OpenCC(CHINESE_CONVERTER) if CHINESE_CONVERTER else None
 _model_lock = threading.Lock()
 # 推理锁:同一个全局 Whisper 模型不保证并发推理安全(多任务并行时),故串行化。
 _model_infer_lock = threading.Lock()
+
+
+@app.get("/")
+async def root():
+    """根路径说明:避免浏览器/IDE 探活访问 `/` 时误报 404。"""
+    return {
+        "service": "asr-service",
+        "status": "ok",
+        "health": "/health",
+        "transcribe": "/transcribe",
+        "note": "OCR 服务是独立进程 ocr-service/ocr_app.py,默认端口 9001。",
+    }
 
 
 def _probe_gpu() -> dict:
@@ -100,6 +124,7 @@ async def health():
         "model": MODEL_SIZE,
         "device": DEVICE,
         "fp16": FP16,
+        "showTritonWarnings": SHOW_TRITON_WARNINGS,
         "modelLoaded": model is not None,
         "gpu": _probe_gpu(),
     }

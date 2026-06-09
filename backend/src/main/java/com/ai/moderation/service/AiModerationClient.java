@@ -3,11 +3,14 @@ package com.ai.moderation.service;
 import com.ai.moderation.common.ApiException;
 import com.ai.moderation.config.AiProperties;
 import com.ai.moderation.config.ApiType;
+import com.ai.moderation.domain.MatchType;
+import com.ai.moderation.domain.Severity;
 import com.ai.moderation.domain.TermHit;
 import com.ai.moderation.domain.TranscriptSegment;
 import com.ai.moderation.domain.ViolationTerm;
 import com.ai.moderation.dto.AiConnectionTestRequest;
 import com.ai.moderation.dto.AiConnectionTestResponse;
+import com.ai.moderation.dto.GeneratedTermResponse;
 import com.ai.moderation.service.support.AiDecision;
 import com.ai.moderation.service.support.ExtractedHit;
 import com.ai.moderation.service.support.FormatMode;
@@ -30,6 +33,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 调用 OpenAI 兼容接口对单条命中做内容复核。
@@ -44,11 +49,13 @@ public class AiModerationClient {
     private static final Logger log = LoggerFactory.getLogger(AiModerationClient.class);
     private static final String SCHEMA_NAME = "moderation_decision";
     private static final String EXTRACTION_SCHEMA_NAME = "moderation_extraction";
+    private static final String TERM_GENERATION_SCHEMA_NAME = "term_generation";
 
     // 记忆当前端点已探测出的可用档位,避免每条命中都从 json_schema 重试。
     // key 由 apiType|baseUrl|model 组成,设置变更时重新探测。
     private volatile FormatMode cachedMode = FormatMode.JSON_SCHEMA;
     private volatile String cachedModeKey = "";
+    private final Set<String> reportedFallbacks = ConcurrentHashMap.newKeySet();
 
     private final SettingsService settingsService;
     private final ObjectMapper objectMapper;
@@ -85,6 +92,31 @@ public class AiModerationClient {
     }
 
     /**
+     * 按自然语言需求生成违规词库候选项。这里只生成候选,不做入库。
+     */
+    public List<GeneratedTermResponse> generateTerms(String prompt, String category, int count, List<ViolationTerm> existingTerms) {
+        AiProperties config = settingsService.currentAi();
+        if (!StringUtils.hasText(config.baseUrl())) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "AI Base URL 不能为空");
+        }
+        if (!StringUtils.hasText(config.model())) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "AI 模型名称不能为空");
+        }
+        RestClient client = buildClient(config);
+        ApiType type = config.apiType();
+        JsonNode response = callWithFallback(
+                client,
+                config,
+                type,
+                termGenerationSystemPrompt(),
+                termGenerationUserPrompt(prompt, category, count, existingTerms),
+                termGenerationSchema(),
+                TERM_GENERATION_SCHEMA_NAME
+        );
+        return parseGeneratedTerms(response, type);
+    }
+
+    /**
      * 按当前端点已知的兼容档位发起调用;若因结构化输出不被支持而 400,
      * 自动降级(json_schema -> json_object -> none)重试并记忆,使后续调用直接命中可用档位。
      */
@@ -104,9 +136,19 @@ public class AiModerationClient {
                 if (next == null) {
                     throw ex;
                 }
-                log.warn("结构化输出档位 {} 不被端点支持(HTTP {}),降级为 {} 重试", mode, ex.getStatusCode().value(), next);
+                rememberMode(config, next);
+                logFormatFallbackOnce(config, mode, next, ex.getStatusCode().value());
                 mode = next;
             }
+        }
+    }
+
+    private void logFormatFallbackOnce(AiProperties config, FormatMode from, FormatMode to, int statusCode) {
+        String key = formatKey(config) + "|" + from + "->" + to;
+        if (reportedFallbacks.add(key)) {
+            log.warn("结构化输出档位 {} 不被端点支持(HTTP {}),已降级为 {}。同一端点后续将直接使用该档位", from, statusCode, to);
+        } else {
+            log.debug("结构化输出档位 {} 不被端点支持(HTTP {}),继续使用已缓存档位 {}", from, statusCode, to);
         }
     }
 
@@ -617,6 +659,36 @@ public class AiModerationClient {
     }
 
     /**
+     * 纯函数:从 AI 原始响应中抽取词库候选数组并解析,便于单元测试。
+     */
+    public List<GeneratedTermResponse> parseGeneratedTerms(JsonNode root, ApiType type) {
+        String content = type == ApiType.RESPONSES ? extractResponsesContent(root) : extractChatContent(root);
+        JsonNode termsNode = extractTermsArray(content);
+        List<GeneratedTermResponse> terms = new ArrayList<>();
+        if (termsNode == null || !termsNode.isArray()) {
+            return terms;
+        }
+        for (JsonNode item : termsNode) {
+            if (!item.isObject()) {
+                continue;
+            }
+            String term = item.path("term").asText("").trim();
+            if (term.isBlank()) {
+                continue;
+            }
+            terms.add(new GeneratedTermResponse(
+                    term,
+                    item.path("category").asText("").trim(),
+                    parseSeverity(item.path("severity").asText("")),
+                    parseMatchType(item.path("matchType").asText("")),
+                    textOrArray(item.path("variants")),
+                    item.path("reason").asText("AI 生成候选词。").trim()
+            ));
+        }
+        return terms;
+    }
+
+    /**
      * 先按 {"hits":[...]} 对象解析;失败则兜底尝试模型直接返回的裸数组 [...]。
      * 全部失败仅记 warn 并返回 null(本批跳过),不静默吞掉。
      */
@@ -644,6 +716,33 @@ public class AiModerationClient {
             }
         }
         log.warn("AI 提取返回内容无法解析为 hits 数组,本批跳过。原始内容: {}", trimForMessage(content));
+        return null;
+    }
+
+    private JsonNode extractTermsArray(String content) {
+        String stripped = stripCodeFence(content);
+        JsonNode object = tryParseObject(stripped);
+        if (object == null) {
+            String extracted = extractJsonObject(stripped);
+            if (extracted != null) {
+                object = tryParseObject(extracted);
+            }
+        }
+        if (object != null && object.path("terms").isArray()) {
+            return object.path("terms");
+        }
+        JsonNode array = tryParseArray(stripped);
+        if (array != null) {
+            return array;
+        }
+        String extractedArray = extractJsonArray(stripped);
+        if (extractedArray != null) {
+            array = tryParseArray(extractedArray);
+            if (array != null) {
+                return array;
+            }
+        }
+        log.warn("AI 词库生成返回内容无法解析为 terms 数组,本次结果为空。原始内容: {}", trimForMessage(content));
         return null;
     }
 
@@ -737,5 +836,104 @@ public class AiModerationClient {
         schema.put("required", List.of("hits"));
         schema.put("additionalProperties", false);
         return schema;
+    }
+
+    private String termGenerationSystemPrompt() {
+        return """
+                你是视频内容审核系统的词库生成助手。用户会用自然语言描述需要覆盖的违规类型或场景。
+                你的任务是生成可用于规则召回的词库候选,而不是给出合规解释。
+                每个候选必须包含 term、category、severity、matchType、variants、reason。
+                生成原则:
+                1. term 要短、可直接匹配,避免整句长文案;
+                2. category 使用用户要求或你归纳出的中文分类名;
+                3. severity 只能是 LOW、MEDIUM、HIGH、CRITICAL;
+                4. matchType 只能是 EXACT、VARIANT、REGEX、SEMANTIC。普通词用 EXACT,同义/谐音/错别字多的用 VARIANT,
+                   模式表达用 REGEX,宽泛语义类别用 SEMANTIC;
+                5. variants 用中文顿号分隔,没有则返回空字符串;
+                6. 不要生成已经存在的词条,不要输出解释文字或 Markdown。
+                必须只返回一个 JSON 对象 {"terms":[...]}。""";
+    }
+
+    private String termGenerationUserPrompt(String prompt, String category, int count, List<ViolationTerm> existingTerms) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("用户需求:\n").append(prompt).append("\n\n");
+        if (StringUtils.hasText(category)) {
+            sb.append("目标分类提示: ").append(category).append("\n\n");
+        }
+        sb.append("期望数量: ").append(Math.max(1, Math.min(50, count))).append("\n\n");
+        sb.append("已有词库,请避免重复:\n");
+        for (ViolationTerm term : existingTerms == null ? List.<ViolationTerm>of() : existingTerms) {
+            sb.append("- ").append(nullToEmpty(term.getTerm()))
+                    .append(" | ").append(nullToEmpty(term.getCategory()))
+                    .append(" | ").append(term.getMatchType())
+                    .append('\n');
+        }
+        sb.append("""
+
+                请生成词库候选,严格只返回:
+                {"terms":[{"term":"词条","category":"分类","severity":"MEDIUM","matchType":"EXACT","variants":"变体1、变体2","reason":"一句中文生成依据"}]}
+                """);
+        return sb.toString();
+    }
+
+    private static Map<String, Object> termGenerationSchema() {
+        Map<String, Object> termProperties = new LinkedHashMap<>();
+        termProperties.put("term", Map.of("type", "string"));
+        termProperties.put("category", Map.of("type", "string"));
+        termProperties.put("severity", Map.of("type", "string", "enum", List.of("LOW", "MEDIUM", "HIGH", "CRITICAL")));
+        termProperties.put("matchType", Map.of("type", "string", "enum", List.of("EXACT", "VARIANT", "REGEX", "SEMANTIC")));
+        termProperties.put("variants", Map.of("type", "string"));
+        termProperties.put("reason", Map.of("type", "string"));
+        Map<String, Object> termSchema = new LinkedHashMap<>();
+        termSchema.put("type", "object");
+        termSchema.put("properties", termProperties);
+        termSchema.put("required", List.of("term", "category", "severity", "matchType", "variants", "reason"));
+        termSchema.put("additionalProperties", false);
+
+        Map<String, Object> termsArray = new LinkedHashMap<>();
+        termsArray.put("type", "array");
+        termsArray.put("items", termSchema);
+
+        Map<String, Object> properties = new LinkedHashMap<>();
+        properties.put("terms", termsArray);
+        Map<String, Object> schema = new LinkedHashMap<>();
+        schema.put("type", "object");
+        schema.put("properties", properties);
+        schema.put("required", List.of("terms"));
+        schema.put("additionalProperties", false);
+        return schema;
+    }
+
+    private Severity parseSeverity(String value) {
+        try {
+            return Severity.valueOf(value == null ? "" : value.trim().toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException ex) {
+            return Severity.MEDIUM;
+        }
+    }
+
+    private MatchType parseMatchType(String value) {
+        try {
+            return MatchType.valueOf(value == null ? "" : value.trim().toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException ex) {
+            return MatchType.EXACT;
+        }
+    }
+
+    private String textOrArray(JsonNode node) {
+        if (node == null || node.isNull()) {
+            return "";
+        }
+        if (node.isArray()) {
+            List<String> values = new ArrayList<>();
+            for (JsonNode item : node) {
+                String value = item.asText("").trim();
+                if (!value.isBlank()) {
+                    values.add(value);
+                }
+            }
+            return String.join("、", values);
+        }
+        return node.asText("").trim();
     }
 }

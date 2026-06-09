@@ -1,15 +1,21 @@
 package com.ai.moderation.controller;
 
 import com.ai.moderation.dto.ExportResponse;
+import com.ai.moderation.dto.BatchIdsRequest;
+import com.ai.moderation.dto.BatchOperationResponse;
+import com.ai.moderation.dto.ExportTaskResponse;
 import com.ai.moderation.dto.JobResponse;
 import com.ai.moderation.dto.VideoResponse;
 import com.ai.moderation.service.ExportService;
+import com.ai.moderation.service.ExportTaskService;
 import com.ai.moderation.service.VideoService;
+import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestPart;
 import org.springframework.web.bind.annotation.ResponseStatus;
@@ -33,10 +39,12 @@ import java.util.List;
 public class VideoController {
     private final VideoService videoService;
     private final ExportService exportService;
+    private final ExportTaskService exportTaskService;
 
-    public VideoController(VideoService videoService, ExportService exportService) {
+    public VideoController(VideoService videoService, ExportService exportService, ExportTaskService exportTaskService) {
         this.videoService = videoService;
         this.exportService = exportService;
+        this.exportTaskService = exportTaskService;
     }
 
     @GetMapping
@@ -53,6 +61,11 @@ public class VideoController {
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void deleteVideo(@PathVariable Long id) {
         videoService.deleteVideo(id);
+    }
+
+    @DeleteMapping("/batch")
+    public BatchOperationResponse batchDeleteVideos(@Valid @RequestBody BatchIdsRequest request) {
+        return videoService.batchDeleteVideos(request.ids());
     }
 
     @PostMapping
@@ -75,9 +88,24 @@ public class VideoController {
         return videoService.createDetectionJob(id);
     }
 
+    @PostMapping("/batch/jobs")
+    public BatchOperationResponse createJobs(@Valid @RequestBody BatchIdsRequest request) {
+        return videoService.batchCreateDetectionJobs(request.ids());
+    }
+
     @PostMapping("/{id}/exports")
     public ExportResponse export(@PathVariable Long id) {
         return exportService.exportConfirmedClips(id);
     }
-}
 
+    @PostMapping("/{id}/export-tasks")
+    @ResponseStatus(HttpStatus.CREATED)
+    public ExportTaskResponse enqueueExport(@PathVariable Long id) {
+        return exportTaskService.enqueue(id);
+    }
+
+    @GetMapping("/{id}/export-tasks")
+    public List<ExportTaskResponse> listExportTasks(@PathVariable Long id) {
+        return exportTaskService.listByVideo(id);
+    }
+}

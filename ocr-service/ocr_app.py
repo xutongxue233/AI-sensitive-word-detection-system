@@ -18,6 +18,18 @@ import ocr_core
 app = FastAPI(title="PaddleOCR Subtitle Service")
 
 
+@app.get("/")
+async def root():
+    """根路径说明:避免浏览器/IDE 探活访问 `/` 时误报 404。"""
+    return {
+        "service": "ocr-service",
+        "status": "ok",
+        "health": "/health",
+        "ocrSubtitles": "/ocr-subtitles",
+        "note": "ASR 服务是独立进程 asr-service/app.py,默认端口 9000。",
+    }
+
+
 @app.get("/health")
 async def health():
     """健康探针:供后端探活并据此在前端展示 OCR 服务状态。
@@ -31,6 +43,10 @@ async def health():
         "ocrLang": ocr_core.PADDLE_OCR_LANG,
         "ocrVersion": ocr_core.PADDLE_OCR_VERSION or "(default)",
         "paddleOcrUseGpu": ocr_core.PADDLE_OCR_USE_GPU,
+        "showStartupLogs": ocr_core.PADDLE_OCR_SHOW_STARTUP_LOGS,
+        "minTextLength": ocr_core.PADDLE_OCR_MIN_TEXT_LENGTH,
+        "dropShortLatin": ocr_core.PADDLE_OCR_DROP_SHORT_LATIN,
+        "minRepeatFrames": ocr_core.PADDLE_OCR_MIN_REPEAT_FRAMES,
         "ocrModelLoaded": ocr_core.ocr_model_loaded(),
         "gpu": ocr_core.probe_paddle_gpu(),
     }
@@ -60,8 +76,8 @@ async def save_upload_to_temp(file: UploadFile, fallback_name: str) -> str:
 async def ocr_subtitles(
     file: UploadFile = File(...),
     interval_seconds: float = Form(0.75),
-    crop_bottom_ratio: float = Form(0.35),
-    min_confidence: float = Form(0.35),
+    crop_bottom_ratio: float = Form(1.0),
+    min_confidence: float = Form(0.65),
     lang: str = Form(ocr_core.PADDLE_OCR_LANG),
 ):
     """画面硬字幕识别主入口:接收视频,返回逐条字幕 segment。

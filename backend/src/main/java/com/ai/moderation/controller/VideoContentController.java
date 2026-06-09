@@ -3,6 +3,7 @@ package com.ai.moderation.controller;
 import com.ai.moderation.common.ApiException;
 import com.ai.moderation.domain.ClipStatus;
 import com.ai.moderation.repository.ClipSuggestionRepository;
+import com.ai.moderation.repository.DetectionJobRepository;
 import com.ai.moderation.repository.VideoFileRepository;
 import org.springframework.core.io.FileSystemResource;
 import org.springframework.core.io.Resource;
@@ -26,7 +27,7 @@ import java.nio.file.Path;
  * 视频二进制流式播放的 REST 入口,前缀 {@code /api/v1}。
  *
  * <p>负责把原始上传视频({@code /videos/{id}/content})与导出成片
- * ({@code /clip-suggestions/{id}/export-content})以字节流形式返回给浏览器播放器,
+ * ({@code /videos/{id}/export-content}、{@code /clip-suggestions/{id}/export-content})以字节流形式返回给浏览器播放器,
  * 支持 HTTP Range 分片请求(拖动进度条按需取片段)。因返回的是二进制流而非 JSON,
  * 与 {@link VideoController} 等 JSON 控制器刻意分开。
  */
@@ -37,10 +38,16 @@ public class VideoContentController {
     private static final long RANGE_CHUNK_SIZE = 1024 * 1024;
 
     private final VideoFileRepository videoRepository;
+    private final DetectionJobRepository jobRepository;
     private final ClipSuggestionRepository suggestionRepository;
 
-    public VideoContentController(VideoFileRepository videoRepository, ClipSuggestionRepository suggestionRepository) {
+    public VideoContentController(
+            VideoFileRepository videoRepository,
+            DetectionJobRepository jobRepository,
+            ClipSuggestionRepository suggestionRepository
+    ) {
         this.videoRepository = videoRepository;
+        this.jobRepository = jobRepository;
         this.suggestionRepository = suggestionRepository;
     }
 
@@ -49,6 +56,22 @@ public class VideoContentController {
         String path = videoRepository.findById(id)
                 .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, "视频不存在"))
                 .getStoragePath();
+        return fileResponse(Path.of(path), "video/mp4", headers);
+    }
+
+    @GetMapping("/videos/{id}/export-content")
+    public ResponseEntity<?> videoExportContent(@PathVariable Long id, @RequestHeader HttpHeaders headers) {
+        videoRepository.findById(id)
+                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, "视频不存在"));
+        String path = jobRepository.findByVideoIdOrderByCreatedAtDesc(id)
+                .stream()
+                .flatMap(job -> suggestionRepository
+                        .findByJobIdAndStatusOrderByStartTimeAsc(job.getId(), ClipStatus.EXPORTED)
+                        .stream())
+                .filter(item -> item.getExportPath() != null && !item.getExportPath().isBlank())
+                .findFirst()
+                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, "导出文件不存在"))
+                .getExportPath();
         return fileResponse(Path.of(path), "video/mp4", headers);
     }
 
@@ -85,6 +108,7 @@ public class VideoContentController {
             return ResponseEntity.ok()
                     .header(HttpHeaders.CONTENT_DISPOSITION, "inline")
                     .header(HttpHeaders.ACCEPT_RANGES, "bytes")
+                    .header(HttpHeaders.CACHE_CONTROL, "no-store")
                     .contentLength(contentLength)
                     .contentType(mediaType)
                     .body(resource);
@@ -98,6 +122,7 @@ public class VideoContentController {
         return ResponseEntity.status(HttpStatus.PARTIAL_CONTENT)
                 .header(HttpHeaders.CONTENT_DISPOSITION, "inline")
                 .header(HttpHeaders.ACCEPT_RANGES, "bytes")
+                .header(HttpHeaders.CACHE_CONTROL, "no-store")
                 .header(HttpHeaders.CONTENT_RANGE, "bytes " + start + "-" + end + "/" + contentLength)
                 .contentLength(chunk.length)
                 .contentType(mediaType)

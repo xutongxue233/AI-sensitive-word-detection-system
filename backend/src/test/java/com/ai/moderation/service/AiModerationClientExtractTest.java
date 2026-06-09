@@ -1,6 +1,9 @@
 package com.ai.moderation.service;
 
 import com.ai.moderation.config.ApiType;
+import com.ai.moderation.domain.MatchType;
+import com.ai.moderation.domain.Severity;
+import com.ai.moderation.dto.GeneratedTermResponse;
 import com.ai.moderation.service.support.ExtractedHit;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -122,5 +125,42 @@ class AiModerationClientExtractTest {
         JsonNode root = chat("抱歉,我无法完成提取。");
 
         assertThat(client.parseExtraction(root, ApiType.CHAT)).isEmpty();
+    }
+
+    @Test
+    void parsesGeneratedTermsObject() {
+        JsonNode root = chat("""
+                {"terms":[{"term":"全网最低","category":"广告极限词","severity":"CRITICAL","matchType":"EXACT","variants":"","reason":"绝对化宣传"}]}""");
+
+        List<GeneratedTermResponse> terms = client.parseGeneratedTerms(root, ApiType.CHAT);
+
+        assertThat(terms).hasSize(1);
+        assertThat(terms.getFirst().term()).isEqualTo("全网最低");
+        assertThat(terms.getFirst().severity()).isEqualTo(Severity.CRITICAL);
+        assertThat(terms.getFirst().matchType()).isEqualTo(MatchType.EXACT);
+    }
+
+    @Test
+    void parsesGeneratedTermsBareArrayAndVariantArray() {
+        JsonNode root = chat("""
+                [{"term":"包治百病","category":"虚假功效","severity":"HIGH","matchType":"VARIANT","variants":["包好","治百病"],"reason":"功效夸大"}]""");
+
+        List<GeneratedTermResponse> terms = client.parseGeneratedTerms(root, ApiType.CHAT);
+
+        assertThat(terms).hasSize(1);
+        assertThat(terms.getFirst().variants()).isEqualTo("包好、治百病");
+        assertThat(terms.getFirst().matchType()).isEqualTo(MatchType.VARIANT);
+    }
+
+    @Test
+    void generatedTermsFallbackInvalidEnums() {
+        JsonNode root = chat("""
+                {"terms":[{"term":"测试词","category":"测试","severity":"unknown","matchType":"bad","variants":"","reason":"r"}]}""");
+
+        List<GeneratedTermResponse> terms = client.parseGeneratedTerms(root, ApiType.CHAT);
+
+        assertThat(terms).hasSize(1);
+        assertThat(terms.getFirst().severity()).isEqualTo(Severity.MEDIUM);
+        assertThat(terms.getFirst().matchType()).isEqualTo(MatchType.EXACT);
     }
 }

@@ -1,15 +1,19 @@
 package com.ai.moderation.controller;
 
+import com.ai.moderation.dto.BatchOperationResponse;
+import com.ai.moderation.dto.ClipSuggestionBatchUpdateRequest;
 import com.ai.moderation.dto.ClipSuggestionResponse;
 import com.ai.moderation.dto.ClipSuggestionUpdateRequest;
 import com.ai.moderation.dto.HitStatusRequest;
 import com.ai.moderation.dto.JobResponse;
+import com.ai.moderation.dto.ManualClipSuggestionRequest;
 import com.ai.moderation.dto.TermHitResponse;
 import com.ai.moderation.dto.TimelineItemResponse;
 import com.ai.moderation.dto.TranscriptSegmentResponse;
 import com.ai.moderation.service.ClipSuggestionService;
 import com.ai.moderation.service.ModerationQueryService;
 import com.ai.moderation.service.TranscriptService;
+import jakarta.validation.Valid;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -77,9 +81,22 @@ public class JobController {
         return clipSuggestionService.createSuggestions(id);
     }
 
+    @PostMapping("/jobs/{id}/clip-suggestions/manual")
+    public ClipSuggestionResponse createManualSuggestion(
+            @PathVariable Long id,
+            @Valid @RequestBody ManualClipSuggestionRequest request
+    ) {
+        return clipSuggestionService.createManualSuggestion(id, request);
+    }
+
     @PatchMapping("/clip-suggestions/{id}")
     public ClipSuggestionResponse updateSuggestion(@PathVariable Long id, @RequestBody ClipSuggestionUpdateRequest request) {
         return clipSuggestionService.updateSuggestion(id, request);
+    }
+
+    @PatchMapping("/clip-suggestions/batch")
+    public BatchOperationResponse batchUpdateSuggestions(@Valid @RequestBody ClipSuggestionBatchUpdateRequest request) {
+        return clipSuggestionService.batchUpdateSuggestions(request);
     }
 
     @PatchMapping("/hits/{id}/review-status")
@@ -87,4 +104,3 @@ public class JobController {
         return queryService.updateHitStatus(id, request.status());
     }
 }
-

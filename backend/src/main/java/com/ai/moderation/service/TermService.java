@@ -5,8 +5,13 @@ import com.ai.moderation.domain.MatchType;
 import com.ai.moderation.domain.Severity;
 import com.ai.moderation.domain.TermCategory;
 import com.ai.moderation.domain.ViolationTerm;
+import com.ai.moderation.dto.BatchItemResponse;
+import com.ai.moderation.dto.BatchOperationResponse;
+import com.ai.moderation.dto.GeneratedTermResponse;
+import com.ai.moderation.dto.TermBatchUpdateRequest;
 import com.ai.moderation.dto.TermCategoryRequest;
 import com.ai.moderation.dto.TermCategoryResponse;
+import com.ai.moderation.dto.TermGenerationRequest;
 import com.ai.moderation.dto.TermImportResponse;
 import com.ai.moderation.dto.ViolationTermRequest;
 import com.ai.moderation.dto.ViolationTermResponse;
@@ -21,7 +26,10 @@ import org.springframework.web.multipart.MultipartFile;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.ArrayList;
 
 /**
  * 违规词与分类的管理服务:违规词/分类的 CRUD 与 CSV 批量导入。
@@ -33,10 +41,19 @@ import java.util.List;
 public class TermService {
     private final ViolationTermRepository termRepository;
     private final TermCategoryRepository categoryRepository;
+    private final SettingsService settingsService;
+    private final AiModerationClient aiModerationClient;
 
-    public TermService(ViolationTermRepository termRepository, TermCategoryRepository categoryRepository) {
+    public TermService(
+            ViolationTermRepository termRepository,
+            TermCategoryRepository categoryRepository,
+            SettingsService settingsService,
+            AiModerationClient aiModerationClient
+    ) {
         this.termRepository = termRepository;
         this.categoryRepository = categoryRepository;
+        this.settingsService = settingsService;
+        this.aiModerationClient = aiModerationClient;
     }
 
     @Transactional(readOnly = true)
@@ -73,6 +90,49 @@ public class TermService {
             throw new ApiException(HttpStatus.NOT_FOUND, "违规词不存在");
         }
         termRepository.deleteById(id);
+    }
+
+    @Transactional
+    public BatchOperationResponse batchUpdateTerms(TermBatchUpdateRequest request) {
+        List<BatchItemResponse> items = new ArrayList<>();
+        for (Long id : request.ids()) {
+            try {
+                ViolationTerm term = termRepository.findById(id)
+                        .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, "违规词不存在"));
+                if (request.enabled() != null) {
+                    term.setEnabled(request.enabled());
+                }
+                if (request.category() != null) {
+                    term.setCategory(blankToNull(request.category()));
+                }
+                if (request.severity() != null) {
+                    term.setSeverity(request.severity());
+                }
+                if (request.matchType() != null) {
+                    term.setMatchType(request.matchType());
+                }
+                term.setUpdatedAt(Instant.now());
+                termRepository.save(term);
+                items.add(BatchItemResponse.ok(id, "已更新"));
+            } catch (Exception ex) {
+                items.add(BatchItemResponse.failed(id, readableMessage(ex)));
+            }
+        }
+        return BatchOperationResponse.from(items);
+    }
+
+    @Transactional
+    public BatchOperationResponse batchDeleteTerms(List<Long> ids) {
+        List<BatchItemResponse> items = new ArrayList<>();
+        for (Long id : ids) {
+            try {
+                deleteTerm(id);
+                items.add(BatchItemResponse.ok(id, "已删除"));
+            } catch (Exception ex) {
+                items.add(BatchItemResponse.failed(id, readableMessage(ex)));
+            }
+        }
+        return BatchOperationResponse.from(items);
     }
 
     /**
@@ -135,6 +195,30 @@ public class TermService {
         }
     }
 
+    /**
+     * 根据自然语言需求调用当前 AI 配置生成候选词条。结果只返回给前端预览,不直接入库。
+     */
+    public List<GeneratedTermResponse> generateTerms(TermGenerationRequest request) {
+        if (!settingsService.currentAi().enabled()) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "AI 未启用，请先在系统设置中开启 AI 复核并配置模型");
+        }
+        int count = request.count() == null ? 12 : Math.max(1, Math.min(50, request.count()));
+        List<ViolationTerm> existingTerms = termRepository.findAll().stream().limit(120).toList();
+        List<GeneratedTermResponse> generated = aiModerationClient.generateTerms(
+                request.prompt().trim(),
+                blankToNull(request.category()),
+                count,
+                existingTerms
+        );
+        Set<String> seen = new HashSet<>();
+        return generated.stream()
+                .filter(item -> StringUtils.hasText(item.term()))
+                .filter(item -> !termRepository.existsByTermIgnoreCaseAndMatchType(item.term().trim(), item.matchType()))
+                .filter(item -> seen.add(item.term().trim().toLowerCase() + "|" + item.matchType()))
+                .limit(count)
+                .toList();
+    }
+
     @Transactional(readOnly = true)
     public List<TermCategoryResponse> listCategories() {
         return categoryRepository.findAll().stream().map(TermCategoryResponse::from).toList();
@@ -179,5 +263,9 @@ public class TermService {
 
     private String blankToNull(String value) {
         return StringUtils.hasText(value) ? value.trim() : null;
+    }
+
+    private String readableMessage(Exception ex) {
+        return ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
     }
 }

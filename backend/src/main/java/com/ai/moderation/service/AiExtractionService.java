@@ -22,7 +22,7 @@ import com.ai.moderation.service.support.SegmentTimeRange;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -39,10 +39,11 @@ import java.util.Objects;
 @Service
 public class AiExtractionService {
     private static final Logger log = LoggerFactory.getLogger(AiExtractionService.class);
-    private static final int BATCH_SIZE = 40;
+    private static final int BATCH_SIZE = 20;
     private static final double OVERLAP_TOLERANCE = 0.1;
 
     private final SettingsService settingsService;
+    private final TransactionTemplate transactionTemplate;
     private final AiModerationClient moderationClient;
     private final AiReviewService aiReviewService;
     private final SegmentTimeLocator segmentTimeLocator;
@@ -55,6 +56,7 @@ public class AiExtractionService {
 
     public AiExtractionService(
             SettingsService settingsService,
+            TransactionTemplate transactionTemplate,
             AiModerationClient moderationClient,
             AiReviewService aiReviewService,
             SegmentTimeLocator segmentTimeLocator,
@@ -66,6 +68,7 @@ public class AiExtractionService {
             ViolationTermRepository termRepository
     ) {
         this.settingsService = settingsService;
+        this.transactionTemplate = transactionTemplate;
         this.moderationClient = moderationClient;
         this.aiReviewService = aiReviewService;
         this.segmentTimeLocator = segmentTimeLocator;
@@ -87,7 +90,6 @@ public class AiExtractionService {
      *
      * @param jobId 当前检测任务 id
      */
-    @Transactional
     public void extractAndReview(Long jobId) {
         AiProperties ai = settingsService.currentAi();
         if (!ai.enabled()) {
@@ -103,16 +105,38 @@ public class AiExtractionService {
         }
 
         List<TermHit> ruleHits = hitRepository.findByJobIdOrderByStartTimeAsc(jobId);
+        List<TranscriptSegment> aiSegments = segments.stream()
+                .filter(segment -> !isLikelyOcrNoise(segment))
+                .toList();
+        if (aiSegments.isEmpty()) {
+            log.info("AI 整篇提取跳过 jobId={},可用字幕段为空,回退规则候选逐条复核", jobId);
+            aiReviewService.reviewJob(jobId);
+            return;
+        }
+        if (aiSegments.size() < segments.size()) {
+            log.info("AI 整篇提取已过滤疑似 OCR 噪声段 jobId={} skipped={} total={}",
+                    jobId, segments.size() - aiSegments.size(), segments.size());
+        }
 
         List<ExtractedHit> extracted = new ArrayList<>();
         boolean anyBatchOk = false;
-        for (int from = 0; from < segments.size(); from += BATCH_SIZE) {
-            List<TranscriptSegment> batch = segments.subList(from, Math.min(segments.size(), from + BATCH_SIZE));
+        int batchCount = (aiSegments.size() + BATCH_SIZE - 1) / BATCH_SIZE;
+        log.info("AI 整篇提取开始 jobId={} segments={} terms={} batchSize={}",
+                jobId, aiSegments.size(), terms.size(), BATCH_SIZE);
+        for (int from = 0; from < aiSegments.size(); from += BATCH_SIZE) {
+            List<TranscriptSegment> batch = aiSegments.subList(from, Math.min(aiSegments.size(), from + BATCH_SIZE));
+            int batchNo = from / BATCH_SIZE + 1;
             try {
-                extracted.addAll(moderationClient.extract(batch, terms));
+                log.info("AI 整篇提取批次开始 jobId={} batch={}/{} start={} size={}",
+                        jobId, batchNo, batchCount, from, batch.size());
+                List<ExtractedHit> batchHits = moderationClient.extract(batch, terms);
+                extracted.addAll(batchHits);
+                log.info("AI 整篇提取批次完成 jobId={} batch={}/{} hits={}",
+                        jobId, batchNo, batchCount, batchHits.size());
                 anyBatchOk = true;
             } catch (Exception ex) {
-                log.warn("AI 整篇提取批次失败 jobId={} batchStart={} : {}", jobId, from, ex.toString());
+                log.warn("AI 整篇提取批次失败 jobId={} batch={}/{} batchStart={} : {}",
+                        jobId, batchNo, batchCount, from, ex.toString());
             }
         }
         if (!anyBatchOk) {
@@ -124,16 +148,21 @@ public class AiExtractionService {
         List<PreparedAiHit> aiHits = dedupe(toAiHits(jobId, segments, terms, extracted));
         List<TermHit> residualRuleHits = residualRuleHits(ruleHits, aiHits);
 
-        // 清掉 matchJob 的原始候选,再写入「AI 提取命中 + 未被覆盖的规则残余」合并集。
-        hitRepository.deleteByJobId(jobId);
-        double threshold = ai.confidenceThreshold();
-        for (PreparedAiHit prepared : aiHits) {
-            persistAiHit(prepared, threshold);
-        }
+        persistExtractedHits(jobId, aiHits, ai.confidenceThreshold());
         for (TermHit residual : residualRuleHits) {
             residual.setId(null);
         }
         aiReviewService.reviewHits(residualRuleHits, ai);
+    }
+
+    private void persistExtractedHits(Long jobId, List<PreparedAiHit> aiHits, double threshold) {
+        // 清掉 matchJob 的原始候选,再写入 AI 提取命中;规则残余随后逐条复核并独立落库。
+        transactionTemplate.executeWithoutResult(status -> {
+            hitRepository.deleteByJobId(jobId);
+            for (PreparedAiHit prepared : aiHits) {
+                persistAiHit(prepared, threshold);
+            }
+        });
     }
 
     /**
@@ -305,5 +334,40 @@ public class AiExtractionService {
 
     private static String emptyToNull(String value) {
         return value == null || value.isBlank() ? null : value;
+    }
+
+    private static boolean isLikelyOcrNoise(TranscriptSegment segment) {
+        if (segment.getSource() != TranscriptSource.VIDEO_SUBTITLE) {
+            return false;
+        }
+        String compact = compactSignal(segment.getText());
+        return compact.length() <= 1 || isAsciiLetters(compact) && compact.length() <= 3;
+    }
+
+    private static String compactSignal(String text) {
+        if (text == null || text.isBlank()) {
+            return "";
+        }
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            if (Character.isLetterOrDigit(ch)) {
+                builder.append(ch);
+            }
+        }
+        return builder.toString();
+    }
+
+    private static boolean isAsciiLetters(String value) {
+        if (value == null || value.isBlank()) {
+            return false;
+        }
+        for (int i = 0; i < value.length(); i++) {
+            char ch = value.charAt(i);
+            if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'))) {
+                return false;
+            }
+        }
+        return true;
     }
 }

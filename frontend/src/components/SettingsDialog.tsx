@@ -1,6 +1,16 @@
 import { useEffect, useState } from 'react';
 import { toast } from 'sonner';
-import { CheckCircle2, Loader2, PlugZap } from 'lucide-react';
+import {
+  Bot,
+  CheckCircle2,
+  Gauge,
+  KeyRound,
+  Loader2,
+  PlugZap,
+  Scissors,
+  ShieldCheck,
+  SlidersHorizontal
+} from 'lucide-react';
 
 import { getErrorMessage, getSettings, testAiConnection, updateSettings } from '@/api';
 import type { AiApiType, AppSettings, AppSettingsUpdate } from '@/types';
@@ -24,6 +34,7 @@ import {
   SelectValue
 } from '@/components/ui/select';
 import { NumberField } from '@/components/ui/number-field';
+import { ScrollArea } from '@/components/ui/scroll-area';
 
 /**
  * 表单态:在完整 {@link AppSettings} 基础上去掉只读标志 aiApiKeyConfigured。
@@ -41,18 +52,62 @@ const API_TYPE_LABEL: Record<AiApiType, string> = {
 function Field({
   label,
   hint,
-  children
+  children,
+  className
 }: {
   label: string;
   hint?: string;
   children: React.ReactNode;
+  className?: string;
 }) {
   return (
-    <div className="space-y-1.5">
+    <div className={className ?? 'space-y-1.5'}>
       <Label>{label}</Label>
       {children}
       {hint && <p className="text-[12px] leading-snug text-muted-foreground">{hint}</p>}
     </div>
+  );
+}
+
+function StatusChip({ active, label }: { active: boolean; label: string }) {
+  return (
+    <span
+      className={
+        active
+          ? 'inline-flex items-center gap-1 rounded-md border border-emerald-500/25 bg-emerald-500/[0.08] px-2 py-1 text-[11px] font-medium text-emerald-700 dark:text-emerald-300'
+          : 'inline-flex items-center gap-1 rounded-md border border-border bg-muted/50 px-2 py-1 text-[11px] font-medium text-muted-foreground'
+      }
+    >
+      <span className={active ? 'h-1.5 w-1.5 rounded-full bg-emerald-500' : 'h-1.5 w-1.5 rounded-full bg-muted-foreground/45'} />
+      {label}
+    </span>
+  );
+}
+
+function SettingsSection({
+  icon: Icon,
+  title,
+  description,
+  children
+}: {
+  icon: typeof Bot;
+  title: string;
+  description: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="rounded-lg border border-border bg-card/80 shadow-sm">
+      <div className="flex items-start gap-3 border-b border-border px-4 py-3">
+        <span className="grid h-8 w-8 shrink-0 place-items-center rounded-md bg-primary/10 text-primary">
+          <Icon className="h-4 w-4" />
+        </span>
+        <div className="min-w-0">
+          <div className="text-sm font-semibold">{title}</div>
+          <p className="mt-0.5 text-[12px] leading-snug text-muted-foreground">{description}</p>
+        </div>
+      </div>
+      <div className="p-4">{children}</div>
+    </section>
   );
 }
 
@@ -159,155 +214,206 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-xl">
-        <DialogHeader>
-          <DialogTitle>系统设置</DialogTitle>
-          <DialogDescription>配置 AI 复核接口与剪辑参数，保存后对新检测任务即时生效，无需重启后端。</DialogDescription>
+      <DialogContent className="max-h-[88vh] max-w-[760px] gap-0 overflow-hidden p-0">
+        <DialogHeader className="border-b border-border px-6 py-5 pr-12">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <DialogTitle>系统设置</DialogTitle>
+              <DialogDescription className="mt-1">
+                AI 配置用于后续检测，剪辑参数用于后续生成建议和导出。
+              </DialogDescription>
+            </div>
+            {form && (
+              <div className="flex shrink-0 items-center gap-2 pt-0.5">
+                <StatusChip active={form.aiEnabled} label={form.aiEnabled ? 'AI 已启用' : 'AI 未启用'} />
+                <StatusChip active={keyConfigured} label={keyConfigured ? 'Key 已配置' : 'Key 未配置'} />
+              </div>
+            )}
+          </div>
         </DialogHeader>
 
         {loading || !form ? (
-          <div className="flex h-48 items-center justify-center text-muted-foreground">
+          <div className="flex h-72 items-center justify-center text-muted-foreground">
             <Loader2 className="h-5 w-5 animate-spin" />
           </div>
         ) : (
-          <div className="max-h-[60vh] space-y-5 overflow-y-auto pr-1">
-            <section className="space-y-4">
-              <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-card px-3 py-2.5">
-                <div>
-                  <div className="text-sm font-medium">启用 AI 复核</div>
-                  <p className="text-[12px] text-muted-foreground">关闭时仅按规则命中，全部保留交人工确认。</p>
-                </div>
-                <Switch checked={form.aiEnabled} onCheckedChange={(v) => patchAndClearTest({ aiEnabled: v })} />
-              </div>
-
-              <Field label="接口形态" hint="国产网关 / Ollama 多为 Chat Completions；Responses 为 OpenAI 新版接口。">
-                <Select value={form.aiApiType} onValueChange={(v) => patchAndClearTest({ aiApiType: v as AiApiType })}>
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {(Object.keys(API_TYPE_LABEL) as AiApiType[]).map((key) => (
-                      <SelectItem key={key} value={key}>
-                        {API_TYPE_LABEL[key]}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </Field>
-
-              <Field label="Base URL" hint="兼容端点根地址，例如 https://api.openai.com 或 http://localhost:11434。">
-                <Input
-                  value={form.aiBaseUrl}
-                  placeholder="http://localhost:11434"
-                  onChange={(e) => patchAndClearTest({ aiBaseUrl: e.target.value })}
-                />
-              </Field>
-
-              <Field label="API Key" hint={keyConfigured ? '已配置，留空则保持不变。' : '未配置，如需鉴权请填写。'}>
-                <Input
-                  type="password"
-                  value={apiKey}
-                  autoComplete="off"
-                  placeholder={keyConfigured ? '••••••••（留空保持不变）' : 'sk-...'}
-                  onChange={(e) => {
-                    setTestResult(null);
-                    setApiKey(e.target.value);
-                  }}
-                />
-              </Field>
-
-              <Field label="模型" hint="测试连接会使用当前表单值，不会保存设置；API Key 留空时沿用已保存的 Key。">
-                <div className="flex flex-col gap-2 sm:flex-row">
-                  <Input
-                    value={form.aiModel}
-                    placeholder="qwen2.5"
-                    onChange={(e) => patchAndClearTest({ aiModel: e.target.value })}
-                  />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className="shrink-0"
-                    onClick={testConnection}
-                    disabled={testing || saving || loading || !form.aiBaseUrl.trim() || !form.aiModel.trim()}
-                  >
-                    {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
-                    测试连接
-                  </Button>
-                </div>
-                {testResult && (
-                  <div
-                    className={
-                      testResult.ok
-                        ? 'flex items-start gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/[0.08] px-3 py-2 text-[12px] leading-relaxed text-emerald-700 dark:text-emerald-300'
-                        : 'rounded-md border border-destructive/30 bg-destructive/[0.08] px-3 py-2 text-[12px] leading-relaxed text-destructive'
-                    }
-                  >
-                    {testResult.ok && <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />}
-                    <span>{testResult.message}</span>
+          <ScrollArea className="max-h-[calc(88vh-142px)]">
+            <div className="space-y-4 px-6 py-5">
+              <SettingsSection
+                icon={Bot}
+                title="AI 复核接口"
+                description="配置模型端点、密钥与连通性测试。"
+              >
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between gap-4 rounded-md border border-border bg-muted/30 px-3 py-2.5">
+                    <div className="flex min-w-0 items-start gap-2.5">
+                      <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+                      <div>
+                        <div className="text-sm font-medium">启用 AI 复核</div>
+                        <p className="text-[12px] text-muted-foreground">关闭后仅保留规则召回结果。</p>
+                      </div>
+                    </div>
+                    <Switch checked={form.aiEnabled} onCheckedChange={(v) => patchAndClearTest({ aiEnabled: v })} />
                   </div>
-                )}
-              </Field>
 
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-                <Field label="置信度阈值" hint="低于该值不进时间轴/剪辑。">
-                  <NumberField
-                    value={form.aiConfidenceThreshold}
-                    min={0}
-                    max={1}
-                    step={0.05}
-                    onChange={(v) => patch({ aiConfidenceThreshold: v })}
-                  />
-                </Field>
-                <Field label="温度" hint="负数=不下发。">
-                  <NumberField
-                    value={form.aiTemperature}
-                    min={-1}
-                    max={2}
-                    step={0.1}
-                    onChange={(v) => patchAndClearTest({ aiTemperature: v })}
-                  />
-                </Field>
-                <Field label="超时" hint="秒">
-                  <NumberField
-                    value={form.aiTimeoutSeconds}
-                    min={1}
-                    step={5}
-                    precision={0}
-                    suffix="s"
-                    onChange={(v) => patchAndClearTest({ aiTimeoutSeconds: v })}
-                  />
-                </Field>
-              </div>
-            </section>
+                  <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                    <Field label="接口形态" hint="兼容国产网关、Ollama 与 OpenAI 风格端点。">
+                      <Select
+                        value={form.aiApiType}
+                        onValueChange={(v) => patchAndClearTest({ aiApiType: v as AiApiType })}
+                      >
+                        <SelectTrigger>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {(Object.keys(API_TYPE_LABEL) as AiApiType[]).map((key) => (
+                            <SelectItem key={key} value={key}>
+                              {API_TYPE_LABEL[key]}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </Field>
 
-            <section className="space-y-4 border-t border-border pt-4">
-              <div className="text-sm font-medium">剪辑</div>
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <Field label="剪辑留白" hint="命中词前后各保留的秒数，越小切得越少。">
-                  <NumberField
-                    value={form.clipPaddingSeconds}
-                    min={0}
-                    step={0.05}
-                    suffix="s"
-                    onChange={(v) => patch({ clipPaddingSeconds: v })}
-                  />
-                </Field>
-                <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-card px-3 py-2.5">
-                  <div>
-                    <div className="text-sm font-medium">精确导出</div>
-                    <p className="text-[12px] text-muted-foreground">重编码以帧级精确切割（较慢）。</p>
+                    <Field label="模型" hint="测试连接使用当前表单值。">
+                      <div className="flex gap-2">
+                        <Input
+                          value={form.aiModel}
+                          placeholder="qwen2.5"
+                          onChange={(e) => patchAndClearTest({ aiModel: e.target.value })}
+                        />
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="icon"
+                          className="shrink-0"
+                          onClick={testConnection}
+                          disabled={testing || saving || loading || !form.aiBaseUrl.trim() || !form.aiModel.trim()}
+                          aria-label="测试连接"
+                          title="测试连接"
+                        >
+                          {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}
+                        </Button>
+                      </div>
+                    </Field>
                   </div>
-                  <Switch
-                    checked={form.clipPreciseExport}
-                    onCheckedChange={(v) => patch({ clipPreciseExport: v })}
-                  />
+
+                  <Field label="Base URL" hint="例如 https://api.openai.com 或 http://localhost:11434。">
+                    <Input
+                      value={form.aiBaseUrl}
+                      placeholder="http://localhost:11434"
+                      onChange={(e) => patchAndClearTest({ aiBaseUrl: e.target.value })}
+                    />
+                  </Field>
+
+                  <Field label="API Key" hint={keyConfigured ? '已配置，留空则保持不变。' : '未配置，如需鉴权请填写。'}>
+                    <div className="relative">
+                      <KeyRound className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                      <Input
+                        className="pl-9"
+                        type="password"
+                        value={apiKey}
+                        autoComplete="off"
+                        placeholder={keyConfigured ? '••••••••（留空保持不变）' : 'sk-...'}
+                        onChange={(e) => {
+                          setTestResult(null);
+                          setApiKey(e.target.value);
+                        }}
+                      />
+                    </div>
+                  </Field>
+
+                  {testResult && (
+                    <div
+                      className={
+                        testResult.ok
+                          ? 'flex items-start gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/[0.08] px-3 py-2 text-[12px] leading-relaxed text-emerald-700 dark:text-emerald-300'
+                          : 'rounded-md border border-destructive/30 bg-destructive/[0.08] px-3 py-2 text-[12px] leading-relaxed text-destructive'
+                      }
+                    >
+                      {testResult.ok && <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />}
+                      <span>{testResult.message}</span>
+                    </div>
+                  )}
                 </div>
-              </div>
-            </section>
-          </div>
+              </SettingsSection>
+
+              <SettingsSection
+                icon={SlidersHorizontal}
+                title="判定参数"
+                description="控制 AI 复核的阈值、随机性与等待时间。"
+              >
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+                  <Field label="置信度阈值" hint="低于该值不进时间轴。">
+                    <NumberField
+                      value={form.aiConfidenceThreshold}
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      className="w-full"
+                      onChange={(v) => patch({ aiConfidenceThreshold: v })}
+                    />
+                  </Field>
+                  <Field label="温度" hint="负数表示不下发。">
+                    <NumberField
+                      value={form.aiTemperature}
+                      min={-1}
+                      max={2}
+                      step={0.1}
+                      className="w-full"
+                      onChange={(v) => patchAndClearTest({ aiTemperature: v })}
+                    />
+                  </Field>
+                  <Field label="超时" hint="单次 AI 请求。">
+                    <NumberField
+                      value={form.aiTimeoutSeconds}
+                      min={1}
+                      step={5}
+                      precision={0}
+                      suffix="s"
+                      className="w-full"
+                      onChange={(v) => patchAndClearTest({ aiTimeoutSeconds: v })}
+                    />
+                  </Field>
+                </div>
+              </SettingsSection>
+
+              <SettingsSection
+                icon={Scissors}
+                title="剪辑与导出"
+                description="控制剪辑建议留白与最终视频导出方式。"
+              >
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-[minmax(0,1fr)_minmax(260px,0.9fr)]">
+                  <Field label="剪辑留白" hint="命中词前后各保留的秒数。">
+                    <NumberField
+                      value={form.clipPaddingSeconds}
+                      min={0}
+                      step={0.05}
+                      suffix="s"
+                      className="w-full"
+                      onChange={(v) => patch({ clipPaddingSeconds: v })}
+                    />
+                  </Field>
+                  <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-muted/30 px-3 py-2.5">
+                    <div className="flex min-w-0 items-start gap-2.5">
+                      <Gauge className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+                      <div>
+                        <div className="text-sm font-medium">精确导出</div>
+                        <p className="text-[12px] leading-snug text-muted-foreground">重编码以帧级精确切割。</p>
+                      </div>
+                    </div>
+                    <Switch
+                      checked={form.clipPreciseExport}
+                      onCheckedChange={(v) => patch({ clipPreciseExport: v })}
+                    />
+                  </div>
+                </div>
+              </SettingsSection>
+            </div>
+          </ScrollArea>
         )}
 
-        <DialogFooter>
+        <DialogFooter className="border-t border-border bg-muted/20 px-6 py-4">
           <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={saving}>
             取消
           </Button>

@@ -5,23 +5,20 @@ import org.springframework.web.servlet.config.annotation.CorsRegistry;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 
 /**
- * 跨域(CORS)配置。放开前端开发服务器(Vite,本地 5173/5174 端口)对 /api/** 的跨域访问,
- * 允许携带凭证。直接实现 WebMvcConfigurer 重写 addCorsMappings,避免额外的匿名类。
+ * 跨域(CORS)配置。后端作为本地工具服务使用,放开全部来源、方法与请求头,便于前端
+ * 从任意开发地址或内网穿透域名访问 API、视频流与下载接口。
  */
 @Configuration
 public class WebConfig implements WebMvcConfigurer {
 
     @Override
     public void addCorsMappings(CorsRegistry registry) {
-        registry.addMapping("/api/**")
-                .allowedOrigins(
-                        "http://localhost:5173",
-                        "http://127.0.0.1:5173",
-                        "http://localhost:5174",
-                        "http://127.0.0.1:5174"
-                )
-                .allowedMethods("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
+        registry.addMapping("/**")
+                .allowedOriginPatterns("*")
+                .allowedMethods("*")
                 .allowedHeaders("*")
-                .allowCredentials(true);
+                .exposedHeaders("Content-Disposition", "Content-Range", "Accept-Ranges")
+                .allowCredentials(true)
+                .maxAge(3600);
     }
 }

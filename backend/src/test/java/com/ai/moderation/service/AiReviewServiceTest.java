@@ -12,8 +12,11 @@ import com.ai.moderation.service.support.AiDecision;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.springframework.transaction.TransactionStatus;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.List;
+import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -22,6 +25,7 @@ import static org.mockito.Mockito.*;
 class AiReviewServiceTest {
     private SettingsService settingsService;
     private AiModerationClient moderationClient;
+    private TransactionTemplate transactionTemplate;
     private TermHitRepository hitRepository;
     private AiReviewRepository reviewRepository;
 
@@ -29,8 +33,14 @@ class AiReviewServiceTest {
     void setUp() {
         settingsService = mock(SettingsService.class);
         moderationClient = mock(AiModerationClient.class);
+        transactionTemplate = mock(TransactionTemplate.class);
         hitRepository = mock(TermHitRepository.class);
         reviewRepository = mock(AiReviewRepository.class);
+        doAnswer(invocation -> {
+            Consumer<TransactionStatus> callback = invocation.getArgument(0);
+            callback.accept(null);
+            return null;
+        }).when(transactionTemplate).executeWithoutResult(any());
     }
 
     private AiReviewService service(double threshold) {
@@ -40,7 +50,7 @@ class AiReviewServiceTest {
     private AiReviewService service(boolean enabled, double threshold) {
         when(settingsService.currentAi())
                 .thenReturn(new AiProperties(enabled, ApiType.CHAT, "http://x", "", "m", 0, threshold, 60));
-        return new AiReviewService(settingsService, moderationClient, hitRepository, reviewRepository);
+        return new AiReviewService(settingsService, transactionTemplate, moderationClient, hitRepository, reviewRepository);
     }
 
     private TermHit hit() {

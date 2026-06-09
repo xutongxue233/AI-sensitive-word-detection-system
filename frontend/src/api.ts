@@ -13,12 +13,20 @@ import {
   AiConnectionTestResponse,
   AppSettings,
   AppSettingsUpdate,
+  BatchOperationResult,
+  ClipSuggestionBatchItem,
   ClipStatus,
   ClipSuggestion,
   DetectionJob,
   ExportResult,
+  ExportTask,
+  GeneratedTerm,
+  ManualClipSuggestionRequest,
   ReviewStatus,
+  SystemHealth,
   TermHit,
+  TermBatchUpdateRequest,
+  TermGenerationRequest,
   TermImportResult,
   TimelineItem,
   TranscriptSegment,
@@ -59,11 +67,20 @@ export const updateTerm = (id: number, payload: Partial<ViolationTerm>) =>
 
 export const deleteTerm = (id: number) => api.delete(`/terms/${id}`);
 
+export const batchUpdateTerms = (payload: TermBatchUpdateRequest) =>
+  api.patch<BatchOperationResult>('/terms/batch', payload).then((res) => res.data);
+
+export const batchDeleteTerms = (ids: number[]) =>
+  api.delete<BatchOperationResult>('/terms/batch', { data: { ids } }).then((res) => res.data);
+
 export const importTerms = (file: File) => {
   const form = new FormData();
   form.append('file', file);
   return api.post<TermImportResult>('/terms/import', form).then((res) => res.data);
 };
+
+export const generateTermsWithAi = (payload: TermGenerationRequest) =>
+  api.post<GeneratedTerm[]>('/terms/ai-generate', payload).then((res) => res.data);
 
 export const listVideos = () => api.get<VideoFile[]>('/videos').then((res) => res.data);
 
@@ -99,8 +116,14 @@ export const getVideo = (id: number) => api.get<VideoFile>(`/videos/${id}`).then
 
 export const deleteVideo = (id: number) => api.delete(`/videos/${id}`);
 
+export const batchDeleteVideos = (ids: number[]) =>
+  api.delete<BatchOperationResult>('/videos/batch', { data: { ids } }).then((res) => res.data);
+
 export const startJob = (videoId: number) =>
   api.post<DetectionJob>(`/videos/${videoId}/jobs`).then((res) => res.data);
+
+export const batchStartJobs = (ids: number[]) =>
+  api.post<BatchOperationResult>('/videos/batch/jobs', { ids }).then((res) => res.data);
 
 export const listJobs = (videoId: number) =>
   api.get<DetectionJob[]>(`/videos/${videoId}/jobs`).then((res) => res.data);
@@ -121,16 +144,33 @@ export const listClipSuggestions = (jobId: number) =>
 export const createClipSuggestions = (jobId: number) =>
   api.post<ClipSuggestion[]>(`/jobs/${jobId}/clip-suggestions`).then((res) => res.data);
 
+export const createManualClipSuggestion = (jobId: number, payload: ManualClipSuggestionRequest) =>
+  api.post<ClipSuggestion>(`/jobs/${jobId}/clip-suggestions/manual`, payload).then((res) => res.data);
+
 export const updateClipSuggestion = (
   id: number,
   payload: { startTime?: number; endTime?: number; status: ClipStatus }
 ) => api.patch<ClipSuggestion>(`/clip-suggestions/${id}`, payload).then((res) => res.data);
+
+export const batchUpdateClipSuggestions = (items: ClipSuggestionBatchItem[]) =>
+  api.patch<BatchOperationResult>('/clip-suggestions/batch', { items }).then((res) => res.data);
 
 export const updateHitStatus = (id: number, status: ReviewStatus) =>
   api.patch<TermHit>(`/hits/${id}/review-status`, { status }).then((res) => res.data);
 
 export const exportVideo = (videoId: number) =>
   api.post<ExportResult>(`/videos/${videoId}/exports`).then((res) => res.data);
+
+export const enqueueExportTask = (videoId: number) =>
+  api.post<ExportTask>(`/videos/${videoId}/export-tasks`).then((res) => res.data);
+
+export const listExportTasks = (videoId: number) =>
+  api.get<ExportTask[]>(`/videos/${videoId}/export-tasks`).then((res) => res.data);
+
+export const getExportTask = (id: number) => api.get<ExportTask>(`/export-tasks/${id}`).then((res) => res.data);
+
+export const batchEnqueueExportTasks = (ids: number[]) =>
+  api.post<BatchOperationResult>('/export-tasks/batch', { ids }).then((res) => res.data);
 
 export const getSettings = () => api.get<AppSettings>('/settings').then((res) => res.data);
 
@@ -140,6 +180,15 @@ export const updateSettings = (payload: AppSettingsUpdate) =>
 export const testAiConnection = (payload: AiConnectionTestRequest) =>
   api.post<AiConnectionTestResponse>('/settings/ai/test', payload).then((res) => res.data);
 
+export const getSystemHealth = () => api.get<SystemHealth>('/system/health').then((res) => res.data);
+
 export const videoContentUrl = (videoId: number) => `/api/v1/videos/${videoId}/content`;
+
+export const videoExportContentUrl = (videoId: number, version?: string | number) => {
+  const base = `/api/v1/videos/${videoId}/export-content`;
+  return version === undefined || version === null || version === ''
+    ? base
+    : `${base}?v=${encodeURIComponent(String(version))}`;
+};
 
 export const exportContentUrl = (suggestionId: number) => `/api/v1/clip-suggestions/${suggestionId}/export-content`;

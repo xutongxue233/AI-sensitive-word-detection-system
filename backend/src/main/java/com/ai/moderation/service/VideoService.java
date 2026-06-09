@@ -7,6 +7,8 @@ import com.ai.moderation.domain.JobStatus;
 import com.ai.moderation.domain.TermHit;
 import com.ai.moderation.domain.VideoFile;
 import com.ai.moderation.domain.VideoStatus;
+import com.ai.moderation.dto.BatchItemResponse;
+import com.ai.moderation.dto.BatchOperationResponse;
 import com.ai.moderation.dto.JobResponse;
 import com.ai.moderation.dto.VideoResponse;
 import com.ai.moderation.repository.AiReviewRepository;
@@ -31,6 +33,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
+import java.util.ArrayList;
 import java.util.stream.Stream;
 
 /**
@@ -166,6 +169,19 @@ public class VideoService {
         return JobResponse.from(saved);
     }
 
+    public BatchOperationResponse batchCreateDetectionJobs(List<Long> videoIds) {
+        List<BatchItemResponse> items = new ArrayList<>();
+        for (Long videoId : videoIds) {
+            try {
+                JobResponse job = createDetectionJob(videoId);
+                items.add(BatchItemResponse.ok(videoId, "检测任务 #" + job.id() + " 已启动"));
+            } catch (Exception ex) {
+                items.add(BatchItemResponse.failed(videoId, readableMessage(ex)));
+            }
+        }
+        return BatchOperationResponse.from(items);
+    }
+
     @Transactional(readOnly = true)
     public List<JobResponse> listJobs(Long videoId) {
         return jobRepository.findByVideoIdOrderByCreatedAtDesc(videoId).stream().map(JobResponse::from).toList();
@@ -192,6 +208,20 @@ public class VideoService {
         jobRepository.deleteByVideoId(id);
         videoRepository.deleteById(id);
         deleteStorageFiles(video);
+    }
+
+    @Transactional
+    public BatchOperationResponse batchDeleteVideos(List<Long> videoIds) {
+        List<BatchItemResponse> items = new ArrayList<>();
+        for (Long videoId : videoIds) {
+            try {
+                deleteVideo(videoId);
+                items.add(BatchItemResponse.ok(videoId, "已删除"));
+            } catch (Exception ex) {
+                items.add(BatchItemResponse.failed(videoId, readableMessage(ex)));
+            }
+        }
+        return BatchOperationResponse.from(items);
     }
 
     /**
@@ -235,6 +265,10 @@ public class VideoService {
 
     private VideoFile findVideo(Long id) {
         return videoRepository.findById(id).orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, "视频不存在"));
+    }
+
+    private String readableMessage(Exception ex) {
+        return ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
     }
 
     /** 从原始文件名提取小写扩展名(含点,如 ".mp4");无合法扩展名时返回空串。存储文件名只用 UUID,不含原始名。 */

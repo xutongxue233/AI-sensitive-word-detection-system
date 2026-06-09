@@ -5,15 +5,16 @@ spring:
   application:
     name: video-moderation
   datasource:
-    url: jdbc:mysql://localhost:3306/video_moderation?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true&createDatabaseIfNotExist=true
-    username: root
-    password: root
-    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:sqlite:${user.dir}/video_moderation.db?foreign_keys=on&journal_mode=WAL&busy_timeout=5000
+    driver-class-name: org.sqlite.JDBC
+    hikari:
+      maximum-pool-size: 1
+      connection-init-sql: PRAGMA foreign_keys=ON
   sql:
     init:
       mode: always
       encoding: UTF-8
-      schema-locations: classpath:schema-mysql.sql
+      schema-locations: classpath:schema-sqlite.sql
   servlet:
     multipart:
       max-file-size: 2GB
@@ -43,8 +44,8 @@ app:
     base-url: http://localhost:9001   # OCR 独立服务,与 Whisper(9000) 拆开避免 torch/paddle 同进程 CUDA 冲突;留空则回退用 asr.base-url
     ocr-path: /ocr-subtitles
     interval-seconds: 0.75
-    crop-bottom-ratio: 1.0       # 1.0=扫描整个画面(识别任意位置文字); 0.35=仅底部字幕条(更快但漏非底部文字)
-    min-confidence: 0.35
+    crop-bottom-ratio: 1.0       # 1.0=扫描整个画面(识别任意位置文字);如只需要底部字幕可调到 0.35
+    min-confidence: 0.65         # 整帧扫描时提高阈值,减少角标/Logo/背景碎片误识别
   ai:
     enabled: false
     api-type: chat

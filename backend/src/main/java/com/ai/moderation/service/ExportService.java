@@ -17,10 +17,13 @@ import com.ai.moderation.repository.DetectionJobRepository;
 import com.ai.moderation.repository.TermHitRepository;
 import com.ai.moderation.repository.TranscriptSegmentRepository;
 import com.ai.moderation.repository.VideoFileRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.Comparator;
@@ -46,6 +49,7 @@ import java.util.stream.Collectors;
  */
 @Service
 public class ExportService {
+    private static final Logger log = LoggerFactory.getLogger(ExportService.class);
 
     private final StorageProperties storageProperties;
     private final VideoFileRepository videoRepository;
@@ -80,14 +84,14 @@ public class ExportService {
      * 导出某视频已确认的剪辑片段为最终成片。
      *
      * <p>流程:取该视频最近一次 {@link JobStatus#COMPLETED} 任务下、状态为
-     * {@link ClipStatus#CONFIRMED} 的建议;按命中来源拆成音频时段与字幕遮罩时段;
+     * {@link ClipStatus#CONFIRMED} 的建议;若没有已确认建议但已有导出结果,则用
+     * {@link ClipStatus#EXPORTED} 建议支持重新生成;按命中来源拆成音频时段与字幕遮罩时段;
      * 先 delogo 去字幕得到中间产物,再在其上删除音频片段;最后把所有建议回写为
      * {@link ClipStatus#EXPORTED} 并标记视频 {@link VideoStatus#EXPORTED}。
      *
      * @param videoId 待导出的视频 id
      * @return 导出结果(输出路径与导出片段数)
      */
-    @Transactional
     public ExportResponse exportConfirmedClips(Long videoId) {
         VideoFile video = videoRepository.findById(videoId)
                 .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, "视频不存在"));
@@ -98,7 +102,10 @@ public class ExportService {
                 .orElseThrow(() -> new ApiException(HttpStatus.BAD_REQUEST, "没有已完成的检测任务"));
         List<ClipSuggestion> suggestions = suggestionRepository.findByJobIdAndStatusOrderByStartTimeAsc(job.getId(), ClipStatus.CONFIRMED);
         if (suggestions.isEmpty()) {
-            throw new ApiException(HttpStatus.BAD_REQUEST, "没有已确认的剪辑片段");
+            suggestions = suggestionRepository.findByJobIdAndStatusOrderByStartTimeAsc(job.getId(), ClipStatus.EXPORTED);
+        }
+        if (suggestions.isEmpty()) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, "没有可导出的剪辑片段");
         }
         Double durationValue = video.getDurationSeconds() == null
                 ? ffmpegService.probeDuration(Path.of(video.getStoragePath()))
@@ -122,7 +129,8 @@ public class ExportService {
                 .map(item -> toSubtitleMaskRange(item, hitsById, segmentsById))
                 .filter(Objects::nonNull)
                 .toList();
-        Path outputDir = Path.of(storageProperties.rootPath(), "exports", "video-" + videoId, "job-" + job.getId());
+        Path videoExportDir = Path.of(storageProperties.rootPath(), "exports", "video-" + videoId);
+        Path outputDir = videoExportDir.resolve("job-" + job.getId());
         Path videoPath = Path.of(video.getStoragePath());
         // 画面字幕命中统一走 delogo(邻域插值去字幕 + 高斯柔化 + 边缘羽化);无命中时方法内直接返回原视频
         Path source = ffmpegService.exportWithSubtitleBlur(videoPath, outputDir, subtitleRanges);
@@ -138,7 +146,43 @@ public class ExportService {
         suggestionRepository.saveAll(suggestions);
         video.setStatus(VideoStatus.EXPORTED);
         videoRepository.save(video);
+        cleanupStaleExportFiles(videoExportDir, output);
         return new ExportResponse(videoId, job.getId(), output.toString(), suggestions.size());
+    }
+
+    /**
+     * 同一视频重新导出后,旧成片与 FFmpeg 临时片段不再使用。清理限制在 storage/exports 下,
+     * 且保留本次最终输出文件;清理失败只记日志,不影响新视频导出成功。
+     */
+    private void cleanupStaleExportFiles(Path scopeDir, Path currentOutput) {
+        Path exportRoot = Path.of(storageProperties.rootPath(), "exports").toAbsolutePath().normalize();
+        Path dir = scopeDir.toAbsolutePath().normalize();
+        Path keep = currentOutput.toAbsolutePath().normalize();
+        if (!Files.isDirectory(dir) || !dir.startsWith(exportRoot)) {
+            return;
+        }
+        try (var walk = Files.walk(dir)) {
+            walk.sorted(Comparator.reverseOrder())
+                    .filter(path -> shouldDeleteExportPath(path, dir, keep))
+                    .forEach(path -> {
+                        try {
+                            Files.deleteIfExists(path);
+                        } catch (IOException ex) {
+                            log.warn("清理旧导出文件失败 {}: {}", path, ex.getMessage());
+                        }
+                    });
+        } catch (IOException ex) {
+            log.warn("扫描导出目录失败 {}: {}", dir, ex.getMessage());
+        }
+    }
+
+    private boolean shouldDeleteExportPath(Path path, Path scopeDir, Path currentOutput) {
+        Path normalized = path.toAbsolutePath().normalize();
+        if (normalized.equals(scopeDir)) {
+            return false;
+        }
+        // 当前最终文件及其父目录需要保留;其他旧文件、临时文件、空目录都可以清理。
+        return !normalized.equals(currentOutput) && !currentOutput.startsWith(normalized);
     }
 
     /**
@@ -169,10 +213,10 @@ public class ExportService {
         double y = segment == null || segment.getBboxY() == null ? 0.74 : segment.getBboxY();
         double width = segment == null || segment.getBboxWidth() == null ? 0.84 : segment.getBboxWidth();
         double height = segment == null || segment.getBboxHeight() == null ? 0.16 : segment.getBboxHeight();
-        // 擦除时段用字幕整条显示时长(segment start~end),而非命中词的零点几秒,
-        // 使擦除连续覆盖整条字幕、不闪烁;segment 缺失时回退到命中词时段。
-        double maskStart = segment == null ? suggestion.getStartTime() : segment.getStartTime();
-        double maskEnd = segment == null ? suggestion.getEndTime() : segment.getEndTime();
+        // 擦除时段严格使用剪辑建议上的最终时间,这样前端对字幕遮挡开始/结束的人工调整会真实生效。
+        // 建议生成阶段已把字幕类命中默认扩到整条字幕句段;这里不再强制覆盖为 segment 时间。
+        double maskStart = Math.max(0, suggestion.getStartTime());
+        double maskEnd = Math.max(maskStart + 0.1, suggestion.getEndTime());
         return new FfmpegService.SubtitleMaskRange(maskStart, maskEnd, x, y, width, height);
     }
 }

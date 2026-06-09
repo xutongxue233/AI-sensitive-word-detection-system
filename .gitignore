@@ -2,6 +2,7 @@ backend/target/
 backend/data/
 backend/storage/
 backend/tools/
+backend/video_moderation.db*
 frontend/node_modules/
 frontend/dist/
 frontend/*.tsbuildinfo

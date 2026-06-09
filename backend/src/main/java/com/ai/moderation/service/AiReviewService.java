@@ -10,7 +10,7 @@ import com.ai.moderation.service.support.AiDecision;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.List;
 
@@ -31,24 +31,26 @@ public class AiReviewService {
     private static final Logger log = LoggerFactory.getLogger(AiReviewService.class);
 
     private final SettingsService settingsService;
+    private final TransactionTemplate transactionTemplate;
     private final AiModerationClient moderationClient;
     private final TermHitRepository hitRepository;
     private final AiReviewRepository reviewRepository;
 
     public AiReviewService(
             SettingsService settingsService,
+            TransactionTemplate transactionTemplate,
             AiModerationClient moderationClient,
             TermHitRepository hitRepository,
             AiReviewRepository reviewRepository
     ) {
         this.settingsService = settingsService;
+        this.transactionTemplate = transactionTemplate;
         this.moderationClient = moderationClient;
         this.hitRepository = hitRepository;
         this.reviewRepository = reviewRepository;
     }
 
     /** 复核某任务全部命中,使用当前运行时 AI 设置(启用状态/阈值即时生效)。 */
-    @Transactional
     public void reviewJob(Long jobId) {
         reviewHits(hitRepository.findByJobIdOrderByStartTimeAsc(jobId), settingsService.currentAi());
     }
@@ -58,28 +60,30 @@ public class AiReviewService {
      * 传入的命中可为已持久化记录(update)或新建命中(insert),由 save 按 id 决定;
      * 先落库拿到自增 id,再写对应 ai_reviews,保证新建命中的 hitId 不为空。
      */
-    @Transactional
     public void reviewHits(List<TermHit> hits, AiProperties ai) {
         double threshold = ai.confidenceThreshold();
         for (TermHit hit : hits) {
             AiDecision decision = ai.enabled() ? review(hit) : localFallback(hit);
-
-            // 置信度把关:只有 AI 确认命中且置信度达到阈值,才标记为违规进入时间轴/剪辑。
-            // 低置信命中保留记录与原因,但置为 SAFE,不会自动生成剪辑。
-            boolean pass = decision.violation() && decision.confidence() >= threshold;
-            hit.setReviewStatus(pass ? ReviewStatus.VIOLATION : ReviewStatus.SAFE);
-            hit.setAiConfidence(decision.confidence());
-            hitRepository.save(hit);
-
-            AiReview review = new AiReview();
-            review.setHitId(hit.getId());
-            review.setViolation(decision.violation());
-            review.setConfidence(decision.confidence());
-            review.setCategory(decision.category());
-            review.setReason(decision.reason());
-            review.setRawResponse(decision.rawResponse());
-            reviewRepository.save(review);
+            transactionTemplate.executeWithoutResult(status -> persistReview(hit, decision, threshold));
         }
+    }
+
+    private void persistReview(TermHit hit, AiDecision decision, double threshold) {
+        // 置信度把关:只有 AI 确认命中且置信度达到阈值,才标记为违规进入时间轴/剪辑。
+        // 低置信命中保留记录与原因,但置为 SAFE,不会自动生成剪辑。
+        boolean pass = decision.violation() && decision.confidence() >= threshold;
+        hit.setReviewStatus(pass ? ReviewStatus.VIOLATION : ReviewStatus.SAFE);
+        hit.setAiConfidence(decision.confidence());
+        hitRepository.save(hit);
+
+        AiReview review = new AiReview();
+        review.setHitId(hit.getId());
+        review.setViolation(decision.violation());
+        review.setConfidence(decision.confidence());
+        review.setCategory(decision.category());
+        review.setReason(decision.reason());
+        review.setRawResponse(decision.rawResponse());
+        reviewRepository.save(review);
     }
 
     /** 调用模型复核单条命中;异常时不抛出,降级为保守判定保留规则命中结果。 */

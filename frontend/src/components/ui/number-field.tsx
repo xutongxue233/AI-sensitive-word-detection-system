@@ -10,6 +10,7 @@ interface NumberFieldProps {
   precision?: number;
   suffix?: string;
   className?: string;
+  disabled?: boolean;
   name?: string;
   'aria-label'?: string;
 }
@@ -23,6 +24,7 @@ export function NumberField({
   precision = 2,
   suffix,
   className,
+  disabled,
   ...rest
 }: NumberFieldProps) {
   const [text, setText] = React.useState(String(value ?? ''));
@@ -56,6 +58,7 @@ export function NumberField({
     <div
       className={cn(
         'inline-flex h-9 items-center rounded-md border border-input bg-card/50 shadow-sm transition-colors focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/30',
+        disabled && 'cursor-not-allowed opacity-60',
         className
       )}
     >
@@ -67,6 +70,7 @@ export function NumberField({
         min={min}
         max={max}
         step={step}
+        disabled={disabled}
         onChange={(e) => setText(e.target.value)}
         onFocus={() => {
           focused.current = true;

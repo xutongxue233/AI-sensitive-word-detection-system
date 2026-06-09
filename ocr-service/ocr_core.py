@@ -9,22 +9,59 @@
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import threading
+import warnings
+import logging
 from pathlib import Path
 
 from fastapi import HTTPException
 from opencc import OpenCC
 
 
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
 PADDLE_OCR_LANG = os.getenv("PADDLE_OCR_LANG", "ch")
 PADDLE_OCR_VERSION = os.getenv("PADDLE_OCR_VERSION", "PP-OCRv4")
 PADDLE_OCR_DET_MODEL = os.getenv("PADDLE_OCR_DET_MODEL")
 PADDLE_OCR_REC_MODEL = os.getenv("PADDLE_OCR_REC_MODEL")
-PADDLE_OCR_USE_GPU = os.getenv("PADDLE_OCR_USE_GPU", "true").lower() in {"1", "true", "yes", "on"}
-PADDLE_OCR_ENABLE_MKLDNN = os.getenv("PADDLE_OCR_ENABLE_MKLDNN", "false").lower() in {"1", "true", "yes", "on"}
+PADDLE_OCR_USE_GPU = env_bool("PADDLE_OCR_USE_GPU", True)
+PADDLE_OCR_ENABLE_MKLDNN = env_bool("PADDLE_OCR_ENABLE_MKLDNN", False)
+PADDLE_OCR_SHOW_STARTUP_LOGS = env_bool("PADDLE_OCR_SHOW_STARTUP_LOGS", False)
+PADDLE_OCR_MIN_TEXT_LENGTH = max(1, env_int("PADDLE_OCR_MIN_TEXT_LENGTH", 2))
+PADDLE_OCR_DROP_SHORT_LATIN = env_bool("PADDLE_OCR_DROP_SHORT_LATIN", True)
+PADDLE_OCR_MIN_REPEAT_FRAMES = max(1, env_int("PADDLE_OCR_MIN_REPEAT_FRAMES", 2))
 CHINESE_CONVERTER = os.getenv("WHISPER_CHINESE_CONVERTER", "t2s")
 FFMPEG_BIN_DIR = os.getenv("FFMPEG_BIN_DIR")
+
+if not PADDLE_OCR_SHOW_STARTUP_LOGS:
+    # Paddle 初始化时会探测 ccache 并调用 Windows `where ccache`;未安装时会打印本地化 stderr
+    # (PyCharm 下常显示为乱码),随后再发出 UserWarning。这只是编译缓存缺失提示,不影响 OCR 推理。
+    warnings.filterwarnings(
+        "ignore",
+        message=r"No ccache found\..*",
+        category=UserWarning,
+        module=r"paddle\.utils\.cpp_extension\.extension_utils",
+    )
+    # 降低 Paddle C++/glog 启动噪声,如 GPU Compute Capability 提示。需要底层排查时可打开上方开关。
+    os.environ.setdefault("GLOG_minloglevel", "2")
+    os.environ.setdefault("FLAGS_minloglevel", "2")
 
 if not PADDLE_OCR_ENABLE_MKLDNN:
     os.environ.setdefault("FLAGS_use_mkldnn", "0")
@@ -106,7 +143,7 @@ def get_ocr_reader(lang: str):
         with _ocr_lock:
             if ocr_reader is None or ocr_reader_lang != cache_key:
                 try:
-                    from paddleocr import PaddleOCR
+                    PaddleOCR = import_paddle_ocr()
                 except Exception as exc:
                     raise HTTPException(
                         status_code=503,
@@ -131,6 +168,38 @@ def get_ocr_reader(lang: str):
                 ocr_reader = reader
                 ocr_reader_lang = cache_key
     return ocr_reader
+
+
+def import_paddle_ocr():
+    """导入 PaddleOCR。
+
+    Paddle 在导入链中会探测 ccache。Windows 未安装 ccache 时,`where ccache` 会向 stderr
+    打印一行本地化文本,在 PyCharm UTF-8 控制台里常显示为乱码。默认拦截这一次探测调用,
+    让它安静地走"未安装 ccache"分支;功能不受影响。
+    """
+    if PADDLE_OCR_SHOW_STARTUP_LOGS:
+        from paddleocr import PaddleOCR
+        return PaddleOCR
+
+    original_check_output = subprocess.check_output
+
+    def quiet_check_output(cmd, *args, **kwargs):
+        if (
+            isinstance(cmd, (list, tuple))
+            and len(cmd) >= 2
+            and str(cmd[0]).lower() in {"where", "which"}
+            and str(cmd[1]).lower() == "ccache"
+        ):
+            raise subprocess.CalledProcessError(1, cmd)
+        return original_check_output(cmd, *args, **kwargs)
+
+    subprocess.check_output = quiet_check_output
+    try:
+        from paddleocr import PaddleOCR
+        logging.getLogger("paddlex").setLevel(logging.WARNING)
+        return PaddleOCR
+    finally:
+        subprocess.check_output = original_check_output
 
 
 def create_paddle_ocr(paddle_ocr_cls, lang: str):
@@ -241,7 +310,7 @@ def recognize_video_subtitles(
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
         segments = []
-        actives = []  # 每块字幕独立跟踪: {key, text, bbox, start, end, last_seen}
+        actives = []  # 每块字幕独立跟踪: {key, text, bbox, start, end, last_seen, seen}
         t = 0.0
         while t <= duration + 0.001:
             cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
@@ -266,25 +335,26 @@ def recognize_video_subtitles(
                     active = actives[found]
                     active["end"] = max(active["end"], seg_end)
                     active["last_seen"] = t
+                    active["seen"] = int(active.get("seen", 1)) + 1
                     if len(block["text"]) > len(active["text"]):
                         active["text"] = block["text"]
                     active["bbox"] = merge_bbox(active["bbox"], block)
                     matched.add(found)
                 else:
                     actives.append({"key": key, "text": block["text"], "bbox": block,
-                                    "start": t, "end": max(seg_end, t + 0.2), "last_seen": t})
+                                    "start": t, "end": max(seg_end, t + 0.2), "last_seen": t, "seen": 1})
                     matched.add(len(actives) - 1)
             # 连续多帧未再出现的块视为该字幕已消失,收尾成一条 segment
             survivors = []
             for active in actives:
                 if t - active["last_seen"] > interval_seconds * 1.5:
-                    segments.append(to_segment(active))
+                    append_active_segment(segments, active, interval_seconds)
                 else:
                     survivors.append(active)
             actives = survivors
             t += interval_seconds
         for active in actives:
-            segments.append(to_segment(active))
+            append_active_segment(segments, active, interval_seconds)
         # 边界 padding:OCR 按 interval 采样,segment 起止最多差一个采样间隔;前后各外扩半个间隔、
         # 片头字幕(start < interval)直接收到 0,减少"开头漏擦"与"前后各露出 0.几秒"。
         pad = interval_seconds * 0.5
@@ -329,7 +399,7 @@ def read_subtitle_blocks(reader, frame, crop_bottom_ratio: float, min_confidence
     blocks = []
     for bbox, text, confidence in raw_results:
         text = cleanup_ocr_text(text)
-        if confidence >= min_confidence and text and bbox:
+        if confidence >= min_confidence and text and bbox and not is_noise_text(text):
             box = union_bbox([bbox], width * scale, crop_height * scale, crop_top, scale, width, height)
             blocks.append({"text": text, **box})
     return blocks
@@ -492,6 +562,27 @@ def cleanup_ocr_text(text: str) -> str:
     return value
 
 
+def significant_text(text: str) -> str:
+    return "".join(ch for ch in text or "" if ch.isalnum())
+
+
+def contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text or "")
+
+
+def is_ascii_letters(value: str) -> bool:
+    return bool(value) and all(("a" <= ch.lower() <= "z") for ch in value)
+
+
+def is_noise_text(text: str) -> bool:
+    compact = significant_text(text)
+    if len(compact) < PADDLE_OCR_MIN_TEXT_LENGTH:
+        return True
+    if PADDLE_OCR_DROP_SHORT_LATIN and is_ascii_letters(compact) and len(compact) <= 3:
+        return True
+    return False
+
+
 def same_subtitle_box(current: dict | None, block: dict) -> bool:
     # 判断跨帧两块是否同一条字幕:垂直中心接近(同一行高度)且水平有交叠。
     # 与文本相似度配合,把同一块字幕跨帧关联,避免与画面其它位置的文字混成一块。
@@ -528,6 +619,27 @@ def same_subtitle_key(left: str, right: str) -> bool:
 
 def normalize_for_group(text: str) -> str:
     return "".join(ch.lower() for ch in normalize_text(text or "") if ch.isalnum())
+
+
+def append_active_segment(segments: list[dict], active: dict, interval_seconds: float):
+    if should_keep_active(active, interval_seconds):
+        segments.append(to_segment(active))
+
+
+def should_keep_active(active: dict, interval_seconds: float) -> bool:
+    text = active.get("text", "")
+    if is_noise_text(text):
+        return False
+    seen = int(active.get("seen", 1))
+    if seen >= PADDLE_OCR_MIN_REPEAT_FRAMES:
+        return True
+    compact = significant_text(text)
+    if contains_cjk(compact):
+        return True
+    if len(compact) >= 6:
+        return True
+    duration = float(active.get("end", 0.0)) - float(active.get("start", 0.0))
+    return duration >= interval_seconds * max(1, PADDLE_OCR_MIN_REPEAT_FRAMES)
 
 
 def to_segment(item: dict) -> dict:

@@ -1,7 +1,12 @@
 package com.ai.moderation.controller;
 
+import com.ai.moderation.dto.BatchIdsRequest;
+import com.ai.moderation.dto.BatchOperationResponse;
+import com.ai.moderation.dto.GeneratedTermResponse;
+import com.ai.moderation.dto.TermBatchUpdateRequest;
 import com.ai.moderation.dto.TermCategoryRequest;
 import com.ai.moderation.dto.TermCategoryResponse;
+import com.ai.moderation.dto.TermGenerationRequest;
 import com.ai.moderation.dto.TermImportResponse;
 import com.ai.moderation.dto.ViolationTermRequest;
 import com.ai.moderation.dto.ViolationTermResponse;
@@ -61,9 +66,24 @@ public class TermController {
         termService.deleteTerm(id);
     }
 
+    @PatchMapping("/terms/batch")
+    public BatchOperationResponse batchUpdateTerms(@Valid @RequestBody TermBatchUpdateRequest request) {
+        return termService.batchUpdateTerms(request);
+    }
+
+    @DeleteMapping("/terms/batch")
+    public BatchOperationResponse batchDeleteTerms(@Valid @RequestBody BatchIdsRequest request) {
+        return termService.batchDeleteTerms(request.ids());
+    }
+
     @PostMapping("/terms/import")
     public TermImportResponse importTerms(@RequestPart("file") MultipartFile file) {
         return termService.importCsv(file);
+    }
+
+    @PostMapping("/terms/ai-generate")
+    public List<GeneratedTermResponse> generateTerms(@Valid @RequestBody TermGenerationRequest request) {
+        return termService.generateTerms(request);
     }
 
     @GetMapping("/term-categories")

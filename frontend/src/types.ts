@@ -8,6 +8,8 @@
 export type Severity = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
 export type MatchType = 'EXACT' | 'VARIANT' | 'REGEX' | 'SEMANTIC';
 export type VideoStatus = 'UPLOADED' | 'DETECTING' | 'DETECTED' | 'EXPORTED' | 'FAILED';
+export type HealthStatus = 'OK' | 'WARN' | 'DOWN';
+export type ExportTaskStatus = 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED';
 /**
  * 转写来源,决定该条文本在导出阶段的处理方式(同后端 `TranscriptSource` 枚举):
  * - `AUDIO`:语音转写命中 → 导出时删除对应音频时间片段
@@ -63,6 +65,21 @@ export interface ViolationTerm {
   variants?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface GeneratedTerm {
+  term: string;
+  category?: string;
+  severity: Severity;
+  matchType: MatchType;
+  variants?: string;
+  reason?: string;
+}
+
+export interface TermGenerationRequest {
+  prompt: string;
+  category?: string;
+  count?: number;
 }
 
 export interface VideoFile {
@@ -160,10 +177,19 @@ export interface ClipSuggestion {
   action: 'REMOVE_AUDIO_SEGMENT' | 'BLUR_SUBTITLE'; // 处置动作:删音频段(AUDIO)或去字幕(VIDEO_SUBTITLE)
   startTime: number;
   endTime: number;
+  segmentStartTime?: number | null;
+  segmentEndTime?: number | null;
   paddingSeconds: number; // 命中时段前后各扩充的秒数,避免剪切边界过紧导致内容残留
   status: ClipStatus;
   exportPath?: string;
   aiConfidence?: number;
+}
+
+export interface ManualClipSuggestionRequest {
+  segmentId: number;
+  matchedText: string;
+  startTime: number;
+  endTime: number;
 }
 
 export interface ExportResult {
@@ -171,6 +197,49 @@ export interface ExportResult {
   jobId: number;
   exportPath: string;
   removedClipCount: number;
+}
+
+export interface ExportTask {
+  id: number;
+  videoId: number;
+  jobId?: number | null;
+  status: ExportTaskStatus;
+  progress: number;
+  exportPath?: string | null;
+  removedClipCount?: number | null;
+  errorMessage?: string | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface BatchItemResult {
+  id: number;
+  success: boolean;
+  message?: string;
+}
+
+export interface BatchOperationResult {
+  total: number;
+  succeeded: number;
+  failed: number;
+  items: BatchItemResult[];
+}
+
+export interface ClipSuggestionBatchItem {
+  id: number;
+  startTime?: number;
+  endTime?: number;
+  status: ClipStatus;
+}
+
+export interface TermBatchUpdateRequest {
+  ids: number[];
+  enabled?: boolean;
+  category?: string;
+  severity?: Severity;
+  matchType?: MatchType;
 }
 
 export type AiApiType = 'CHAT' | 'RESPONSES';
@@ -220,4 +289,18 @@ export interface AiConnectionTestResponse {
 export interface TermImportResult {
   importedCount: number;
   skippedCount: number;
+}
+
+export interface HealthItem {
+  key: string;
+  label: string;
+  status: HealthStatus;
+  message?: string;
+  elapsedMs?: number | null;
+}
+
+export interface SystemHealth {
+  status: HealthStatus;
+  checkedAt: string;
+  items: HealthItem[];
 }

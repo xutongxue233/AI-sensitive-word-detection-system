@@ -13,6 +13,7 @@ export default defineConfig({
     host: '127.0.0.1',
     port: 5174,
     strictPort: true,
+    allowedHosts: ["*", "10428260mx6sn.vicp.fun"],
     proxy: {
       '/api': {
         target: process.env.VITE_API_PROXY ?? 'http://localhost:8090',

@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 | 进程 | 技术 | 端口 | 角色 |
 | --- | --- | --- | --- |
-| backend | Spring Boot 3.3 / Java 21 / MyBatis-Plus / MySQL | 8090 | 编排管线、REST API、规则匹配、AI 客户端、FFmpeg 调用、导出 |
+| backend | Spring Boot 3.3 / Java 21 / MyBatis-Plus / SQLite(默认) / MySQL(可选) | 8090 | 编排管线、REST API、规则匹配、AI 客户端、FFmpeg 调用、导出 |
 | frontend | React 18 / Vite / TS | 5174 | 审核工作台,dev 代理 `/api` → 8090 |
 | asr-service | FastAPI / openai-whisper(**torch**) | 9000 | 语音转写,词级时间戳 |
 | ocr-service | FastAPI / PaddleOCR(**paddle,绝不装 torch**) | 9001 | 画面硬字幕识别 |
@@ -60,8 +60,8 @@ AI 启用与否、端点/密钥/模型走的是**运行时设置**(见下),`extr
 
 ## 数据与迁移
 
-- 启动时 `spring.sql.init` 执行 `schema-mysql.sql` 建表(`CREATE TABLE IF NOT EXISTS`)。
-- **新增列走 `SchemaMigration`**(`ApplicationRunner`,`information_schema` 幂等加列),**不要**改 `schema-mysql.sql` 期望它对已有库生效。
+- 默认数据库是 SQLite,启动时 `spring.sql.init` 执行 `schema-sqlite.sql` 建表(`CREATE TABLE IF NOT EXISTS`),数据库文件在 `backend/video_moderation.db`;MySQL 通过 `mysql` profile 启用并使用 `schema-mysql.sql`。
+- **新增列走 `SchemaMigration`**(`ApplicationRunner`,MySQL 用 `information_schema`,SQLite 用 `PRAGMA table_info` 幂等加列),**不要**只改 schema 脚本期望它对已有库生效。
 - 核心表:`violation_terms`、`videos`、`detection_jobs`、`transcript_segments`(+bbox/source)、`transcript_words`(词级时间戳)、`term_hits`(+source/review_status/ai_confidence)、`ai_reviews`、`clip_suggestions`、`app_settings`。
 
 ## 代码组织约定(backend `com.ai.moderation`)

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import {
   Activity,
@@ -31,16 +31,27 @@ import {
 } from 'lucide-react';
 
 import {
+  batchDeleteTerms,
+  batchDeleteVideos,
+  batchEnqueueExportTasks,
+  batchStartJobs,
+  batchUpdateClipSuggestions,
+  batchUpdateTerms,
   createClipSuggestions,
+  createManualClipSuggestion,
   createTerm,
   deleteTerm,
   deleteVideo,
+  enqueueExportTask,
   exportContentUrl,
   exportVideo,
+  generateTermsWithAi,
   getErrorMessage,
   getJob,
+  getSystemHealth,
   getVideo,
   importTerms,
+  listExportTasks,
   listClipSuggestions,
   listHits,
   listJobs,
@@ -52,21 +63,30 @@ import {
   updateClipSuggestion,
   updateTerm,
   uploadVideo,
+  videoExportContentUrl,
   videoContentUrl
 } from './api';
 import { SettingsDialog } from '@/components/SettingsDialog';
 import type {
   ClipStatus,
   ClipSuggestion,
+  ClipSuggestionBatchItem,
+  BatchOperationResult,
   DetectionJob,
+  ExportTask,
+  GeneratedTerm,
+  HealthStatus,
+  ManualClipSuggestionRequest,
   MatchType,
   Severity,
   TermHit,
   TimelineItem,
   TranscriptSource,
   TranscriptSegment,
+  TranscriptWord,
   VideoFile,
-  ViolationTerm
+  ViolationTerm,
+  SystemHealth
 } from './types';
 
 import { cn } from '@/lib/utils';
@@ -163,6 +183,48 @@ const TRANSCRIPT_SOURCE: Record<TranscriptSource, { label: string; tone: 'neutra
   VIDEO_SUBTITLE: { label: '画面字幕', tone: 'warn' }
 };
 
+interface ManualWordSelection {
+  segmentId: number;
+  startIndex: number;
+  endIndex: number;
+}
+
+interface ManualClipDraft extends ManualClipSuggestionRequest {
+  source: TranscriptSource;
+}
+
+function exportDownloadName(video: VideoFile | null) {
+  const base = (video?.originalFilename || `video-${video?.id ?? 'export'}`)
+    .replace(/\.[^/.\\]+$/, '')
+    .replace(/[\\/:*?"<>|]+/g, '_')
+    .trim();
+  return `${base || 'export'}-去违规版本.mp4`;
+}
+
+function joinTranscriptWords(words: TranscriptWord[]) {
+  const values = words.map((word) => word.word.trim()).filter(Boolean);
+  const compact = values.join('');
+  return /[\u4e00-\u9fff]/.test(compact) ? compact : values.join(' ');
+}
+
+function segmentDraft(segment: TranscriptSegment): ManualClipDraft {
+  return {
+    segmentId: segment.id,
+    matchedText: segment.text,
+    startTime: segment.startTime,
+    endTime: segment.endTime,
+    source: segment.source
+  };
+}
+
+function showBatchResult(result: BatchOperationResult, successText: string) {
+  if (result.failed > 0) {
+    toast.success(`${successText} ${result.succeeded} 条，失败 ${result.failed} 条`);
+    return;
+  }
+  toast.success(`${successText} ${result.succeeded} 条`);
+}
+
 /**
  * 管理明暗主题。
  * 初值取自 document.documentElement 上的 dark class,以兼容首屏内联脚本提前设置的主题(避免闪烁);
@@ -205,7 +267,47 @@ function BrandMark() {
   );
 }
 
-function Sidebar({ active, onNavigate }: { active: NavKey; onNavigate: (key: NavKey) => void }) {
+const HEALTH_STATUS_META: Record<HealthStatus, { label: string; dot: string; text: string; panel: string }> = {
+  OK: {
+    label: '正常',
+    dot: 'bg-[hsl(var(--sidebar-ring))]',
+    text: 'text-sidebar-foreground/55',
+    panel: 'border-[hsl(var(--sidebar-ring))]/25 bg-[hsl(var(--sidebar-ring))]/10 text-[hsl(var(--sidebar-ring))]'
+  },
+  WARN: {
+    label: '预警',
+    dot: 'bg-amber-400',
+    text: 'text-amber-200',
+    panel: 'border-amber-400/25 bg-amber-400/10 text-amber-100'
+  },
+  DOWN: {
+    label: '异常',
+    dot: 'bg-red-400',
+    text: 'text-red-200',
+    panel: 'border-red-400/25 bg-red-400/10 text-red-100'
+  }
+};
+
+function Sidebar({
+  active,
+  onNavigate,
+  health,
+  healthLoading,
+  onRefreshHealth
+}: {
+  active: NavKey;
+  onNavigate: (key: NavKey) => void;
+  health: SystemHealth | null;
+  healthLoading: boolean;
+  onRefreshHealth: () => void;
+}) {
+  const status = health?.status ?? 'WARN';
+  const statusMeta = HEALTH_STATUS_META[status];
+  const healthItems =
+    health?.items?.length
+      ? health.items
+      : [{ key: 'pending', label: '后端状态', status: healthLoading ? 'WARN' : 'DOWN', message: healthLoading ? '检查中' : '等待检查' } as const];
+
   return (
     <aside className="sticky top-0 hidden h-screen w-[252px] shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground lg:flex">
       <div className="flex items-center gap-3 px-5 pb-5 pt-6">
@@ -248,11 +350,26 @@ function Sidebar({ active, onNavigate }: { active: NavKey; onNavigate: (key: Nav
 
       <div className="mt-auto space-y-3 px-4 pb-5">
         <div className="rounded-lg border border-sidebar-border bg-black/20 p-3">
-          <Eyebrow className="text-sidebar-foreground/50">系统状态</Eyebrow>
+          <div className="flex items-center justify-between gap-2">
+            <Eyebrow className="text-sidebar-foreground/50">系统状态</Eyebrow>
+            <button
+              type="button"
+              onClick={onRefreshHealth}
+              disabled={healthLoading}
+              className="rounded-md p-1 text-sidebar-foreground/45 transition-colors hover:bg-white/5 hover:text-sidebar-foreground disabled:cursor-not-allowed disabled:opacity-50"
+              title="刷新系统状态"
+              aria-label="刷新系统状态"
+            >
+              <RefreshCw className={cn('h-3.5 w-3.5', healthLoading && 'animate-spin')} />
+            </button>
+          </div>
+          <div className={cn('mt-2 inline-flex items-center rounded-md border px-2 py-1 text-[11px] font-medium', statusMeta.panel)}>
+            {healthLoading ? '检查中' : statusMeta.label}
+          </div>
           <div className="mt-2.5 space-y-2 text-[12px]">
-            <StatusLine label="检测流水线" ok />
-            <StatusLine label="ASR / 字幕 OCR" ok />
-            <StatusLine label="数据来源" ok note="后端" />
+            {healthItems.map((item) => (
+              <StatusLine key={item.key} label={item.label} status={item.status} note={item.message} />
+            ))}
           </div>
         </div>
         <div className="px-1 text-[11px] text-sidebar-foreground/40">
@@ -263,19 +380,21 @@ function Sidebar({ active, onNavigate }: { active: NavKey; onNavigate: (key: Nav
   );
 }
 
-function StatusLine({ label, ok, note }: { label: string; ok: boolean; note?: string }) {
+function StatusLine({ label, status, note }: { label: string; status: HealthStatus; note?: string }) {
+  const meta = HEALTH_STATUS_META[status];
   return (
     <div className="flex items-center justify-between gap-2">
       <span className="text-sidebar-foreground/70">{label}</span>
-      <span className="flex items-center gap-1.5">
+      <span className="min-w-0 flex items-center gap-1.5" title={note}>
         <span
           className={cn(
             'h-1.5 w-1.5 rounded-full',
-            ok ? 'bg-[hsl(var(--sidebar-ring))] animate-pulse-ring' : 'bg-[hsl(var(--sev-medium))]'
+            meta.dot,
+            status === 'OK' && 'animate-pulse-ring'
           )}
         />
-        <span className={cn('telemetry text-[10px] uppercase', ok ? 'text-sidebar-foreground/55' : 'text-[hsl(var(--sev-medium))]')}>
-          {note ?? 'OK'}
+        <span className={cn('telemetry max-w-[104px] truncate text-right text-[10px] uppercase', meta.text)}>
+          {note ?? meta.label}
         </span>
       </span>
     </div>
@@ -367,10 +486,46 @@ export default function App() {
   const { theme, toggle } = useTheme();
   const [active, setActive] = useState<NavKey>('videos');
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [systemHealth, setSystemHealth] = useState<SystemHealth | null>(null);
+  const [healthLoading, setHealthLoading] = useState(false);
+
+  const refreshSystemHealth = useCallback(async () => {
+    setHealthLoading(true);
+    try {
+      setSystemHealth(await getSystemHealth());
+    } catch (error) {
+      setSystemHealth({
+        status: 'DOWN',
+        checkedAt: new Date().toISOString(),
+        items: [
+          {
+            key: 'backend',
+            label: '后端接口',
+            status: 'DOWN',
+            message: getErrorMessage(error, '接口不可达')
+          }
+        ]
+      });
+    } finally {
+      setHealthLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshSystemHealth();
+    const timer = window.setInterval(refreshSystemHealth, 30000);
+    return () => window.clearInterval(timer);
+  }, [refreshSystemHealth]);
 
   return (
     <div className="flex min-h-screen bg-background text-foreground">
-      <Sidebar active={active} onNavigate={setActive} />
+      <Sidebar
+        active={active}
+        onNavigate={setActive}
+        health={systemHealth}
+        healthLoading={healthLoading}
+        onRefreshHealth={refreshSystemHealth}
+      />
       <div className="flex min-w-0 flex-1 flex-col">
         <TopBar
           active={active}
@@ -419,8 +574,11 @@ function VideosPage() {
   const [progress, setProgress] = useState(0);
   const [subtitleFile, setSubtitleFile] = useState<File | undefined>();
   const [selected, setSelected] = useState<{ videoId: number; jobId?: number } | null>(null);
+  const [selectedVideoIds, setSelectedVideoIds] = useState<Set<number>>(new Set());
   const [deleteTarget, setDeleteTarget] = useState<VideoFile | null>(null);
+  const [batchDeleteOpen, setBatchDeleteOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [batchingVideos, setBatchingVideos] = useState(false);
   const pageSize = 6;
   const { page, setPage, pageCount, pageItems } = usePagination(videos, pageSize);
   const subtitleInputRef = useRef<HTMLInputElement>(null);
@@ -439,6 +597,14 @@ function VideosPage() {
   useEffect(() => {
     load();
   }, []);
+
+  useEffect(() => {
+    setSelectedVideoIds((current) => {
+      const liveIds = new Set(videos.map((video) => video.id));
+      const next = new Set([...current].filter((id) => liveIds.has(id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [videos]);
 
   const handleUpload = async (files: File[]) => {
     const video = files[0];
@@ -472,29 +638,99 @@ function VideosPage() {
 
   const exportModerated = async (video: VideoFile) => {
     try {
-      const result = await exportVideo(video.id);
-      toast.success(`已导出，处理建议 ${result.removedClipCount} 个`);
+      const task = await enqueueExportTask(video.id);
+      toast.success(`导出任务 #${task.id} 已入队`);
       load();
     } catch (error) {
-      toast.error(getErrorMessage(error, '导出失败'));
+      toast.error(getErrorMessage(error, '导出入队失败'));
     }
   };
 
   const confirmDelete = async () => {
-    if (!deleteTarget) return;
+    const targets = deleteTarget ? [deleteTarget] : videos.filter((video) => selectedVideoIds.has(video.id));
+    if (targets.length === 0) return;
     setDeleting(true);
     try {
-      await deleteVideo(deleteTarget.id);
-      toast.success('视频已删除');
-      if (selected?.videoId === deleteTarget.id) {
+      const result = await batchDeleteVideos(targets.map((video) => video.id));
+      showBatchResult(result, '已删除视频');
+      if (selected && targets.some((video) => video.id === selected.videoId)) {
         setSelected(null);
       }
       setDeleteTarget(null);
+      setBatchDeleteOpen(false);
+      setSelectedVideoIds(new Set());
       load();
     } catch (error) {
       toast.error(getErrorMessage(error, '删除失败'));
     } finally {
       setDeleting(false);
+    }
+  };
+
+  const selectedVideos = useMemo(
+    () => videos.filter((video) => selectedVideoIds.has(video.id)),
+    [selectedVideoIds, videos]
+  );
+  const selectedExportableVideos = selectedVideos.filter(
+    (video) => video.status === 'DETECTED' || video.status === 'EXPORTED'
+  );
+  const pageVideoIds = pageItems.map((video) => video.id);
+  const pageVideosAllSelected = pageVideoIds.length > 0 && pageVideoIds.every((id) => selectedVideoIds.has(id));
+
+  const toggleVideoSelection = (id: number, checked: boolean) => {
+    setSelectedVideoIds((current) => {
+      const next = new Set(current);
+      if (checked) {
+        next.add(id);
+      } else {
+        next.delete(id);
+      }
+      return next;
+    });
+  };
+
+  const togglePageVideoSelection = (checked: boolean) => {
+    setSelectedVideoIds((current) => {
+      const next = new Set(current);
+      pageVideoIds.forEach((id) => {
+        if (checked) {
+          next.add(id);
+        } else {
+          next.delete(id);
+        }
+      });
+      return next;
+    });
+  };
+
+  const batchDetectVideos = async () => {
+    const targets = selectedVideos.filter((video) => video.status !== 'DETECTING');
+    if (targets.length === 0) {
+      toast.error('请选择可检测的视频');
+      return;
+    }
+    setBatchingVideos(true);
+    try {
+      const result = await batchStartJobs(targets.map((video) => video.id));
+      showBatchResult(result, '已启动检测');
+      load();
+    } finally {
+      setBatchingVideos(false);
+    }
+  };
+
+  const batchExportVideos = async () => {
+    if (selectedExportableVideos.length === 0) {
+      toast.error('请选择已检测完成或已导出的视频');
+      return;
+    }
+    setBatchingVideos(true);
+    try {
+      const result = await batchEnqueueExportTasks(selectedExportableVideos.map((video) => video.id));
+      showBatchResult(result, '已创建导出任务');
+      load();
+    } finally {
+      setBatchingVideos(false);
     }
   };
 
@@ -599,9 +835,51 @@ function VideosPage() {
             <EmptyState icon={Inbox} title="还没有视频" description="上传一个视频文件开始你的第一次违规词检测。" />
           ) : (
             <>
+              {selectedVideoIds.size > 0 && (
+                <div className="mb-3 flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted/30 px-3 py-2">
+                  <Pill tone="info" dot={false}>
+                    已选 <span className="telemetry">{selectedVideoIds.size}</span>
+                  </Pill>
+                  <Button variant="outline" size="sm" onClick={batchDetectVideos} disabled={batchingVideos}>
+                    <Play className="h-4 w-4" />
+                    批量检测
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={batchExportVideos}
+                    disabled={batchingVideos || selectedExportableVideos.length === 0}
+                  >
+                    <Scissors className="h-4 w-4" />
+                    批量导出
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-muted-foreground hover:text-destructive"
+                    onClick={() => setBatchDeleteOpen(true)}
+                    disabled={batchingVideos}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                    批量删除
+                  </Button>
+                  <Button variant="ghost" size="sm" className="ml-auto" onClick={() => setSelectedVideoIds(new Set())}>
+                    清空选择
+                  </Button>
+                </div>
+              )}
               <Table>
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
+                    <TableHead className="w-[44px]">
+                      <input
+                        type="checkbox"
+                        checked={pageVideosAllSelected}
+                        onChange={(e) => togglePageVideoSelection(e.target.checked)}
+                        aria-label="选择当前页视频"
+                        className="h-4 w-4 rounded border-border accent-primary"
+                      />
+                    </TableHead>
                     <TableHead>文件名</TableHead>
                     <TableHead className="w-[96px]">时长</TableHead>
                     <TableHead className="w-[100px]">状态</TableHead>
@@ -612,8 +890,19 @@ function VideosPage() {
                 <TableBody>
                   {pageItems.map((video) => {
                     const status = VIDEO_STATUS[video.status];
+                    const downloadName = exportDownloadName(video);
+                    const downloadUrl = videoExportContentUrl(video.id);
                     return (
                       <TableRow key={video.id}>
+                        <TableCell>
+                          <input
+                            type="checkbox"
+                            checked={selectedVideoIds.has(video.id)}
+                            onChange={(e) => toggleVideoSelection(video.id, e.target.checked)}
+                            aria-label={`选择 ${video.originalFilename}`}
+                            className="h-4 w-4 rounded border-border accent-primary"
+                          />
+                        </TableCell>
                         <TableCell>
                           <div className="flex items-center gap-2.5">
                             <span className="grid h-8 w-8 shrink-0 place-items-center rounded-md bg-muted text-muted-foreground">
@@ -649,13 +938,21 @@ function VideosPage() {
                               <Gauge className="h-4 w-4" />
                               详情
                             </Button>
+                            {video.status === 'EXPORTED' && (
+                              <Button asChild variant="ghost" size="icon-sm">
+                                <a href={downloadUrl} download={downloadName} aria-label="下载去违规视频" title="下载去违规视频">
+                                  <Download className="h-4 w-4" />
+                                </a>
+                              </Button>
+                            )}
                             <Button
                               variant="ghost"
                               size="icon-sm"
                               onClick={() => exportModerated(video)}
-                              aria-label="导出去违规视频"
+                              aria-label={video.status === 'EXPORTED' ? '重新生成剪辑视频' : '导出去违规视频'}
+                              title={video.status === 'EXPORTED' ? '重新生成剪辑视频' : '导出去违规视频'}
                             >
-                              <Download className="h-4 w-4" />
+                              <Scissors className="h-4 w-4" />
                             </Button>
                             <Button
                               variant="ghost"
@@ -698,12 +995,22 @@ function VideosPage() {
         </SheetContent>
       </Sheet>
 
-      <AlertDialog open={!!deleteTarget} onOpenChange={(open) => !open && !deleting && setDeleteTarget(null)}>
+      <AlertDialog
+        open={!!deleteTarget || batchDeleteOpen}
+        onOpenChange={(open) => {
+          if (!open && !deleting) {
+            setDeleteTarget(null);
+            setBatchDeleteOpen(false);
+          }
+        }}
+      >
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>删除视频</AlertDialogTitle>
             <AlertDialogDescription>
-              将删除「{deleteTarget?.originalFilename}」及其全部检测任务、命中记录、剪辑建议与原始文件，此操作不可恢复。
+              {deleteTarget
+                ? `将删除「${deleteTarget.originalFilename}」及其全部检测任务、命中记录、剪辑建议与原始文件，此操作不可恢复。`
+                : `将删除选中的 ${selectedVideoIds.size} 个视频及其全部检测任务、命中记录、剪辑建议与原始文件，此操作不可恢复。`}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -740,18 +1047,46 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
   const [hits, setHits] = useState<TermHit[]>([]);
   const [timeline, setTimeline] = useState<TimelineItem[]>([]);
   const [suggestions, setSuggestions] = useState<ClipSuggestion[]>([]);
+  const [exportTasks, setExportTasks] = useState<ExportTask[]>([]);
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [exportPreviewVersion, setExportPreviewVersion] = useState(0);
+  const [manualSelection, setManualSelection] = useState<ManualWordSelection | null>(null);
+  const [addingManualSuggestion, setAddingManualSuggestion] = useState(false);
+  const [selectedSuggestionIds, setSelectedSuggestionIds] = useState<Set<number>>(new Set());
+  const [activeEvidenceHitId, setActiveEvidenceHitId] = useState<number | null>(null);
+  const [activeSuggestionId, setActiveSuggestionId] = useState<number | null>(null);
+  const [batchingSuggestions, setBatchingSuggestions] = useState(false);
   const hitPageSize = 6;
   const { page: hitPage, setPage: setHitPage, pageCount: hitPageCount, pageItems: hitItems } = usePagination(hits, hitPageSize);
 
   const activeJobId = job?.id ?? initialJobId;
+
+  const selectedManualDraft = useMemo<ManualClipDraft | null>(() => {
+    if (!manualSelection) return null;
+    const segment = segments.find((item) => item.id === manualSelection.segmentId);
+    if (!segment) return null;
+    const words = segment.words ?? [];
+    if (words.length === 0) return segmentDraft(segment);
+    const from = Math.max(0, Math.min(manualSelection.startIndex, manualSelection.endIndex));
+    const to = Math.min(words.length - 1, Math.max(manualSelection.startIndex, manualSelection.endIndex));
+    const selectedWords = words.slice(from, to + 1);
+    if (selectedWords.length === 0) return null;
+    return {
+      segmentId: segment.id,
+      matchedText: joinTranscriptWords(selectedWords),
+      startTime: Math.min(...selectedWords.map((word) => word.startTime)),
+      endTime: Math.max(...selectedWords.map((word) => word.endTime)),
+      source: segment.source
+    };
+  }, [manualSelection, segments]);
 
   const load = async () => {
     setLoading(true);
     try {
       const currentVideo = await getVideo(videoId);
       setVideo(currentVideo);
+      setExportTasks(await listExportTasks(videoId));
       let jobId = job?.id ?? initialJobId;
       if (!jobId) {
         const jobs = await listJobs(videoId);
@@ -786,6 +1121,32 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [videoId, initialJobId]);
 
+  useEffect(() => {
+    setSelectedSuggestionIds((current) => {
+      const editableIds = new Set(suggestions.filter((item) => item.status !== 'EXPORTED').map((item) => item.id));
+      const next = new Set([...current].filter((id) => editableIds.has(id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [suggestions]);
+
+  useEffect(() => {
+    setActiveEvidenceHitId((current) => {
+      if (current && timeline.some((item) => item.hitId === current)) {
+        return current;
+      }
+      return timeline[0]?.hitId ?? null;
+    });
+  }, [timeline]);
+
+  useEffect(() => {
+    setActiveSuggestionId((current) => {
+      if (current && suggestions.some((item) => item.id === current)) {
+        return current;
+      }
+      return suggestions.find((item) => item.status !== 'EXPORTED')?.id ?? suggestions[0]?.id ?? null;
+    });
+  }, [suggestions]);
+
   const loadRef = useRef(load);
   useEffect(() => {
     // loadRef 始终镜像最新的 load,供下方 setInterval 闭包调用,避免捕获到陈旧的 load 引用
@@ -802,6 +1163,14 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [job?.id, job?.status]);
 
+  useEffect(() => {
+    if (!exportTasks.some((task) => task.status === 'QUEUED' || task.status === 'RUNNING')) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => loadRef.current(), 2500);
+    return () => window.clearInterval(timer);
+  }, [exportTasks]);
+
   const duration = useMemo(() => {
     // 时间轴总时长取视频时长、各违规命中结束时间、各句段结束时间三者最大值,并兜底 1 防止后续按比例换算时除零
     const ends = [
@@ -812,6 +1181,21 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
     return Math.max(1, ...ends);
   }, [video, timeline, segments]);
 
+  const activeEvidence = useMemo(() => {
+    if (timeline.length === 0) return null;
+    return timeline.find((item) => item.hitId === activeEvidenceHitId) ?? timeline[0];
+  }, [activeEvidenceHitId, timeline]);
+  const activeEvidenceHit = activeEvidence ? hits.find((item) => item.id === activeEvidence.hitId) : undefined;
+  const activeEvidenceSuggestion = activeEvidence
+    ? suggestions.find((item) => item.hitId === activeEvidence.hitId)
+    : undefined;
+  const activeEvidenceSegment = activeEvidenceHit
+    ? segments.find((item) => item.id === activeEvidenceHit.segmentId)
+    : undefined;
+  const latestExportTask = exportTasks[0];
+  const runningExportTask = exportTasks.find((task) => task.status === 'QUEUED' || task.status === 'RUNNING');
+  const completedExportTask = exportTasks.find((task) => task.status === 'COMPLETED' && task.exportPath);
+
   const regenerateSuggestions = async () => {
     if (!activeJobId) return;
     try {
@@ -819,6 +1203,53 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
       toast.success('剪辑建议已重新生成');
     } catch (error) {
       toast.error(getErrorMessage(error, '重新生成失败'));
+    }
+  };
+
+  const selectTranscriptWord = (segment: TranscriptSegment, wordIndex: number) => {
+    setManualSelection((current) => {
+      if (current?.segmentId !== segment.id) {
+        return { segmentId: segment.id, startIndex: wordIndex, endIndex: wordIndex };
+      }
+      if (current.startIndex === wordIndex && current.endIndex === wordIndex) {
+        return null;
+      }
+      return {
+        segmentId: segment.id,
+        startIndex: Math.min(current.startIndex, wordIndex),
+        endIndex: Math.max(current.startIndex, wordIndex)
+      };
+    });
+  };
+
+  const refreshReviewData = async (jobId: number) => {
+    const [nextHits, nextTimeline, nextSuggestions] = await Promise.all([
+      listHits(jobId),
+      listTimeline(jobId),
+      listClipSuggestions(jobId)
+    ]);
+    setHits(nextHits);
+    setTimeline(nextTimeline);
+    setSuggestions(nextSuggestions);
+  };
+
+  const addManualSuggestion = async (draft = selectedManualDraft) => {
+    if (!activeJobId || !draft) return;
+    setAddingManualSuggestion(true);
+    try {
+      await createManualClipSuggestion(activeJobId, {
+        segmentId: draft.segmentId,
+        matchedText: draft.matchedText,
+        startTime: draft.startTime,
+        endTime: draft.endTime
+      });
+      await refreshReviewData(activeJobId);
+      setManualSelection(null);
+      toast.success(`已添加“${draft.matchedText}”到剪辑建议`);
+    } catch (error) {
+      toast.error(getErrorMessage(error, '添加剪辑建议失败'));
+    } finally {
+      setAddingManualSuggestion(false);
     }
   };
 
@@ -836,6 +1267,61 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
     }
   };
 
+  const selectableSuggestions = suggestions.filter((item) => item.status !== 'EXPORTED');
+  const selectedSuggestions = suggestions.filter((item) => selectedSuggestionIds.has(item.id) && item.status !== 'EXPORTED');
+  const suggestionsAllSelected =
+    selectableSuggestions.length > 0 && selectableSuggestions.every((item) => selectedSuggestionIds.has(item.id));
+
+  const toggleSuggestionSelection = (id: number, checked: boolean) => {
+    setSelectedSuggestionIds((current) => {
+      const next = new Set(current);
+      if (checked) {
+        next.add(id);
+      } else {
+        next.delete(id);
+      }
+      return next;
+    });
+  };
+
+  const toggleAllSuggestions = (checked: boolean) => {
+    setSelectedSuggestionIds((current) => {
+      const next = new Set(current);
+      selectableSuggestions.forEach((item) => {
+        if (checked) {
+          next.add(item.id);
+        } else {
+          next.delete(item.id);
+        }
+      });
+      return next;
+    });
+  };
+
+  const batchSaveSuggestions = async (status: ClipStatus) => {
+    if (selectedSuggestions.length === 0) {
+      toast.error('请选择剪辑建议');
+      return;
+    }
+    setBatchingSuggestions(true);
+    try {
+      const payload: ClipSuggestionBatchItem[] = selectedSuggestions.map((item) => ({
+        id: item.id,
+        startTime: item.startTime,
+        endTime: item.endTime,
+        status
+      }));
+      const result = await batchUpdateClipSuggestions(payload);
+      if (activeJobId) {
+        setSuggestions(await listClipSuggestions(activeJobId));
+      }
+      setSelectedSuggestionIds(new Set());
+      showBatchResult(result, status === 'CONFIRMED' ? '已确认剪辑建议' : '已忽略剪辑建议');
+    } finally {
+      setBatchingSuggestions(false);
+    }
+  };
+
   const confirmAllSuggestions = async () => {
     const pending = suggestions.filter((item) => item.status === 'PENDING');
     if (pending.length === 0) {
@@ -843,10 +1329,8 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
       return;
     }
     try {
-      await Promise.all(
-        pending.map((item) =>
-          updateClipSuggestion(item.id, { startTime: item.startTime, endTime: item.endTime, status: 'CONFIRMED' })
-        )
+      await batchUpdateClipSuggestions(
+        pending.map((item) => ({ id: item.id, startTime: item.startTime, endTime: item.endTime, status: 'CONFIRMED' }))
       );
       if (activeJobId) setSuggestions(await listClipSuggestions(activeJobId));
       toast.success(`已确认 ${pending.length} 条剪辑建议`);
@@ -859,11 +1343,13 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
     if (!video) return;
     setExporting(true);
     try {
-      const result = await exportVideo(video.id);
-      toast.success(`已导出，删除片段 ${result.removedClipCount} 个`);
+      const task = await enqueueExportTask(video.id);
+      toast.success(`导出任务 #${task.id} 已入队`);
+      setExportPreviewVersion(Date.now());
+      setExportTasks(await listExportTasks(video.id));
       await load();
     } catch (error) {
-      toast.error(getErrorMessage(error, '导出失败'));
+      toast.error(getErrorMessage(error, '导出入队失败'));
     } finally {
       setExporting(false);
     }
@@ -873,6 +1359,10 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
     setSuggestions((items) => items.map((item) => (item.id === id ? { ...item, ...patch } : item)));
 
   const exportedSuggestion = suggestions.find((item) => item.status === 'EXPORTED');
+  const exportedVersion = completedExportTask?.exportPath ?? exportedSuggestion?.exportPath ?? (exportPreviewVersion || undefined);
+  const exportedDownloadUrl =
+    video && (completedExportTask || exportedSuggestion) ? videoExportContentUrl(video.id, exportedVersion) : undefined;
+  const exportedDownloadName = exportDownloadName(video);
   const jobStatus = job ? JOB_STATUS[job.status] : null;
   const violationCount = timeline.length;
 
@@ -898,8 +1388,25 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
           {video && (
             <div className="grid gap-4 md:grid-cols-2">
               <VideoFrame src={videoContentUrl(video.id)} label="原始视频" icon={Film} />
-              {exportedSuggestion ? (
-                <VideoFrame src={exportContentUrl(exportedSuggestion.id)} label="去违规版本" icon={Scissors} />
+              {exportedDownloadUrl ? (
+                <VideoFrame
+                  src={exportedDownloadUrl}
+                  label="去违规版本"
+                  icon={Scissors}
+                  action={
+                    <Button
+                      asChild
+                      variant="ghost"
+                      size="xs"
+                      className="h-7 px-2 text-white/70 hover:bg-white/10 hover:text-white"
+                    >
+                      <a href={exportedDownloadUrl} download={exportedDownloadName} aria-label="下载去违规视频">
+                        <Download className="h-3.5 w-3.5" />
+                        下载
+                      </a>
+                    </Button>
+                  }
+                />
               ) : (
                 <div className="flex flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-border bg-muted/20 text-center text-muted-foreground">
                   <Scissors className="h-6 w-6 opacity-50" />
@@ -943,16 +1450,59 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
                     </Alert>
                   )}
                 </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="self-start"
-                  disabled={exporting || job.status !== 'COMPLETED'}
-                  onClick={handleExport}
-                >
-                  {exporting ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-                  导出去违规视频
-                </Button>
+                <div className="flex flex-wrap items-center gap-2 self-start">
+                  {exportedDownloadUrl && (
+                    <Button asChild variant="default" size="sm">
+                      <a href={exportedDownloadUrl} download={exportedDownloadName}>
+                        <Download className="h-4 w-4" />
+                        下载去违规视频
+                      </a>
+                    </Button>
+                  )}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={exporting || job.status !== 'COMPLETED'}
+                    onClick={handleExport}
+                  >
+                    {exporting ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Scissors className="h-4 w-4" />}
+                    {exportedDownloadUrl ? '重新生成剪辑视频' : '生成剪辑视频'}
+                  </Button>
+                </div>
+                {latestExportTask && (
+                  <div className="basis-full rounded-md border border-border bg-muted/25 px-3 py-2">
+                    <div className="flex flex-wrap items-center gap-2 text-[12px]">
+                      <span className="font-medium">导出队列</span>
+                      <Pill
+                        tone={
+                          latestExportTask.status === 'COMPLETED'
+                            ? 'success'
+                            : latestExportTask.status === 'FAILED'
+                              ? 'danger'
+                              : 'info'
+                        }
+                        pulse={latestExportTask.status === 'QUEUED' || latestExportTask.status === 'RUNNING'}
+                      >
+                        #{latestExportTask.id} {latestExportTask.status}
+                      </Pill>
+                      <span className="telemetry text-muted-foreground">{latestExportTask.progress}%</span>
+                      {runningExportTask && <span className="text-muted-foreground">后台生成中，完成后自动刷新预览</span>}
+                      {completedExportTask?.removedClipCount != null && (
+                        <span className="text-muted-foreground">
+                          最近完成处理 <span className="telemetry text-foreground">{completedExportTask.removedClipCount}</span> 段
+                        </span>
+                      )}
+                      {exportTasks.length > 1 && (
+                        <span className="ml-auto text-muted-foreground">
+                          历史任务 <span className="telemetry text-foreground">{exportTasks.length}</span>
+                        </span>
+                      )}
+                    </div>
+                    {latestExportTask.errorMessage && (
+                      <div className="mt-1 truncate text-[12px] text-destructive">{latestExportTask.errorMessage}</div>
+                    )}
+                  </div>
+                )}
               </CardContent>
             </Card>
           ) : (
@@ -961,6 +1511,71 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
               <AlertDescription>该视频还没有检测任务，可以在视频列表点击“检测”。</AlertDescription>
             </Alert>
           )}
+
+          <Card>
+            <CardHeader className="flex-row items-center justify-between gap-3 space-y-0">
+              <div className="flex items-center gap-2">
+                <ShieldAlert className="h-4 w-4 text-muted-foreground" />
+                <CardTitle>违规证据预览</CardTitle>
+              </div>
+              {activeEvidence && (
+                <div className="telemetry text-[12px] text-muted-foreground">
+                  {seconds(activeEvidence.startTime)} - {seconds(activeEvidence.endTime)}
+                </div>
+              )}
+            </CardHeader>
+            <CardContent>
+              {!video || !activeEvidence ? (
+                <EmptyState icon={ShieldAlert} title="暂无可预览证据" description="完成检测并产生违规命中后，可在这里预览证据片段。" />
+              ) : (
+                <div className="grid gap-4 lg:grid-cols-[minmax(280px,0.9fr)_1.1fr]">
+                  <VideoFrame
+                    src={`${videoContentUrl(video.id)}#t=${Math.max(0, activeEvidence.startTime).toFixed(2)}`}
+                    label="证据定位"
+                    icon={Film}
+                  />
+                  <div className="space-y-3 rounded-lg border border-border bg-muted/20 p-4">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <SeverityBadge severity={activeEvidence.severity} />
+                      <Pill tone={TRANSCRIPT_SOURCE[activeEvidence.source]?.tone ?? 'neutral'} dot={false}>
+                        {TRANSCRIPT_SOURCE[activeEvidence.source]?.label ?? activeEvidence.source}
+                      </Pill>
+                      <Pill tone={REVIEW_STATUS[activeEvidence.reviewStatus].tone} dot={false}>
+                        {REVIEW_STATUS[activeEvidence.reviewStatus].label}
+                      </Pill>
+                      {activeEvidence.aiConfidence !== undefined && (
+                        <Pill tone="info" dot={false}>
+                          AI <span className="telemetry">{Math.round(activeEvidence.aiConfidence * 100)}%</span>
+                        </Pill>
+                      )}
+                    </div>
+                    <div>
+                      <div className="text-[12px] text-muted-foreground">命中文本</div>
+                      <div className="mt-1 text-lg font-semibold">{activeEvidence.matchedText}</div>
+                    </div>
+                    <div className="grid gap-2 text-[13px]">
+                      <div>
+                        <span className="text-muted-foreground">上下文：</span>
+                        <span>{activeEvidence.contextText || activeEvidenceHit?.contextText || activeEvidenceSegment?.text || '-'}</span>
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">AI 原因：</span>
+                        <span>{activeEvidence.aiReason || activeEvidenceHit?.aiReview?.reason || '-'}</span>
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">处置建议：</span>
+                        <span>
+                          {activeEvidenceSuggestion
+                            ? `${activeEvidenceSuggestion.action === 'BLUR_SUBTITLE' ? '遮盖字幕' : '删除音频段'}，${seconds(activeEvidenceSuggestion.startTime)} - ${seconds(activeEvidenceSuggestion.endTime)}`
+                            : '尚未生成剪辑建议'}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
 
           {/* 违规词时间轴 */}
           <Card>
@@ -993,6 +1608,7 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
                             <TooltipTrigger asChild>
                               <button
                                 type="button"
+                                onClick={() => setActiveEvidenceHitId(item.hitId)}
                                 className="absolute top-1 h-7 rounded-[4px] ring-1 ring-inset ring-white/20 transition-transform hover:scale-y-110"
                                 style={{
                                   left: `${left}%`,
@@ -1040,7 +1656,18 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
                     {timeline.map((item) => (
                       <div
                         key={item.hitId}
-                        className="flex items-center gap-3 rounded-md border border-border bg-card px-3 py-2"
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => setActiveEvidenceHitId(item.hitId)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter' || event.key === ' ') {
+                            setActiveEvidenceHitId(item.hitId);
+                          }
+                        }}
+                        className={cn(
+                          'flex items-center gap-3 rounded-md border bg-card px-3 py-2 transition-colors',
+                          activeEvidenceHitId === item.hitId ? 'border-primary/50 bg-primary/5' : 'border-border'
+                        )}
                       >
                         <SeverityBadge severity={item.severity} />
                         <Pill tone={TRANSCRIPT_SOURCE[item.source]?.tone ?? 'neutral'} dot={false}>
@@ -1092,25 +1719,95 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
               {suggestions.length === 0 ? (
                 <EmptyState icon={Scissors} title="暂无剪辑建议" description="检测完成并存在违规命中后将生成剪辑建议。" />
               ) : (
-                <Table>
-                  <TableHeader>
-                    <TableRow className="hover:bg-transparent">
-                      <TableHead>违规词</TableHead>
-                      <TableHead className="w-[96px]">处理</TableHead>
-                      <TableHead className="w-[150px]">开始 (秒)</TableHead>
-                      <TableHead className="w-[150px]">结束 (秒)</TableHead>
-                      <TableHead className="w-[88px]">置信度</TableHead>
-                      <TableHead className="w-[96px]">状态</TableHead>
-                      <TableHead className="w-[170px] text-right">操作</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {suggestions.map((record) => {
-                      const status = CLIP_STATUS[record.status];
-                      const locked = record.status === 'EXPORTED';
-                      return (
-                        <TableRow key={record.id}>
-                          <TableCell className="font-medium">{record.matchedText}</TableCell>
+                <>
+                  <ClipTimelineEditor
+                    suggestions={suggestions}
+                    duration={duration}
+                    activeId={activeSuggestionId}
+                    onActiveChange={setActiveSuggestionId}
+                    onPatch={patchSuggestion}
+                    onSave={saveSuggestion}
+                  />
+                  {selectedSuggestionIds.size > 0 && (
+                    <div className="mb-3 flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted/30 px-3 py-2">
+                      <Pill tone="info" dot={false}>
+                        已选 <span className="telemetry">{selectedSuggestionIds.size}</span>
+                      </Pill>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => batchSaveSuggestions('CONFIRMED')}
+                        disabled={batchingSuggestions}
+                      >
+                        <CheckCheck className="h-4 w-4" />
+                        批量确认
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => batchSaveSuggestions('IGNORED')}
+                        disabled={batchingSuggestions}
+                      >
+                        批量忽略
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="ml-auto"
+                        onClick={() => setSelectedSuggestionIds(new Set())}
+                      >
+                        清空选择
+                      </Button>
+                    </div>
+                  )}
+                  <Table>
+                    <TableHeader>
+                      <TableRow className="hover:bg-transparent">
+                        <TableHead className="w-[44px]">
+                          <input
+                            type="checkbox"
+                            checked={suggestionsAllSelected}
+                            onChange={(e) => toggleAllSuggestions(e.target.checked)}
+                            aria-label="选择全部剪辑建议"
+                            className="h-4 w-4 rounded border-border accent-primary"
+                          />
+                        </TableHead>
+                        <TableHead>违规词</TableHead>
+                        <TableHead className="w-[96px]">处理</TableHead>
+                        <TableHead className="w-[150px]">开始 (秒)</TableHead>
+                        <TableHead className="w-[150px]">结束 (秒)</TableHead>
+                        <TableHead className="w-[88px]">置信度</TableHead>
+                        <TableHead className="w-[96px]">状态</TableHead>
+                        <TableHead className="w-[220px] text-right">操作</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {suggestions.map((record) => {
+                        const status = CLIP_STATUS[record.status];
+                        const locked = record.status === 'EXPORTED';
+                        const segmentStartTime = record.segmentStartTime;
+                        const segmentEndTime = record.segmentEndTime;
+                        const canUseSegmentRange =
+                          record.action === 'BLUR_SUBTITLE' &&
+                          segmentStartTime != null &&
+                          segmentEndTime != null &&
+                          segmentEndTime > segmentStartTime;
+                        const suggestionDownloadUrl = record.status === 'EXPORTED' && record.exportPath
+                          ? exportContentUrl(record.id)
+                          : undefined;
+                        return (
+                          <TableRow key={record.id} onClick={() => setActiveSuggestionId(record.id)}>
+                            <TableCell>
+                              <input
+                                type="checkbox"
+                                checked={selectedSuggestionIds.has(record.id)}
+                                disabled={locked}
+                                onChange={(e) => toggleSuggestionSelection(record.id, e.target.checked)}
+                                aria-label={`选择 ${record.matchedText}`}
+                                className="h-4 w-4 rounded border-border accent-primary disabled:opacity-40"
+                              />
+                            </TableCell>
+                            <TableCell className="font-medium">{record.matchedText}</TableCell>
                           <TableCell>
                             <Pill tone={TRANSCRIPT_SOURCE[record.source]?.tone ?? 'neutral'} dot={false}>
                               {record.action === 'BLUR_SUBTITLE' ? '遮盖字幕' : '删除音频段'}
@@ -1120,23 +1817,27 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
                             <NumberField
                               value={record.startTime}
                               min={0}
+                              max={Math.max(0, record.endTime - 0.1)}
                               step={0.1}
                               suffix="s"
                               className="w-[120px]"
+                              disabled={locked}
                               name={`clip-${record.id}-start`}
-                              aria-label="剪辑开始时间（秒）"
+                              aria-label={record.action === 'BLUR_SUBTITLE' ? '字幕遮挡开始时间（秒）' : '剪辑开始时间（秒）'}
                               onChange={(value) => patchSuggestion(record.id, { startTime: value })}
                             />
                           </TableCell>
                           <TableCell>
                             <NumberField
                               value={record.endTime}
-                              min={0}
+                              min={record.startTime + 0.1}
+                              max={duration}
                               step={0.1}
                               suffix="s"
                               className="w-[120px]"
+                              disabled={locked}
                               name={`clip-${record.id}-end`}
-                              aria-label="剪辑结束时间（秒）"
+                              aria-label={record.action === 'BLUR_SUBTITLE' ? '字幕遮挡结束时间（秒）' : '剪辑结束时间（秒）'}
                               onChange={(value) => patchSuggestion(record.id, { endTime: value })}
                             />
                           </TableCell>
@@ -1148,22 +1849,51 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
                           </TableCell>
                           <TableCell>
                             <div className="flex items-center justify-end gap-1.5">
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                disabled={locked}
-                                onClick={() => saveSuggestion(record, 'CONFIRMED')}
-                              >
-                                确认
-                              </Button>
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                disabled={locked}
-                                onClick={() => saveSuggestion(record, 'IGNORED')}
-                              >
-                                忽略
-                              </Button>
+                              {suggestionDownloadUrl ? (
+                                <Button asChild variant="outline" size="sm">
+                                  <a href={suggestionDownloadUrl} download={exportedDownloadName}>
+                                    <Download className="h-4 w-4" />
+                                    下载
+                                  </a>
+                                </Button>
+                              ) : (
+                                <>
+                                  {canUseSegmentRange && (
+                                    <Button
+                                      variant="ghost"
+                                      size="sm"
+                                      disabled={locked}
+                                      title="扩展到整条字幕出现时段"
+                                      onClick={() => {
+                                        if (segmentStartTime == null || segmentEndTime == null) return;
+                                        patchSuggestion(record.id, {
+                                          startTime: segmentStartTime,
+                                          endTime: segmentEndTime
+                                        });
+                                      }}
+                                    >
+                                      <Captions className="h-4 w-4" />
+                                      整句
+                                    </Button>
+                                  )}
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    disabled={locked}
+                                    onClick={() => saveSuggestion(record, 'CONFIRMED')}
+                                  >
+                                    确认
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    disabled={locked}
+                                    onClick={() => saveSuggestion(record, 'IGNORED')}
+                                  >
+                                    忽略
+                                  </Button>
+                                </>
+                              )}
                             </div>
                           </TableCell>
                         </TableRow>
@@ -1171,6 +1901,7 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
                     })}
                   </TableBody>
                 </Table>
+                </>
               )}
             </CardContent>
           </Card>
@@ -1237,27 +1968,96 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
 
           {/* 字幕片段 */}
           <Card>
-            <CardHeader className="flex-row items-center gap-2 space-y-0">
-              <AudioLines className="h-4 w-4 text-muted-foreground" />
-              <CardTitle>字幕片段</CardTitle>
+            <CardHeader className="flex-row items-center justify-between gap-3 space-y-0">
+              <div className="flex items-center gap-2">
+                <AudioLines className="h-4 w-4 text-muted-foreground" />
+                <CardTitle>字幕片段</CardTitle>
+              </div>
+              <div className="flex min-w-0 items-center gap-2">
+                {selectedManualDraft && (
+                  <div className="hidden min-w-0 max-w-[260px] truncate rounded-md bg-muted px-2 py-1 text-[12px] text-muted-foreground md:block">
+                    {selectedManualDraft.matchedText}
+                  </div>
+                )}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={!selectedManualDraft || addingManualSuggestion}
+                  onClick={() => addManualSuggestion()}
+                >
+                  {addingManualSuggestion ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+                  添加选词
+                </Button>
+              </div>
             </CardHeader>
             <CardContent>
               {segments.length === 0 ? (
                 <EmptyState icon={FileText} title="暂无字幕句段" description="检测完成后将展示转写得到的句段与时间码。" />
               ) : (
-                <ScrollArea className="h-[280px] pr-3">
+                <ScrollArea className="h-[340px] pr-3">
                   <div className="space-y-1.5">
-                    {segments.map((segment) => (
-                      <div key={segment.id} className="flex gap-3 rounded-md border border-border bg-card px-3 py-2">
-                        <span className="telemetry shrink-0 rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
-                          {seconds(segment.startTime)} – {seconds(segment.endTime)}
-                        </span>
-                        <Pill tone={TRANSCRIPT_SOURCE[segment.source]?.tone ?? 'neutral'} dot={false}>
-                          {TRANSCRIPT_SOURCE[segment.source]?.label ?? segment.source}
-                        </Pill>
-                        <span className="text-[13px] leading-relaxed">{segment.text}</span>
-                      </div>
-                    ))}
+                    {segments.map((segment) => {
+                      const words = segment.words ?? [];
+                      const isActiveSegment = manualSelection?.segmentId === segment.id;
+                      const selectionStart = isActiveSegment
+                        ? Math.min(manualSelection.startIndex, manualSelection.endIndex)
+                        : -1;
+                      const selectionEnd = isActiveSegment
+                        ? Math.max(manualSelection.startIndex, manualSelection.endIndex)
+                        : -1;
+                      return (
+                        <div
+                          key={segment.id}
+                          className={cn(
+                            'rounded-md border px-3 py-2 transition-colors',
+                            isActiveSegment ? 'border-primary/40 bg-primary/5' : 'border-border bg-card'
+                          )}
+                        >
+                          <div className="mb-2 flex flex-wrap items-center gap-2">
+                            <span className="telemetry shrink-0 rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
+                              {seconds(segment.startTime)} – {seconds(segment.endTime)}
+                            </span>
+                            <Pill tone={TRANSCRIPT_SOURCE[segment.source]?.tone ?? 'neutral'} dot={false}>
+                              {TRANSCRIPT_SOURCE[segment.source]?.label ?? segment.source}
+                            </Pill>
+                            <Button
+                              variant="ghost"
+                              size="xs"
+                              className="ml-auto"
+                              disabled={addingManualSuggestion}
+                              onClick={() => addManualSuggestion(segmentDraft(segment))}
+                            >
+                              <Plus className="h-3.5 w-3.5" />
+                              整句
+                            </Button>
+                          </div>
+                          {words.length > 0 ? (
+                            <div className="flex flex-wrap gap-1">
+                              {words.map((word, index) => {
+                                const selected = isActiveSegment && index >= selectionStart && index <= selectionEnd;
+                                return (
+                                  <button
+                                    key={word.id}
+                                    type="button"
+                                    className={cn(
+                                      'min-h-7 rounded-md border px-2 py-1 text-[13px] leading-tight transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                                      selected
+                                        ? 'border-primary bg-primary text-primary-foreground shadow-sm'
+                                        : 'border-border bg-background hover:border-primary/50 hover:bg-primary/5'
+                                    )}
+                                    onClick={() => selectTranscriptWord(segment, index)}
+                                  >
+                                    {word.word}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          ) : (
+                            <div className="text-[13px] leading-relaxed">{segment.text}</div>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                 </ScrollArea>
               )}
@@ -1266,6 +2066,153 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
         </div>
       </ScrollArea>
     </>
+  );
+}
+
+function ClipTimelineEditor({
+  suggestions,
+  duration,
+  activeId,
+  onActiveChange,
+  onPatch,
+  onSave
+}: {
+  suggestions: ClipSuggestion[];
+  duration: number;
+  activeId: number | null;
+  onActiveChange: (id: number) => void;
+  onPatch: (id: number, patch: Partial<ClipSuggestion>) => void;
+  onSave: (record: ClipSuggestion, status: ClipStatus) => void;
+}) {
+  const active = suggestions.find((item) => item.id === activeId) ?? suggestions[0];
+  if (!active) return null;
+  const locked = active.status === 'EXPORTED';
+  const segmentStartTime = active.segmentStartTime;
+  const segmentEndTime = active.segmentEndTime;
+  const canUseSegmentRange =
+    active.action === 'BLUR_SUBTITLE' &&
+    segmentStartTime != null &&
+    segmentEndTime != null &&
+    segmentEndTime > segmentStartTime &&
+    !locked;
+
+  const patchActive = (patch: Partial<ClipSuggestion>) => onPatch(active.id, patch);
+  const moveStart = (delta: number) => patchActive({ startTime: Math.max(0, Math.min(active.endTime - 0.1, active.startTime + delta)) });
+  const moveEnd = (delta: number) => patchActive({ endTime: Math.max(active.startTime + 0.1, Math.min(duration, active.endTime + delta)) });
+
+  return (
+    <div className="mb-4 rounded-lg border border-border bg-muted/20 p-3">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <div>
+          <div className="text-sm font-medium">可视化时间轴编辑</div>
+          <div className="text-[12px] text-muted-foreground">点击片段后微调范围，确认后参与后台导出队列。</div>
+        </div>
+        <div className="telemetry text-[11px] text-muted-foreground">{seconds(duration)}</div>
+      </div>
+      <div className="relative h-14 overflow-hidden rounded-md border border-border bg-background">
+        <div className="absolute inset-x-0 top-1/2 h-px bg-border" />
+        {suggestions.map((item) => {
+          const left = Math.max(0, (item.startTime / duration) * 100);
+          const width = Math.max(1.6, ((item.endTime - item.startTime) / duration) * 100);
+          const isActive = item.id === active.id;
+          const status = CLIP_STATUS[item.status];
+          return (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => onActiveChange(item.id)}
+              className={cn(
+                'absolute top-3 h-8 rounded-[5px] border px-1 text-left transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                isActive ? 'z-10 border-primary bg-primary text-primary-foreground shadow-md' : 'border-border bg-card hover:border-primary/50',
+                item.status === 'EXPORTED' && !isActive && 'bg-muted text-muted-foreground'
+              )}
+              style={{ left: `${left}%`, width: `${width}%` }}
+              title={`${item.matchedText} ${seconds(item.startTime)} - ${seconds(item.endTime)}`}
+            >
+              <span className="block truncate text-[11px] font-medium">{item.matchedText}</span>
+              <span className={cn('telemetry block truncate text-[10px]', isActive ? 'text-primary-foreground/75' : 'text-muted-foreground')}>
+                {status.label}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+      <div className="mt-2 flex justify-between">
+        {[0, 0.25, 0.5, 0.75, 1].map((frac) => (
+          <span key={frac} className="telemetry text-[10px] text-muted-foreground">
+            {seconds(duration * frac)}
+          </span>
+        ))}
+      </div>
+      <div className="mt-3 grid gap-3 lg:grid-cols-[1fr_auto]">
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div className="space-y-1.5">
+            <Label>开始时间</Label>
+            <div className="flex items-center gap-1.5">
+              <Button variant="outline" size="icon-sm" disabled={locked} onClick={() => moveStart(-0.1)}>
+                -
+              </Button>
+              <NumberField
+                value={active.startTime}
+                min={0}
+                max={Math.max(0, active.endTime - 0.1)}
+                step={0.1}
+                suffix="s"
+                className="w-full"
+                disabled={locked}
+                name={`timeline-${active.id}-start`}
+                aria-label="时间轴编辑开始时间"
+                onChange={(value) => patchActive({ startTime: value })}
+              />
+              <Button variant="outline" size="icon-sm" disabled={locked} onClick={() => moveStart(0.1)}>
+                +
+              </Button>
+            </div>
+          </div>
+          <div className="space-y-1.5">
+            <Label>结束时间</Label>
+            <div className="flex items-center gap-1.5">
+              <Button variant="outline" size="icon-sm" disabled={locked} onClick={() => moveEnd(-0.1)}>
+                -
+              </Button>
+              <NumberField
+                value={active.endTime}
+                min={active.startTime + 0.1}
+                max={duration}
+                step={0.1}
+                suffix="s"
+                className="w-full"
+                disabled={locked}
+                name={`timeline-${active.id}-end`}
+                aria-label="时间轴编辑结束时间"
+                onChange={(value) => patchActive({ endTime: value })}
+              />
+              <Button variant="outline" size="icon-sm" disabled={locked} onClick={() => moveEnd(0.1)}>
+                +
+              </Button>
+            </div>
+          </div>
+        </div>
+        <div className="flex flex-wrap items-end gap-2">
+          {canUseSegmentRange && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => patchActive({ startTime: segmentStartTime, endTime: segmentEndTime })}
+            >
+              <Captions className="h-4 w-4" />
+              整句
+            </Button>
+          )}
+          <Button variant="outline" size="sm" disabled={locked} onClick={() => onSave(active, 'CONFIRMED')}>
+            确认
+          </Button>
+          <Button variant="ghost" size="sm" disabled={locked} onClick={() => onSave(active, 'IGNORED')}>
+            忽略
+          </Button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1305,6 +2252,17 @@ function TermsPage() {
   const [form, setForm] = useState<TermForm>(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<ViolationTerm | null>(null);
+  const [selectedTermIds, setSelectedTermIds] = useState<Set<number>>(new Set());
+  const [batchDeleteTermsOpen, setBatchDeleteTermsOpen] = useState(false);
+  const [batchingTerms, setBatchingTerms] = useState(false);
+  const [aiDialogOpen, setAiDialogOpen] = useState(false);
+  const [aiPrompt, setAiPrompt] = useState('');
+  const [aiCategory, setAiCategory] = useState('');
+  const [aiCount, setAiCount] = useState(12);
+  const [generatingTerms, setGeneratingTerms] = useState(false);
+  const [generatedTerms, setGeneratedTerms] = useState<GeneratedTerm[]>([]);
+  const [selectedGenerated, setSelectedGenerated] = useState<Set<number>>(new Set());
+  const [importingGenerated, setImportingGenerated] = useState(false);
   const pageSize = 8;
   const { page, setPage, pageCount, pageItems } = usePagination(terms, pageSize);
   const importInputRef = useRef<HTMLInputElement>(null);
@@ -1324,6 +2282,14 @@ function TermsPage() {
     load('');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    setSelectedTermIds((current) => {
+      const liveIds = new Set(terms.map((term) => term.id));
+      const next = new Set([...current].filter((id) => liveIds.has(id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [terms]);
 
   const openCreate = () => {
     setEditing(null);
@@ -1379,14 +2345,68 @@ function TermsPage() {
   };
 
   const confirmDelete = async () => {
-    if (!deleteTarget) return;
+    const targets = deleteTarget ? [deleteTarget] : terms.filter((term) => selectedTermIds.has(term.id));
+    if (targets.length === 0) return;
+    setBatchingTerms(true);
     try {
-      await deleteTerm(deleteTarget.id);
-      toast.success('已删除');
+      const result = await batchDeleteTerms(targets.map((term) => term.id));
+      showBatchResult(result, '已删除词条');
       setDeleteTarget(null);
+      setBatchDeleteTermsOpen(false);
+      setSelectedTermIds(new Set());
       load();
     } catch (error) {
       toast.error(getErrorMessage(error, '删除失败'));
+    } finally {
+      setBatchingTerms(false);
+    }
+  };
+
+  const selectedTerms = useMemo(
+    () => terms.filter((term) => selectedTermIds.has(term.id)),
+    [selectedTermIds, terms]
+  );
+  const pageTermIds = pageItems.map((term) => term.id);
+  const pageTermsAllSelected = pageTermIds.length > 0 && pageTermIds.every((id) => selectedTermIds.has(id));
+
+  const toggleTermSelection = (id: number, checked: boolean) => {
+    setSelectedTermIds((current) => {
+      const next = new Set(current);
+      if (checked) {
+        next.add(id);
+      } else {
+        next.delete(id);
+      }
+      return next;
+    });
+  };
+
+  const togglePageTermSelection = (checked: boolean) => {
+    setSelectedTermIds((current) => {
+      const next = new Set(current);
+      pageTermIds.forEach((id) => {
+        if (checked) {
+          next.add(id);
+        } else {
+          next.delete(id);
+        }
+      });
+      return next;
+    });
+  };
+
+  const batchSetTermsEnabled = async (enabled: boolean) => {
+    if (selectedTerms.length === 0) {
+      toast.error('请选择词条');
+      return;
+    }
+    setBatchingTerms(true);
+    try {
+      const result = await batchUpdateTerms({ ids: selectedTerms.map((term) => term.id), enabled });
+      showBatchResult(result, enabled ? '已启用词条' : '已停用词条');
+      load();
+    } finally {
+      setBatchingTerms(false);
     }
   };
 
@@ -1401,7 +2421,132 @@ function TermsPage() {
     }
   };
 
+  const openAiGenerate = () => {
+    setAiDialogOpen(true);
+    setGeneratedTerms([]);
+    setSelectedGenerated(new Set());
+  };
+
+  const openAiGeneratePreset = (prompt: string, category: string, count = 12) => {
+    setAiPrompt(prompt);
+    setAiCategory(category);
+    setAiCount(count);
+    setAiDialogOpen(true);
+    setGeneratedTerms([]);
+    setSelectedGenerated(new Set());
+  };
+
+  const generateAiTerms = async () => {
+    if (!aiPrompt.trim()) {
+      toast.error('请输入生成需求');
+      return;
+    }
+    setGeneratingTerms(true);
+    try {
+      const result = await generateTermsWithAi({
+        prompt: aiPrompt.trim(),
+        category: aiCategory.trim() || undefined,
+        count: aiCount
+      });
+      setGeneratedTerms(result);
+      setSelectedGenerated(new Set(result.map((_, index) => index)));
+      if (result.length === 0) {
+        toast.error('AI 未返回可导入的候选词，换一种描述再试');
+      } else {
+        toast.success(`已生成 ${result.length} 条候选词`);
+      }
+    } catch (error) {
+      toast.error(getErrorMessage(error, 'AI 生成失败'));
+    } finally {
+      setGeneratingTerms(false);
+    }
+  };
+
+  const toggleGeneratedTerm = (index: number, checked: boolean) => {
+    setSelectedGenerated((current) => {
+      const next = new Set(current);
+      if (checked) {
+        next.add(index);
+      } else {
+        next.delete(index);
+      }
+      return next;
+    });
+  };
+
+  const importGeneratedTerms = async () => {
+    const selected = generatedTerms.filter((_, index) => selectedGenerated.has(index));
+    if (selected.length === 0) {
+      toast.error('请选择要写入词库的候选词');
+      return;
+    }
+    setImportingGenerated(true);
+    let imported = 0;
+    let skipped = 0;
+    try {
+      for (const item of selected) {
+        try {
+          await createTerm({
+            term: item.term,
+            category: item.category ?? '',
+            severity: item.severity,
+            matchType: item.matchType,
+            enabled: true,
+            variants: item.variants ?? ''
+          });
+          imported++;
+        } catch {
+          skipped++;
+        }
+      }
+      toast.success(`已写入 ${imported} 条，跳过 ${skipped} 条`);
+      setAiDialogOpen(false);
+      setGeneratedTerms([]);
+      setSelectedGenerated(new Set());
+      load();
+    } finally {
+      setImportingGenerated(false);
+    }
+  };
+
   const enabledCount = terms.filter((t) => t.enabled).length;
+  const termOps = useMemo(() => {
+    const disabledCount = terms.length - enabledCount;
+    const missingVariants = terms.filter((term) => term.matchType === 'VARIANT' && !term.variants?.trim()).length;
+    const regexCount = terms.filter((term) => term.matchType === 'REGEX').length;
+    const semanticCount = terms.filter((term) => term.matchType === 'SEMANTIC').length;
+    const categoryCounts = terms.reduce<Record<string, number>>((acc, term) => {
+      const key = term.category?.trim() || '未分类';
+      acc[key] = (acc[key] ?? 0) + 1;
+      return acc;
+    }, {});
+    const topCategories = Object.entries(categoryCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 4);
+    const score = Math.max(
+      0,
+      Math.min(100, 100 - disabledCount * 2 - missingVariants * 4 - (topCategories[0]?.[1] === terms.length && terms.length > 5 ? 12 : 0))
+    );
+    return { disabledCount, missingVariants, regexCount, semanticCount, topCategories, score };
+  }, [enabledCount, terms]);
+
+  const aiPresets = [
+    {
+      label: '广告极限词',
+      category: '广告极限词',
+      prompt: '生成直播带货、短视频口播中常见的广告极限词和绝对化宣传违规词，包含口语化、谐音和变体表达。'
+    },
+    {
+      label: '价格误导',
+      category: '价格营销',
+      prompt: '生成价格误导、虚假低价、限时限量诱导、比价夸大相关违规词，适合电商视频审核。'
+    },
+    {
+      label: '站外引流',
+      category: '违规引流',
+      prompt: '生成站外引流、私下交易、联系方式规避表达相关违规词，包含拼音、谐音和拆字表达。'
+    }
+  ];
 
   return (
     <div className="flex flex-col gap-5">
@@ -1443,6 +2588,10 @@ function TermsPage() {
               <UploadCloud className="h-4 w-4" />
               导入 CSV
             </Button>
+            <Button variant="outline" onClick={openAiGenerate}>
+              <Sparkles className="h-4 w-4" />
+              AI 生成
+            </Button>
             <Button onClick={openCreate}>
               <Plus className="h-4 w-4" />
               新增违规词
@@ -1465,6 +2614,70 @@ function TermsPage() {
       </Card>
 
       <Card className="animate-fade-up animate-delay-75">
+        <CardHeader className="flex-row items-center justify-between gap-3 space-y-0">
+          <div>
+            <CardTitle>智能词库运营</CardTitle>
+            <div className="mt-1 text-[12px] text-muted-foreground">按启用率、变体缺口和分类分布评估词库维护状态。</div>
+          </div>
+          <Pill tone={termOps.score >= 80 ? 'success' : termOps.score >= 60 ? 'warn' : 'danger'} dot={false}>
+            健康分 <span className="telemetry">{termOps.score}</span>
+          </Pill>
+        </CardHeader>
+        <CardContent>
+          <div className="grid gap-3 lg:grid-cols-[1fr_1fr_1.2fr]">
+            <div className="rounded-md border border-border bg-muted/20 p-3">
+              <div className="text-[12px] text-muted-foreground">运营风险</div>
+              <div className="mt-2 grid grid-cols-3 gap-2 text-center">
+                <div>
+                  <div className="telemetry text-xl font-semibold">{termOps.disabledCount}</div>
+                  <div className="text-[11px] text-muted-foreground">停用</div>
+                </div>
+                <div>
+                  <div className="telemetry text-xl font-semibold">{termOps.missingVariants}</div>
+                  <div className="text-[11px] text-muted-foreground">变体缺口</div>
+                </div>
+                <div>
+                  <div className="telemetry text-xl font-semibold">{termOps.semanticCount}</div>
+                  <div className="text-[11px] text-muted-foreground">语义词</div>
+                </div>
+              </div>
+            </div>
+            <div className="rounded-md border border-border bg-muted/20 p-3">
+              <div className="mb-2 text-[12px] text-muted-foreground">分类覆盖</div>
+              {termOps.topCategories.length === 0 ? (
+                <div className="text-[12px] text-muted-foreground">暂无分类数据</div>
+              ) : (
+                <div className="space-y-1.5">
+                  {termOps.topCategories.map(([category, count]) => (
+                    <div key={category} className="flex items-center gap-2 text-[12px]">
+                      <span className="min-w-0 flex-1 truncate">{category}</span>
+                      <span className="telemetry text-muted-foreground">{count}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="rounded-md border border-border bg-muted/20 p-3">
+              <div className="mb-2 text-[12px] text-muted-foreground">AI 运营动作</div>
+              <div className="flex flex-wrap gap-2">
+                {aiPresets.map((preset) => (
+                  <Button
+                    key={preset.label}
+                    variant="outline"
+                    size="sm"
+                    onClick={() => openAiGeneratePreset(preset.prompt, preset.category)}
+                  >
+                    <Sparkles className="h-4 w-4" />
+                    {preset.label}
+                  </Button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="animate-fade-up animate-delay-150">
         <CardContent className="pt-5">
           {terms.length === 0 && !loading ? (
             <EmptyState
@@ -1474,9 +2687,45 @@ function TermsPage() {
             />
           ) : (
             <>
+              {selectedTermIds.size > 0 && (
+                <div className="mb-3 flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted/30 px-3 py-2">
+                  <Pill tone="info" dot={false}>
+                    已选 <span className="telemetry">{selectedTermIds.size}</span>
+                  </Pill>
+                  <Button variant="outline" size="sm" onClick={() => batchSetTermsEnabled(true)} disabled={batchingTerms}>
+                    <CheckCheck className="h-4 w-4" />
+                    批量启用
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={() => batchSetTermsEnabled(false)} disabled={batchingTerms}>
+                    批量停用
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-muted-foreground hover:text-destructive"
+                    onClick={() => setBatchDeleteTermsOpen(true)}
+                    disabled={batchingTerms}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                    批量删除
+                  </Button>
+                  <Button variant="ghost" size="sm" className="ml-auto" onClick={() => setSelectedTermIds(new Set())}>
+                    清空选择
+                  </Button>
+                </div>
+              )}
               <Table>
                 <TableHeader>
                   <TableRow className="hover:bg-transparent">
+                    <TableHead className="w-[44px]">
+                      <input
+                        type="checkbox"
+                        checked={pageTermsAllSelected}
+                        onChange={(e) => togglePageTermSelection(e.target.checked)}
+                        aria-label="选择当前页词条"
+                        className="h-4 w-4 rounded border-border accent-primary"
+                      />
+                    </TableHead>
                     <TableHead>词条</TableHead>
                     <TableHead className="w-[140px]">分类</TableHead>
                     <TableHead className="w-[88px]">严重级别</TableHead>
@@ -1490,6 +2739,15 @@ function TermsPage() {
                 <TableBody>
                   {pageItems.map((term) => (
                     <TableRow key={term.id}>
+                      <TableCell>
+                        <input
+                          type="checkbox"
+                          checked={selectedTermIds.has(term.id)}
+                          onChange={(e) => toggleTermSelection(term.id, e.target.checked)}
+                          aria-label={`选择 ${term.term}`}
+                          className="h-4 w-4 rounded border-border accent-primary"
+                        />
+                      </TableCell>
                       <TableCell>
                         <span className="font-medium">{term.term}</span>
                       </TableCell>
@@ -1634,22 +2892,155 @@ function TermsPage() {
         </DialogContent>
       </Dialog>
 
+      <Dialog open={aiDialogOpen} onOpenChange={setAiDialogOpen}>
+        <DialogContent className="max-w-4xl">
+          <DialogHeader>
+            <DialogTitle>AI 生成词库</DialogTitle>
+            <DialogDescription>用自然语言描述要覆盖的违规场景，生成候选词后再人工确认写入。</DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-4">
+            <div className="grid gap-2">
+              <Label htmlFor="ai-term-prompt">生成需求</Label>
+              <Textarea
+                id="ai-term-prompt"
+                name="ai-term-prompt"
+                rows={4}
+                value={aiPrompt}
+                onChange={(e) => setAiPrompt(e.target.value)}
+                placeholder="例如：生成直播带货中价格误导、绝对化宣传、虚假功效相关的违规词，包含常见口语化表达和谐音变体"
+              />
+            </div>
+            <div className="grid gap-3 md:grid-cols-[1fr_160px_auto]">
+              <div className="grid gap-2">
+                <Label htmlFor="ai-term-category">分类提示</Label>
+                <Input
+                  id="ai-term-category"
+                  name="ai-term-category"
+                  value={aiCategory}
+                  onChange={(e) => setAiCategory(e.target.value)}
+                  placeholder="可选，例如 广告极限词"
+                />
+              </div>
+              <div className="grid gap-2">
+                <Label>生成数量</Label>
+                <NumberField
+                  value={aiCount}
+                  min={1}
+                  max={50}
+                  step={1}
+                  precision={0}
+                  className="w-full"
+                  name="ai-term-count"
+                  aria-label="AI 生成词条数量"
+                  onChange={setAiCount}
+                />
+              </div>
+              <div className="flex items-end">
+                <Button onClick={generateAiTerms} disabled={generatingTerms} className="w-full md:w-auto">
+                  {generatingTerms ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+                  生成候选
+                </Button>
+              </div>
+            </div>
+            {generatedTerms.length > 0 && (
+              <div className="rounded-md border border-border">
+                <div className="flex items-center justify-between border-b border-border px-3 py-2">
+                  <div className="text-sm font-medium">候选词条</div>
+                  <Button
+                    variant="ghost"
+                    size="xs"
+                    onClick={() => {
+                      const allSelected = selectedGenerated.size === generatedTerms.length;
+                      setSelectedGenerated(allSelected ? new Set() : new Set(generatedTerms.map((_, index) => index)));
+                    }}
+                  >
+                    {selectedGenerated.size === generatedTerms.length ? '取消全选' : '全选'}
+                  </Button>
+                </div>
+                <ScrollArea className="max-h-[320px]">
+                  <Table>
+                    <TableHeader>
+                      <TableRow className="hover:bg-transparent">
+                        <TableHead className="w-[48px]">选择</TableHead>
+                        <TableHead>词条</TableHead>
+                        <TableHead className="w-[130px]">分类</TableHead>
+                        <TableHead className="w-[88px]">严重级别</TableHead>
+                        <TableHead className="w-[88px]">匹配方式</TableHead>
+                        <TableHead>变体 / 依据</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {generatedTerms.map((term, index) => (
+                        <TableRow key={`${term.term}-${index}`}>
+                          <TableCell>
+                            <input
+                              type="checkbox"
+                              checked={selectedGenerated.has(index)}
+                              onChange={(e) => toggleGeneratedTerm(index, e.target.checked)}
+                              aria-label={`选择 ${term.term}`}
+                              className="h-4 w-4 rounded border-border accent-primary"
+                            />
+                          </TableCell>
+                          <TableCell className="font-medium">{term.term}</TableCell>
+                          <TableCell className="text-[13px] text-muted-foreground">{term.category || '-'}</TableCell>
+                          <TableCell>
+                            <SeverityBadge severity={term.severity} />
+                          </TableCell>
+                          <TableCell className="text-[13px] text-muted-foreground">{MATCH_TYPE[term.matchType]}</TableCell>
+                          <TableCell className="text-[12px] text-muted-foreground">
+                            <div className="line-clamp-1">{term.variants || '-'}</div>
+                            {term.reason && <div className="line-clamp-1 opacity-80">{term.reason}</div>}
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </ScrollArea>
+              </div>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setAiDialogOpen(false)}>
+              取消
+            </Button>
+            <Button
+              onClick={importGeneratedTerms}
+              disabled={generatedTerms.length === 0 || selectedGenerated.size === 0 || importingGenerated}
+            >
+              {importingGenerated ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Database className="h-4 w-4" />}
+              写入选中词条
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* 删除确认 */}
-      <AlertDialog open={!!deleteTarget} onOpenChange={(open) => !open && setDeleteTarget(null)}>
+      <AlertDialog
+        open={!!deleteTarget || batchDeleteTermsOpen}
+        onOpenChange={(open) => {
+          if (!open && !batchingTerms) {
+            setDeleteTarget(null);
+            setBatchDeleteTermsOpen(false);
+          }
+        }}
+      >
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>删除违规词</AlertDialogTitle>
             <AlertDialogDescription>
-              确认删除「{deleteTarget?.term}」？删除后将不再参与后续检测召回。
+              {deleteTarget
+                ? `确认删除「${deleteTarget.term}」？删除后将不再参与后续检测召回。`
+                : `确认删除选中的 ${selectedTermIds.size} 条违规词？删除后将不再参与后续检测召回。`}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogCancel disabled={batchingTerms}>取消</AlertDialogCancel>
             <AlertDialogAction
               onClick={confirmDelete}
+              disabled={batchingTerms}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
-              删除
+              {batchingTerms ? '处理中…' : '删除'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

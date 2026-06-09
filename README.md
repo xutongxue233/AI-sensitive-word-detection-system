@@ -29,11 +29,11 @@ AI 敏感词检测系统是一个基于 `Spring Boot + React` 的视频内容审
 
 | 模块 | 技术 |
 | --- | --- |
-| 后端 | Spring Boot 3.3, Java 21, MyBatis-Plus, MySQL |
+| 后端 | Spring Boot 3.3, Java 21, MyBatis-Plus, SQLite / MySQL |
 | 前端 | React 18, TypeScript, Vite, Ant Design |
 | ASR / OCR | FastAPI, openai-whisper, PaddleOCR, OpenCV, OpenCC |
 | 媒体处理 | FFmpeg, ffprobe |
-| 数据库 | MySQL 8+ |
+| 数据库 | SQLite（默认，无需安装服务）/ MySQL 8+（可选） |
 
 ### 项目结构
 
@@ -73,7 +73,7 @@ flowchart LR
 - Java 21
 - Maven 3.9+
 - Node.js 18+
-- MySQL 8+
+- SQLite（默认内置，无需单独安装）；可选 MySQL 8+
 - Python 3.10
 - FFmpeg / ffprobe
 
@@ -82,22 +82,28 @@ flowchart LR
 - 后端端口：`8090`
 - 前端端口：`5174`
 - ASR 服务端口：`9000`
-- MySQL：`root/root`
-- 数据库：`video_moderation`
+- SQLite 数据库文件：`backend/video_moderation.db`
 
-### MySQL
+### 数据库
 
-后端默认使用 MySQL，并在启动时自动执行 `backend/src/main/resources/schema-mysql.sql` 建表。
+后端默认使用 SQLite，并在启动时自动执行 `backend/src/main/resources/schema-sqlite.sql` 建表，不需要安装 MySQL。
 
 默认配置位于 `backend/src/main/resources/application.yml`：
 
 ```yaml
 spring:
   datasource:
-    url: jdbc:mysql://localhost:3306/video_moderation?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true&createDatabaseIfNotExist=true
-    username: root
-    password: root
+    url: jdbc:sqlite:${user.dir}/video_moderation.db?foreign_keys=on&journal_mode=WAL&busy_timeout=5000
+    driver-class-name: org.sqlite.JDBC
 ```
+
+如需继续使用 MySQL，启动后端时启用 `mysql` profile：
+
+```powershell
+mvn "-Dspring-boot.run.profiles=mysql" spring-boot:run
+```
+
+MySQL 配置位于 `backend/src/main/resources/application-mysql.yml`，并使用 `schema-mysql.sql` 初始化。
 
 ### FFmpeg
 
@@ -382,11 +388,11 @@ The system is designed for auditability and precise timeline positioning instead
 
 | Layer | Stack |
 | --- | --- |
-| Backend | Spring Boot 3.3, Java 21, MyBatis-Plus, MySQL |
+| Backend | Spring Boot 3.3, Java 21, MyBatis-Plus, SQLite / MySQL |
 | Frontend | React 18, TypeScript, Vite, Ant Design |
 | ASR / OCR | FastAPI, openai-whisper, PaddleOCR, OpenCV, OpenCC |
 | Media | FFmpeg, ffprobe |
-| Database | MySQL 8+ |
+| Database | SQLite by default, optional MySQL 8+ |
 
 ### Project Structure
 
@@ -426,7 +432,7 @@ flowchart LR
 - Java 21
 - Maven 3.9+
 - Node.js 18+
-- MySQL 8+
+- SQLite by default, no separate database service required; optional MySQL 8+
 - Python 3.10
 - FFmpeg / ffprobe
 
@@ -435,22 +441,28 @@ Default services:
 - Backend: `8090`
 - Frontend: `5174`
 - ASR: `9000`
-- MySQL: `root/root`
-- Database: `video_moderation`
+- SQLite database file: `backend/video_moderation.db`
 
-### MySQL
+### Database
 
-The backend uses MySQL by default and automatically initializes tables from `backend/src/main/resources/schema-mysql.sql`.
+The backend uses SQLite by default and automatically initializes tables from `backend/src/main/resources/schema-sqlite.sql`; no MySQL installation is required.
 
 Default datasource:
 
 ```yaml
 spring:
   datasource:
-    url: jdbc:mysql://localhost:3306/video_moderation?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true&createDatabaseIfNotExist=true
-    username: root
-    password: root
+    url: jdbc:sqlite:${user.dir}/video_moderation.db?foreign_keys=on&journal_mode=WAL&busy_timeout=5000
+    driver-class-name: org.sqlite.JDBC
 ```
+
+To keep using MySQL, start the backend with the `mysql` profile:
+
+```powershell
+mvn "-Dspring-boot.run.profiles=mysql" spring-boot:run
+```
+
+MySQL settings live in `backend/src/main/resources/application-mysql.yml` and use `schema-mysql.sql`.
 
 ### FFmpeg
 

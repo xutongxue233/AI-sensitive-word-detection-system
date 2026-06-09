@@ -19,8 +19,11 @@ import com.ai.moderation.service.support.ExtractedHit;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.springframework.transaction.TransactionStatus;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.List;
+import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -31,6 +34,7 @@ import static org.mockito.Mockito.*;
 class AiExtractionServiceTest {
     private SettingsService settingsService;
     private AiModerationClient moderationClient;
+    private TransactionTemplate transactionTemplate;
     private AiReviewService aiReviewService;
     private TermHitRepository hitRepository;
     private AiReviewRepository reviewRepository;
@@ -43,6 +47,7 @@ class AiExtractionServiceTest {
     void setUp() {
         settingsService = mock(SettingsService.class);
         moderationClient = mock(AiModerationClient.class);
+        transactionTemplate = mock(TransactionTemplate.class);
         aiReviewService = mock(AiReviewService.class);
         hitRepository = mock(TermHitRepository.class);
         reviewRepository = mock(AiReviewRepository.class);
@@ -52,9 +57,14 @@ class AiExtractionServiceTest {
         TextNormalizer textNormalizer = new TextNormalizer();
         SegmentTimeLocator locator = new SegmentTimeLocator(textNormalizer);
         service = new AiExtractionService(
-                settingsService, moderationClient, aiReviewService, locator, textNormalizer,
+                settingsService, transactionTemplate, moderationClient, aiReviewService, locator, textNormalizer,
                 hitRepository, reviewRepository, segmentRepository, wordRepository, termRepository
         );
+        doAnswer(invocation -> {
+            Consumer<TransactionStatus> callback = invocation.getArgument(0);
+            callback.accept(null);
+            return null;
+        }).when(transactionTemplate).executeWithoutResult(any());
         // 词级时间戳缺省返回空,提取命中退回段级时间(定位逻辑由 SegmentTimeLocatorTest 单独覆盖)
         when(wordRepository.findBySegmentIdOrderBySequenceNoAsc(anyLong())).thenReturn(List.of());
     }

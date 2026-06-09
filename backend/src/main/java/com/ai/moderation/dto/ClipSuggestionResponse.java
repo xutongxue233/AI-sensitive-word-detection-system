@@ -17,6 +17,8 @@ import com.ai.moderation.domain.TranscriptSource;
  * @param action         处置动作:BLUR_SUBTITLE(去字幕)或 REMOVE_AUDIO_SEGMENT(删音频段),由 source 推导
  * @param startTime      建议处置区间起点(秒)
  * @param endTime        建议处置区间终点(秒)
+ * @param segmentStartTime 命中所在字幕/转写句段起点(秒);缺失时为 null,用于前端一键扩展到整句
+ * @param segmentEndTime   命中所在字幕/转写句段终点(秒);缺失时为 null,用于前端一键扩展到整句
  * @param paddingSeconds 区间前后预留的留白(秒),避免裁切过紧导致内容突兀
  * @param status         建议状态({@link ClipStatus},如待确认/已确认/已忽略)
  * @param exportPath     导出产物路径(尚未导出时为 null)
@@ -30,6 +32,8 @@ public record ClipSuggestionResponse(
         String action,
         double startTime,
         double endTime,
+        Double segmentStartTime,
+        Double segmentEndTime,
         double paddingSeconds,
         ClipStatus status,
         String exportPath,
@@ -42,7 +46,8 @@ public record ClipSuggestionResponse(
      * 其余(音频命中)走 REMOVE_AUDIO_SEGMENT(删除音频时间片段)。
      */
     public static ClipSuggestionResponse from(ClipSuggestion suggestion, String matchedText,
-                                              TranscriptSource source, Double aiConfidence) {
+                                              TranscriptSource source, Double aiConfidence,
+                                              Double segmentStartTime, Double segmentEndTime) {
         return new ClipSuggestionResponse(
                 suggestion.getId(),
                 suggestion.getHitId(),
@@ -54,6 +59,8 @@ public record ClipSuggestionResponse(
                         : "REMOVE_AUDIO_SEGMENT",
                 suggestion.getStartTime(),
                 suggestion.getEndTime(),
+                segmentStartTime,
+                segmentEndTime,
                 suggestion.getPaddingSeconds(),
                 suggestion.getStatus(),
                 suggestion.getExportPath(),

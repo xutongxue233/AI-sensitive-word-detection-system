@@ -210,18 +210,25 @@ export function EmptyState({
 export function VideoFrame({
   src,
   label,
-  icon: Icon
+  icon: Icon,
+  action
 }: {
   src: string;
   label: string;
   icon: LucideIcon;
+  action?: React.ReactNode;
 }) {
   const [errored, setErrored] = React.useState(false);
+
+  React.useEffect(() => {
+    setErrored(false);
+  }, [src]);
+
   return (
     <div className="overflow-hidden rounded-lg border border-border bg-[#0a120f]">
       <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
         <span className="eyebrow text-white/55">{label}</span>
-        <Icon className="h-3.5 w-3.5 text-white/40" />
+        {action ?? <Icon className="h-3.5 w-3.5 text-white/40" />}
       </div>
       {errored ? (
         <div className="flex aspect-video flex-col items-center justify-center gap-2 text-white/45">
@@ -230,6 +237,7 @@ export function VideoFrame({
         </div>
       ) : (
         <video
+          key={src}
           src={src}
           controls
           preload="metadata"
