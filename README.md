@@ -234,6 +234,19 @@ http://127.0.0.1:8090/
 .runtime/ffmpeg   # FFmpeg，目录内需有 bin/ffmpeg.exe 与 bin/ffprobe.exe
 ```
 
+环境下载地址：
+
+| 环境 | 推荐下载地址 | 备注 |
+| --- | --- | --- |
+| Java 21 JDK | [Eclipse Temurin JDK 21 Windows x64](https://adoptium.net/temurin/releases/?version=21&os=windows&arch=x64&package=jdk) | 下载 JDK，不要下载 JRE；可安装到系统，也可放到 `.runtime/jdk` |
+| Maven 3.9+ | [Apache Maven Download](https://maven.apache.org/download.cgi) | 下载 Binary zip archive，解压后目录内应有 `bin/mvn.cmd` |
+| Node.js | [Node.js Downloads](https://nodejs.org/en/download) | 下载 Windows x64 安装包或 zip；放到 `.runtime/node` 时目录内应有 `npm.cmd` |
+| Python 3.10.x | [Python 3.10.11 Release](https://www.python.org/downloads/release/python-31011/) / [Windows 64-bit installer](https://www.python.org/ftp/python/3.10.11/python-3.10.11-amd64.exe) | 使用正常安装版，需支持 `venv` 和 `pip`；不要用 embeddable package |
+| FFmpeg | [FFmpeg Download](https://ffmpeg.org/download.html) / [gyan.dev Windows builds](https://www.gyan.dev/ffmpeg/builds/) | 下载 release essentials zip，解压后把 `bin/ffmpeg.exe` 和 `bin/ffprobe.exe` 放到 `.runtime/ffmpeg/bin` |
+| NVIDIA Driver（可选 GPU） | [NVIDIA Driver Downloads](https://www.nvidia.com/Download/index.aspx) | 只有启用 Whisper/OCR GPU 时需要 |
+| PyTorch CUDA 源（可选 GPU） | [PyTorch cu130 wheels](https://download.pytorch.org/whl/cu130) | `asr-service/install-gpu.bat` 会使用 |
+| PaddlePaddle CUDA 源（可选 GPU） | [PaddlePaddle cu129 wheels](https://www.paddlepaddle.org.cn/packages/stable/cu129/) | `ocr-service/install-ocr-gpu.bat` 会使用 |
+
 默认按 CPU 模式启动。需要改端口、GPU 或模型配置时，编辑 `config/local.env`；如果文件不存在，脚本会从 `config/local.env.example` 自动复制一份。
 
 关于“少装一个 Python 环境”：C# 项目看起来能直接执行 Python，通常是因为它把 Python 解释器和依赖一起内置了，或把 Python 代码打成 exe；底层仍然需要 Python runtime。当前项目的 ASR/OCR 依赖 Whisper、torch、PaddleOCR、OpenCV，尤其 GPU 版本体积大且对 CUDA 版本敏感，因此推荐把 Python 3.10 放到 `.runtime/python`，让脚本首次启动时自动创建 ASR/OCR venv。这样最终用户不需要把 Python 安装到系统 PATH。不要使用 Python embeddable package，它默认不适合 `venv` 和 `pip`。
