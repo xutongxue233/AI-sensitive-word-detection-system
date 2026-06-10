@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-视频内容审核工作台:上传视频/字幕 → 抽音频 Whisper ASR + 画面硬字幕 PaddleOCR 双层转写 → 规则召回敏感词候选 → AI 上下文复核 → 生成可确认/可调整/可导出的剪辑(音频)与去字幕(画面)建议。核心目标是**可审计、可解释、可定位到时间轴**,而非黑盒整段多模态审核。
+视频内容审核工作台:上传视频/字幕 → 抽音频 Whisper ASR + 画面硬字幕 OCR 双层转写 → 规则召回敏感词候选 → AI 上下文复核 → 生成可确认/可调整/可导出的剪辑(音频)与去字幕(画面)建议。核心目标是**可审计、可解释、可定位到时间轴**,而非黑盒整段多模态审核。
 
 ## 架构:四进程拓扑(关键)
 
@@ -16,12 +16,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | --- | --- | --- | --- |
 | backend | Spring Boot 3.3 / Java 21 / MyBatis-Plus / SQLite(默认) / MySQL(可选) | 8090 | 编排管线、REST API、规则匹配、AI 客户端、FFmpeg 调用、导出 |
 | frontend | React 18 / Vite / TS | 5174 | 审核工作台,dev 代理 `/api` → 8090 |
-| asr-service | FastAPI / openai-whisper(**torch**) | 9000 | 语音转写,词级时间戳 |
-| ocr-service | FastAPI / PaddleOCR(**paddle,绝不装 torch**) | 9001 | 画面硬字幕识别 |
+| asr-service | FastAPI / faster-whisper(**CTranslate2,纯 CPU**) | 9000 | 语音转写,词级时间戳 |
+| ocr-service | FastAPI / RapidOCR(**onnxruntime,纯 CPU**) | 9001 | 画面硬字幕识别 |
 
-**ASR 与 OCR 必须是两个独立进程、独立 venv**:torch(CUDA 13)与 paddlepaddle-gpu(CUDA 12)共用同名 `cudnn64_9.dll`,同进程加载会 `WinError 127` 崩溃;且 paddleocr 检测到 torch 会拉起它。因此 `ocr-service/.venv` 刻意不装 torch(paddleocr 自动降级为纯 paddle)。修改任一 Python 服务依赖时,绝不可把 torch 引入 OCR 进程。两服务无 GPU 时跑 CPU,行为一致,仅速度不同。
+**两个 Python 服务均为纯 CPU 轻量引擎**(面向核显/无 NVIDIA 机器):ASR 用 faster-whisper(CTranslate2 INT8,无 torch),OCR 用 rapidocr-onnxruntime(PP-OCRv4 模型随 wheel 自带、离线可用,无 paddle)。两服务仍保持独立进程、独立 venv 的拓扑(职责与依赖隔离);历史上的 torch/paddle CUDA 冲突随引擎更换已不存在,但**不要**往这两个 venv 里引入 torch/paddle 等重依赖。OCR 模块内 `PADDLE_OCR_*` 环境变量名与 `probe_paddle_gpu` 等公开名是 PaddleOCR 时代的遗留命名,为兼容 /health 字段与既有配置而保留。
 
-后端是混合架构中唯一不可被 Python 替代的部分(AI 推理服务因 CUDA 依赖无法与 JVM 合并)。`backend/tools/ffmpeg/bin/{ffmpeg,ffprobe}.exe` 不入库,由本地提供或环境变量 `FFMPEG_PATH`/`FFPROBE_PATH` 覆盖。
+后端是混合架构中唯一不可被 Python 替代的部分(转写/OCR 推理保持独立进程,职责与依赖隔离)。`backend/tools/ffmpeg/bin/{ffmpeg,ffprobe}.exe` 不入库,由本地提供或环境变量 `FFMPEG_PATH`/`FFPROBE_PATH` 覆盖。
 
 ## 检测管线(DetectionPipelineService.processAsync)
 
@@ -70,6 +70,8 @@ AI 启用与否、端点/密钥/模型走的是**运行时设置**(见下),`extr
 
 ## 常用命令
 
+一键脚本(仓库根目录):`dev.bat` 开发模式启动全部四服务(源码直跑,日志带 `[backend]/[frontend]/[asr]/[ocr]` 前缀聚合到同一窗口,Ctrl+C 全停);`stop.bat` 按端口停止全部服务进程树(对 dev/生产/手动/遗留孤儿进程一律有效);`start-local.bat` 生产模式(前端打进 jar 后台跑,支持 `stop|status|setup|rebuild` 子命令)。
+
 **后端必须用 JDK 21**(默认 `JAVA_HOME` 是 JDK8,直接 `mvn` 会对 record/text block 报假语法错):
 
 ```bash
@@ -88,18 +90,18 @@ npm run build      # tsc -b && vite build
 ```
 
 ```bash
-# ASR 服务 :9000(首次跑会下载 Whisper 模型);GPU 一键装:asr-service/install-gpu.bat
+# ASR 服务 :9000(首次跑会经 HF_ENDPOINT 镜像下载 faster-whisper 模型,缓存在 WHISPER_DOWNLOAD_ROOT)
 cd asr-service && .\.venv\Scripts\python.exe -m uvicorn app:app --host 127.0.0.1 --port 9000
-# OCR 服务 :9001(独立 venv,不含 torch);GPU 一键装:ocr-service/install-ocr-gpu.bat
+# OCR 服务 :9001(独立 venv;RapidOCR 模型随包自带,免下载)
 cd ocr-service && .\.venv\Scripts\python.exe -m uvicorn ocr_app:app --host 127.0.0.1 --port 9001
 ```
 
-GPU 是否生效:ASR `http://127.0.0.1:9000/health` 看 `gpu.torchCudaAvailable`;OCR `:9001/health` 看 `gpu.paddleCompiledWithCuda`。完整环境变量见 README「启动/GPU 加速」。
+两服务均纯 CPU(faster-whisper INT8 / onnxruntime),无 GPU 依赖;引擎信息看各自 `/health` 的 `gpu` 字段(仅排查用,后端不解析)。模型/设备等环境变量见 `config/local.env.example`。
 
 ## 重要陷阱
 
 - **JDK 21**:命令行构建前必须 `export JAVA_HOME=/d/Environment/jdk-21.0.2`,否则假语法错。
-- **OCR 进程绝不引入 torch**(与 paddle 的 cuDNN 同进程冲突)。
-- **README 里的 `start-all.bat`/`stop-all.bat`/`_run-*.bat` 已删除**,当前需按上面命令分别手动启动各服务。
+- **Python 服务保持轻量纯 CPU**:asr/ocr 两 venv 不要引入 torch/paddle 等重依赖(已换 faster-whisper / rapidocr-onnxruntime)。
+- **README 里的 `start-all.bat`/`stop-all.bat`/`_run-*.bat` 已删除**,现用根目录 `dev.bat`(开发启动)/`stop.bat`(停止)/`start-local.bat`(生产)。
 - Shell 是 Windows 上的 bash:用正斜杠、`/dev/null`。
 - AI 复核只处理规则/提取召回的候选,不做全文无差别审核。

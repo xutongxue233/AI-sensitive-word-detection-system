@@ -435,12 +435,7 @@ function Ensure-Ready {
 
     Write-Step "Checking Python service dependencies"
     Ensure-PythonVenv -Root $Root -ServiceName "asr-service" -PythonExe $python
-    $ocrExtraPackages = @("paddlepaddle==3.2.1", "paddleocr>=3.0,<4.0")
-    if ($env:PADDLE_OCR_USE_GPU -and ($env:PADDLE_OCR_USE_GPU).ToLower() -in @("1", "true", "yes", "on")) {
-        $ocrExtraPackages = @()
-        Write-Host "PADDLE_OCR_USE_GPU=true; skipping CPU Paddle packages. Run ocr-service\install-ocr-gpu.bat for GPU OCR."
-    }
-    Ensure-PythonVenv -Root $Root -ServiceName "ocr-service" -PythonExe $python -ExtraPackages $ocrExtraPackages
+    Ensure-PythonVenv -Root $Root -ServiceName "ocr-service" -PythonExe $python
 
     if ($needsBuild) {
         $npm = Resolve-Executable -Root $Root -RuntimePath ".runtime\node\npm.cmd" -CommandName "npm.cmd" -DisplayName "Node.js/npm"

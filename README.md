@@ -14,8 +14,8 @@ AI 敏感词检测系统是一个基于 `Spring Boot + React` 的视频内容审
 - 多种匹配方式：精确词、变体词、正则词、语义规则。
 - 视频上传：支持视频文件上传，可选上传 `.srt/.vtt` 字幕。
 - 音频抽取：通过 FFmpeg 将视频音频转为 16kHz mono wav。
-- Whisper ASR：通过本地 `openai/whisper` 服务生成句段和词级时间戳。
-- 画面字幕 OCR：无外部字幕时使用 PaddleOCR 扫描视频底部硬字幕，将字幕文本作为独立检测层合并进时间轴。
+- Whisper ASR：通过本地 faster-whisper（CTranslate2，纯 CPU INT8）服务生成句段和词级时间戳。
+- 画面字幕 OCR：无外部字幕时使用 RapidOCR（ONNXRuntime，模型随包内置）扫描视频画面硬字幕，将字幕文本作为独立检测层合并进时间轴。
 - 简体中文输出：ASR 使用简体中文提示词，并用 OpenCC 做繁转简兜底。
 - 规则召回：先用词库规则找到候选命中，降低 AI 审核成本。
 - AI 复核：对接 OpenAI 兼容接口（Chat Completions 与 Responses 两种形态可配置切换），只复核候选上下文，输出违规判断、原因和置信度。
@@ -31,7 +31,7 @@ AI 敏感词检测系统是一个基于 `Spring Boot + React` 的视频内容审
 | --- | --- |
 | 后端 | Spring Boot 3.3, Java 21, MyBatis-Plus, SQLite / MySQL |
 | 前端 | React 18, TypeScript, Vite, Ant Design |
-| ASR / OCR | FastAPI, openai-whisper, PaddleOCR, OpenCV, OpenCC |
+| ASR / OCR | FastAPI, faster-whisper (CTranslate2), RapidOCR (ONNXRuntime), OpenCV, OpenCC |
 | 媒体处理 | FFmpeg, ffprobe |
 | 数据库 | SQLite（默认，无需安装服务）/ MySQL 8+（可选） |
 
@@ -41,8 +41,8 @@ AI 敏感词检测系统是一个基于 `Spring Boot + React` 的视频内容审
 .
 ├── backend/      # Spring Boot 后端 API、检测管线、MyBatis-Plus Mapper
 ├── frontend/     # React + Vite 前端审核工作台
-├── asr-service/  # FastAPI + openai/whisper 语音识别(GPU: install-gpu.bat 装 torch cu130)
-├── ocr-service/  # FastAPI + PaddleOCR 画面字幕识别(GPU: install-ocr-gpu.bat, 独立 venv 不含 torch)
+├── asr-service/  # FastAPI + faster-whisper 语音识别(CTranslate2, 纯 CPU)
+├── ocr-service/  # FastAPI + RapidOCR 画面字幕识别(ONNXRuntime, 纯 CPU, 独立 venv)
 └── README.md
 ```
 
@@ -134,7 +134,7 @@ py -3.10 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\pip.exe install -r requirements.txt
 
-$env:WHISPER_MODEL='large-v3'
+$env:WHISPER_MODEL='medium'
 $env:WHISPER_DEVICE='cpu'
 $env:WHISPER_FP16='false'
 $env:WHISPER_LANGUAGE='zh'
@@ -150,16 +150,13 @@ $env:PADDLE_OCR_ENABLE_MKLDNN='false'
 
 说明：
 
-- 第一次识别会下载 Whisper 模型。
-- 第一次画面字幕 OCR 会下载 PaddleOCR 模型。
-- 默认使用 PaddleOCR `PP-OCRv4` 移动版模型，适合本地 CPU；需要指定模型时可设置 `PADDLE_OCR_DET_MODEL` / `PADDLE_OCR_REC_MODEL`。
-- CPU 默认禁用 PaddleOCR 的 MKLDNN/oneDNN 加速，避免部分 PaddlePaddle 版本在 PP-OCRv4 推理时报 `ConvertPirAttribute2RuntimeAttribute`；确认本机版本兼容后可把 `PADDLE_OCR_ENABLE_MKLDNN` 改为 `true`。
-- `WHISPER_MODEL` 可改为 `tiny/base/small/medium/large/large-v3/turbo`。
-- 当前默认使用 `large-v3`；CPU 环境会更慢，如只验证流程可临时改为 `base` 或 `small`。
-- CPU 环境保持 `WHISPER_FP16=false`；使用 CUDA 时可按硬件情况改为 `true`。
-- 默认启用 beam search（`WHISPER_BEAM_SIZE=5`）提升数字/口语识别（如「几十块」不易被听成「十块」）；CPU 上更慢，可设 `WHISPER_BEAM_SIZE=0` 改用更快的贪心解码。
+- ASR 引擎是 faster-whisper（CTranslate2），首次识别会从 HuggingFace 下载 CT2 模型权重（缓存目录可用 `WHISPER_DOWNLOAD_ROOT` 指定，建议指向仓库 `.runtime\models`）。
+- OCR 引擎是 RapidOCR（ONNXRuntime），PP-OCRv4 中英文模型随包内置、离线可用，无需下载；可用 `PADDLE_OCR_DET_MODEL` / `PADDLE_OCR_REC_MODEL` 指定自定义 onnx 模型路径。
+- `WHISPER_MODEL` 可改为 `tiny/base/small/medium/large-v3` 等；默认 `medium`（配 INT8 量化，准确度与速度平衡），求快改 `small`，求更准改 `large-v3`。
+- `WHISPER_COMPUTE_TYPE` 默认 `int8`（CPU 最快最省内存）；`WHISPER_CPU_THREADS` 建议设为物理性能核数（引擎默认 4 线程偏保守，开满全部核反而可能更慢）。
+- 默认启用 beam search（`WHISPER_BEAM_SIZE=5`）提升数字/口语识别（如「几十块」不易被听成「十块」）；追求速度可设 `WHISPER_BEAM_SIZE=0` 改用贪心解码。
 - 默认输出会使用简体中文提示词，并通过 OpenCC 做繁转简。
-- **NVIDIA GPU 加速**：以上为 CPU 默认配置；有 NVIDIA 显卡时见下方「GPU 加速」章节一键切到 CUDA（含 RTX 50 系 Blackwell）。
+- 两个推理服务均为纯 CPU 轻量引擎，无 torch/paddle/CUDA 依赖，核显机器可直接运行。
 
 ### 启动后端
 
@@ -224,6 +221,8 @@ http://127.0.0.1:8090/
 .\start-local.bat rebuild  # 强制重新构建前端与后端 Jar
 ```
 
+开发调试用另一对脚本：双击 `dev.bat` 以开发模式源码直跑四个服务（backend/frontend/asr/ocr 日志带前缀汇聚在同一窗口，前端 :5174 热更新，Ctrl+C 一次全停）；`stop.bat` 按端口停止全部项目服务进程树（无论服务由哪种方式启动，含遗留孤儿进程）。
+
 源码模式需要 Java 21、Maven 3.9+、Node.js、Python 3.10 与 FFmpeg。可以全局安装，也可以把轻量环境包解压到以下目录，脚本会优先使用本地环境：
 
 ```text
@@ -243,78 +242,24 @@ http://127.0.0.1:8090/
 | Node.js | [Node.js Downloads](https://nodejs.org/en/download) | 下载 Windows x64 安装包或 zip；放到 `.runtime/node` 时目录内应有 `npm.cmd` |
 | Python 3.10.x | [Python 3.10.11 Release](https://www.python.org/downloads/release/python-31011/) / [Windows 64-bit installer](https://www.python.org/ftp/python/3.10.11/python-3.10.11-amd64.exe) | 使用正常安装版，需支持 `venv` 和 `pip`；不要用 embeddable package |
 | FFmpeg | [FFmpeg Download](https://ffmpeg.org/download.html) / [gyan.dev Windows builds](https://www.gyan.dev/ffmpeg/builds/) | 下载 release essentials zip，解压后把 `bin/ffmpeg.exe` 和 `bin/ffprobe.exe` 放到 `.runtime/ffmpeg/bin` |
-| NVIDIA Driver（可选 GPU） | [NVIDIA Driver Downloads](https://www.nvidia.com/Download/index.aspx) | 只有启用 Whisper/OCR GPU 时需要 |
-| PyTorch CUDA 源（可选 GPU） | [PyTorch cu130 wheels](https://download.pytorch.org/whl/cu130) | `asr-service/install-gpu.bat` 会使用 |
-| PaddlePaddle CUDA 源（可选 GPU） | [PaddlePaddle cu129 wheels](https://www.paddlepaddle.org.cn/packages/stable/cu129/) | `ocr-service/install-ocr-gpu.bat` 会使用 |
 
-默认按 CPU 模式启动。需要改端口、GPU 或模型配置时，编辑 `config/local.env`；如果文件不存在，脚本会从 `config/local.env.example` 自动复制一份。
+推理默认纯 CPU。需要改端口或模型配置时，编辑 `config/local.env`；如果文件不存在，脚本会从 `config/local.env.example` 自动复制一份。
 
-关于“少装一个 Python 环境”：C# 项目看起来能直接执行 Python，通常是因为它把 Python 解释器和依赖一起内置了，或把 Python 代码打成 exe；底层仍然需要 Python runtime。当前项目的 ASR/OCR 依赖 Whisper、torch、PaddleOCR、OpenCV，尤其 GPU 版本体积大且对 CUDA 版本敏感，因此推荐把 Python 3.10 放到 `.runtime/python`，让脚本首次启动时自动创建 ASR/OCR venv。这样最终用户不需要把 Python 安装到系统 PATH。不要使用 Python embeddable package，它默认不适合 `venv` 和 `pip`。
+关于“少装一个 Python 环境”：C# 项目看起来能直接执行 Python，通常是因为它把 Python 解释器和依赖一起内置了，或把 Python 代码打成 exe；底层仍然需要 Python runtime。当前项目的 ASR/OCR 依赖 faster-whisper、RapidOCR、OpenCV（纯 CPU 轻量依赖），推荐把 Python 3.10 放到 `.runtime/python`，让脚本首次启动时自动创建 ASR/OCR venv。这样最终用户不需要把 Python 安装到系统 PATH。不要使用 Python embeddable package，它默认不适合 `venv` 和 `pip`。
 
-### GPU 加速（NVIDIA 显卡 / RTX 50 系 Blackwell sm_120）
+### 推理引擎与性能（纯 CPU）
 
-两处本地推理（Whisper 语音识别、PaddleOCR 画面字幕）默认跑在 CPU。有 NVIDIA 显卡时可切到 GPU 大幅提速。核心动作是把深度学习框架换成**包含对应 GPU 计算核（kernel）的 CUDA 构建**——旧版本在新显卡上会报 `no kernel image is available for execution on the device`。
+两处本地推理均采用轻量纯 CPU 引擎，无 torch/paddle/CUDA 依赖，只有核显的机器可直接运行：
 
-> RTX 50 系（Blackwell，计算能力 sm_120）需要较新的框架：PyTorch 走 CUDA 13.0（cu130）构建，PaddlePaddle 走 CUDA 12.9（cu129）构建。下面命令以此为准；更早的显卡可改用对应的 cu121/cu124 等构建。
+- **Whisper 语音识别**：faster-whisper（CTranslate2）INT8 量化，比 openai-whisper 纯 CPU 推理快约 4 倍、内存更省。提速优先级：`WHISPER_CPU_THREADS` 设为物理性能核数 > 换小模型（`small`）> `WHISPER_BEAM_SIZE=0` 贪心解码。
+- **画面字幕 OCR**：RapidOCR（ONNXRuntime）+ 内置 PP-OCRv4 中英文模型，识别质量与 PP-OCR 同源；调大 `interval-seconds` 抽帧间隔可加快扫描。
 
-> **重要架构说明**：torch（Whisper, CUDA 13）与 paddlepaddle-gpu（OCR, CUDA 12）共用同名 `cudnn64_9.dll`，**无法在同一进程共存**（报 `WinError 127`），且 paddleocr 在检测到 torch 时会拉起它。因此 Whisper 与 OCR 用**两个独立 venv、两个进程**：asr venv 装 torch（GPU）跑 Whisper（9000）；OCR 用独立目录 ocr-service 的专用 venv（装 paddle GPU + paddleocr、**不装 torch**，paddleocr 自动降级为纯 paddle）跑 `ocr_app.py`（9001）。
+两服务 `/health` 的 `gpu` 字段现为引擎自检信息（onnxruntime providers、ctranslate2 版本等），仅供排查。
 
-#### 1. 安装两个 GPU 环境
+常见问题：
 
-**Whisper（asr-service/.venv，torch cu130）**：
-
-```powershell
-cd asr-service
-.\install-gpu.bat
-```
-
-**OCR（ocr-service/.venv，paddle GPU + paddleocr，不含 torch）**：
-
-```powershell
-cd ocr-service
-.\install-ocr-gpu.bat
-```
-
-`install-ocr-gpu.bat` 会新建 `.venv` 并装 `paddlepaddle-gpu==3.2.1`(cu129) + `nvidia-cuda-nvrtc-cu12`(cuDNN 运行时编译所需) + `paddleocr` + 服务依赖；它**不装 torch**——这是 OCR 能用 GPU 的关键（有 torch 会和 paddle 的 cuDNN 冲突）。脚本结尾会校验该 venv 里确实没有 torch。
-
-#### 2. 启动（GPU 模式）
-
-编辑根目录 `config/local.env`，把本地推理切到 GPU：
-
-```env
-WHISPER_DEVICE=cuda
-WHISPER_FP16=true
-PADDLE_OCR_USE_GPU=true
-```
-
-然后使用同一个单窗口启动入口：
-
-```powershell
-.\start-local.bat
-```
-
-脚本会隐藏启动 ASR(9000) / OCR(9001) / Backend(8090) 三个托管进程，并打开 `http://127.0.0.1:8090/`。如果需要确认 GPU 是否生效，访问 ASR/OCR 的 `/health` 或运行 `start-local.bat status` 后查看服务状态与日志。
-
-验证 GPU 是否真正生效：
-- Whisper：`http://127.0.0.1:9000/health` → `gpu.torchCudaAvailable=true`、`gpu.torchHasSm120=true`。
-- OCR：`http://127.0.0.1:9001/health` → `gpu.paddleCompiledWithCuda=true`。
-
-后端 `application.yml` 的 `app.subtitle-ocr.base-url` 已指向 `http://localhost:9001`（独立 OCR 服务）。
-
-> 说明：PaddleOCR 升级到 3.x 后，旧的 `use_gpu` / `show_log` / `enable_mkldnn` / `use_angle_cls` 参数已移除或更名，GPU 改由 `device='gpu'` 控制（后端按 `PADDLE_OCR_USE_GPU` 自动注入）；`PADDLE_OCR_VERSION` 默认 `PP-OCRv4`，需要时可设为空或 `PP-OCRv5`。
-
-#### 3. 显存说明（8GB 卡重要）
-
-- Whisper `large-v3`（FP16）推理峰值约 5–8GB，随音频时长与 `WHISPER_BEAM_SIZE` 变化。8GB 卡偏紧，若 OOM：把 `WHISPER_BEAM_SIZE` 调小，或把 `WHISPER_MODEL` 换成 `large-v3-turbo`（质量接近、显存友好）。
-- Whisper 与 OCR 是两个进程、各自占显存，单任务的音频腿与画面腿并发时会叠加。8GB 卡若吃紧，可让 OCR 服务设 `PADDLE_OCR_USE_GPU=false` 回 CPU，把显存让给 Whisper。
-
-#### 4. GPU 故障排查
-
-- `no kernel image is available`：装了不含当前显卡计算核的旧框架，重跑 `install-gpu.bat`（RTX 50 系务必用 cu130 / cu129 构建，不要用 PyPI 默认的 `paddlepaddle-gpu`，那是旧 cu102 构建，不含 sm_120）。
-- OCR 报 `cudnn_cnn64_9.dll ... WinError 127`：多半是 OCR 和 Whisper 跑在了同一进程。确认 OCR 用独立的 `ocr_app.py`（端口 9001）启动、且未在该进程引入 torch，`application.yml` 的 `app.subtitle-ocr.base-url` 指向 9001。
-- 配了 `WHISPER_DEVICE=cuda` 却仍很慢/报错：多半装的是 CPU 版 torch（版本号带 `+cpu`）。`/health` 的 `gpu.torchCudaAvailable` 会显示 `false`；按上面重装。
-- `paddleocr` 升级后把 `numpy` 顶到 2.x 导致 whisper/numba 报错：`.\.venv\Scripts\python.exe -m pip install numpy==1.26.4` 钉回。
 - 编译 backend 报 `record` / text block 之类语法错误：用了 JDK8，请改用 Java 21（`set JAVA_HOME=...\jdk21`）后再 `mvn`。
+- faster-whisper 首次下载模型失败：检查到 HuggingFace 的网络；若配置了 `HF_ENDPOINT` 镜像，注意部分镜像对部分模型会 308 跳回源站导致 huggingface_hub 报错，此时应去掉镜像配置改为直连或代理。
 
 ### AI 复核（OpenAI 兼容）
 
@@ -414,7 +359,7 @@ term,category,severity,matchType,variants
 ### 注意事项
 
 - 本项目不会提交本地视频、模型、虚拟环境、FFmpeg 二进制文件。
-- ASR 模型由 openai-whisper 首次运行时下载并缓存到本机；OCR 模型由 PaddleOCR 首次运行时下载并缓存。
+- ASR 模型由 faster-whisper 首次运行时从 HuggingFace 下载（可经 `WHISPER_DOWNLOAD_ROOT` 缓存到仓库内）；OCR 模型随 RapidOCR 包内置，无需下载。
 - 真实生产环境建议增加鉴权、审计日志、对象存储、任务队列和模型服务监控。
 - AI 复核只处理规则召回候选，不做全文无差别审核。
 
@@ -434,8 +379,8 @@ The system is designed for auditability and precise timeline positioning instead
 - Matching modes: exact terms, variants, regex, and semantic rules.
 - Video upload: upload video files with optional `.srt/.vtt` subtitles.
 - Audio extraction: convert video audio to 16kHz mono wav using FFmpeg.
-- Whisper ASR: generate segment-level and word-level timestamps.
-- Hard-subtitle OCR: scan bottom-screen subtitles with PaddleOCR and merge recognized text as an independent moderation layer.
+- Whisper ASR: generate segment-level and word-level timestamps via faster-whisper (CTranslate2, CPU INT8).
+- Hard-subtitle OCR: scan on-screen subtitles with RapidOCR (ONNXRuntime, bundled models) and merge recognized text as an independent moderation layer.
 - Simplified Chinese output: ASR uses a Simplified Chinese prompt and OpenCC fallback conversion.
 - Rule recall: find candidate hits before AI review.
 - AI review: call an OpenAI-compatible API (Chat Completions or Responses, switchable via `app.ai.api-type`) to review only candidate contexts and return violation, confidence, and reason.
@@ -451,7 +396,7 @@ The system is designed for auditability and precise timeline positioning instead
 | --- | --- |
 | Backend | Spring Boot 3.3, Java 21, MyBatis-Plus, SQLite / MySQL |
 | Frontend | React 18, TypeScript, Vite, Ant Design |
-| ASR / OCR | FastAPI, openai-whisper, PaddleOCR, OpenCV, OpenCC |
+| ASR / OCR | FastAPI, faster-whisper (CTranslate2), RapidOCR (ONNXRuntime), OpenCV, OpenCC |
 | Media | FFmpeg, ffprobe |
 | Database | SQLite by default, optional MySQL 8+ |
 
@@ -461,8 +406,8 @@ The system is designed for auditability and precise timeline positioning instead
 .
 ├── backend/      # Spring Boot APIs, detection pipeline, MyBatis-Plus mappers
 ├── frontend/     # React + Vite moderation console
-├── asr-service/  # FastAPI + openai/whisper speech recognition (GPU: install-gpu.bat, torch cu130)
-├── ocr-service/  # FastAPI + PaddleOCR hard-subtitle recognition (GPU: install-ocr-gpu.bat, separate venv, no torch)
+├── asr-service/  # FastAPI + faster-whisper speech recognition (CTranslate2, CPU-only)
+├── ocr-service/  # FastAPI + RapidOCR hard-subtitle recognition (ONNXRuntime, CPU-only, separate venv)
 └── README.md
 ```
 
@@ -571,7 +516,7 @@ py -3.10 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\pip.exe install -r requirements.txt
 
-$env:WHISPER_MODEL='large-v3'
+$env:WHISPER_MODEL='medium'
 $env:WHISPER_DEVICE='cpu'
 $env:WHISPER_FP16='false'
 $env:WHISPER_LANGUAGE='zh'
@@ -587,15 +532,12 @@ $env:PADDLE_OCR_ENABLE_MKLDNN='false'
 
 Notes:
 
-- The Whisper model is downloaded on first use.
-- PaddleOCR downloads OCR models on the first hard-subtitle scan.
-- The default PaddleOCR version is `PP-OCRv4` mobile models for local CPU usage; set `PADDLE_OCR_DET_MODEL` / `PADDLE_OCR_REC_MODEL` to override model names.
-- PaddleOCR MKLDNN/oneDNN CPU acceleration is disabled by default to avoid `ConvertPirAttribute2RuntimeAttribute` inference errors in some PaddlePaddle / PP-OCRv4 combinations; set `PADDLE_OCR_ENABLE_MKLDNN=true` only after verifying your local runtime is compatible.
-- `WHISPER_MODEL` can be `tiny`, `base`, `small`, `medium`, `large`, `large-v3`, or `turbo`.
-- The default is `large-v3`; CPU inference is slower, so use `base` or `small` only for quick workflow checks.
-- Keep `WHISPER_FP16=false` on CPU; set it to `true` only when your CUDA hardware supports it.
+- The ASR engine is faster-whisper (CTranslate2); CT2 model weights are downloaded from HuggingFace on first use (set `WHISPER_DOWNLOAD_ROOT` to keep the cache inside the repo).
+- The OCR engine is RapidOCR (ONNXRuntime); PP-OCRv4 models ship inside the wheel and work offline. Set `PADDLE_OCR_DET_MODEL` / `PADDLE_OCR_REC_MODEL` to point to custom onnx models.
+- `WHISPER_MODEL` can be `tiny`, `base`, `small`, `medium`, or `large-v3`; the default is `medium` with `WHISPER_COMPUTE_TYPE=int8`.
+- Set `WHISPER_CPU_THREADS` to your physical performance-core count for the best speed (the engine default of 4 threads is conservative; using every core can be slower).
 - Simplified Chinese is enforced with both prompt guidance and OpenCC fallback conversion.
-- For NVIDIA GPU acceleration (including RTX 50 series / Blackwell sm_120), see the "GPU 加速" section above. In GPU mode the OCR runs as a separate process (`ocr_app.py`, port 9001) from Whisper (`app.py`, port 9000), since torch and paddle cannot share one process on CUDA.
+- Both inference services are lightweight CPU-only (no torch/paddle/CUDA); machines with integrated graphics run them as-is.
 
 ### Start Backend
 

@@ -1,73 +1,61 @@
-"""ASR 语音转写微服务(FastAPI + openai-whisper / torch)。
+"""ASR 语音转写微服务(FastAPI + faster-whisper / CTranslate2,纯 CPU 轻量版)。
 
 四进程架构中的 ``asr-service``,默认监听 ``127.0.0.1:9000``,由 Java 后端经
 ``app.asr.base-url`` 通过 HTTP 调用:接收后端用 FFmpeg 抽取的 16k mono 音频,
-用 Whisper 转写为带词级时间戳的 segments 返回(供后端做规则召回与时间轴定位)。
+转写为带词级时间戳的 segments 返回(供后端做规则召回与时间轴定位)。
 
-本进程允许引入 torch(Whisper 依赖 torch 做推理),与 ``ocr-service`` 完全独立的
-原因:torch(CUDA 13)与 paddlepaddle-gpu(CUDA 12)共用同名 cuDNN 动态库,
-同进程加载会崩溃,故 ASR(torch)与 OCR(paddle)各跑一个独立进程、独立 venv。
+为适配只有核显(无 NVIDIA/CUDA)的机器,本服务用 faster-whisper(CTranslate2 引擎)
+在纯 CPU 上以 INT8 量化推理:比 openai-whisper 约快 4 倍、内存更省,且不依赖 torch/CUDA。
+对外 HTTP 接口(/、/health、/transcribe)与原 openai-whisper 版完全一致,后端无需改动。
 """
 
 import os
 import tempfile
 import threading
-import warnings
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from opencc import OpenCC
-import whisper
+from faster_whisper import WhisperModel
+
+try:
+    from opencc import OpenCC
+except Exception:  # opencc 缺失时退化为不做简繁转换,不致命
+    OpenCC = None
 
 
-# Whisper 模型规格:默认 large-v3-turbo(精度/速度折中);可用 WHISPER_MODEL 覆盖。
-MODEL_SIZE = os.getenv("WHISPER_MODEL", "large-v3-turbo")
-# 设备选择:默认 'GPU' 仅是用户友好别名,下方统一规范化为 torch 设备串(cuda/cpu)。
-DEVICE = os.getenv("WHISPER_DEVICE", "GPU")
-# 规范化为 PyTorch 设备字符串:GPU/gpu/cuda -> cuda;cuda:N 保留;其余 -> cpu
-_device_lower = DEVICE.strip().lower()
-if _device_lower in {"gpu", "cuda"}:
+# 模型规格:默认 medium(faster-whisper INT8 下 CPU 可接受且较准);可用 WHISPER_MODEL 覆盖。
+# 求快可用 small/base,求准可用 large-v3。
+MODEL_SIZE = os.getenv("WHISPER_MODEL", "medium")
+# 设备:核显机器固定 cpu。保留 cuda 别名规范化,但 CTranslate2 GPU 需 CUDA,核显无效。
+_device_lower = os.getenv("WHISPER_DEVICE", "cpu").strip().lower()
+if _device_lower in {"gpu", "cuda"} or _device_lower.startswith("cuda:"):
     DEVICE = "cuda"
-elif _device_lower.startswith("cuda:"):
-    DEVICE = _device_lower
 else:
     DEVICE = "cpu"
-FP16 = os.getenv("WHISPER_FP16", "true").lower() in {"1", "true", "yes", "on"}
-# OpenCC 简繁转换配置名:默认 t2s(繁转简),空串则不做转换。
+# CTranslate2 计算精度:CPU 默认 int8(最快最省内存);cuda 默认 float16。可用 WHISPER_COMPUTE_TYPE 覆盖。
+COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE") or ("float16" if DEVICE == "cuda" else "int8")
+# CPU 线程数:0 = 让 CTranslate2 自动按物理核数。
+CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", "0"))
+# 模型权重下载目录(从 HuggingFace 拉 CT2 权重),指向项目内以免污染本地用户目录。
+DOWNLOAD_ROOT = os.getenv("WHISPER_DOWNLOAD_ROOT") or None
+# OpenCC 简繁转换配置名:默认 t2s(繁转简),空串则不转换。
 CHINESE_CONVERTER = os.getenv("WHISPER_CHINESE_CONVERTER", "t2s")
 # 引导提示:让模型倾向输出简体中文普通话内容。
 INITIAL_PROMPT = os.getenv("WHISPER_INITIAL_PROMPT", "请使用简体中文转写普通话内容。")
-# beam search:默认 5,数字/口语(如"几十块"易被听成"十块")识别更准;设 0 改用贪心解码,更快(CPU 上明显)
+# beam search:默认 5,数字/口语识别更准;设 0 改用贪心解码(beam=1),更快。
 WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
-# openai-whisper 在缺少本机 CUDA toolkit 时会对词级时间戳的 Triton 加速内核打 UserWarning,
-# 但会自动回退到可用实现,不影响转写结果。默认隐藏这类性能降级噪声;排查性能时可设 true 打开。
-SHOW_TRITON_WARNINGS = os.getenv("WHISPER_SHOW_TRITON_WARNINGS", "false").lower() in {"1", "true", "yes", "on"}
-# FFmpeg 二进制目录:Whisper 内部解码音频需要 ffmpeg 在 PATH 上;
-# 未显式指定时回退到仓库内置的 backend/tools/ffmpeg/bin。
-FFMPEG_BIN_DIR = os.getenv("FFMPEG_BIN_DIR")
+# 语言:默认 None(自动检测);可设 zh 固定为中文。
+WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE") or None
+# 仅为兼容原 /health 的 fp16 字段保留(CPU INT8 下无实际意义)。
+FP16 = os.getenv("WHISPER_FP16", "false").lower() in {"1", "true", "yes", "on"}
 
-if not SHOW_TRITON_WARNINGS:
-    warnings.filterwarnings(
-        "ignore",
-        message=r"Failed to launch Triton kernels.*",
-        category=UserWarning,
-        module=r"whisper\.timing",
-    )
-
-if FFMPEG_BIN_DIR:
-    os.environ["PATH"] = FFMPEG_BIN_DIR + os.pathsep + os.environ.get("PATH", "")
-else:
-    bundled_ffmpeg = Path(__file__).resolve().parents[1] / "backend" / "tools" / "ffmpeg" / "bin"
-    if bundled_ffmpeg.exists():
-        os.environ["PATH"] = str(bundled_ffmpeg) + os.pathsep + os.environ.get("PATH", "")
-
-app = FastAPI(title="OpenAI Whisper ASR Service")
+app = FastAPI(title="faster-whisper ASR Service")
 model = None
-converter = OpenCC(CHINESE_CONVERTER) if CHINESE_CONVERTER else None
-# 初始化锁:保护全局 Whisper 模型的懒加载(double-checked locking)。
+converter = OpenCC(CHINESE_CONVERTER) if (CHINESE_CONVERTER and OpenCC is not None) else None
+# 初始化锁:保护全局模型懒加载(double-checked locking)。
 _model_lock = threading.Lock()
-# 推理锁:同一个全局 Whisper 模型不保证并发推理安全(多任务并行时),故串行化。
+# 推理锁:同一全局模型并发推理不一定安全(多任务并行时),故串行化。
 _model_infer_lock = threading.Lock()
 
 
@@ -77,109 +65,92 @@ async def root():
     return {
         "service": "asr-service",
         "status": "ok",
+        "engine": "faster-whisper",
         "health": "/health",
         "transcribe": "/transcribe",
         "note": "OCR 服务是独立进程 ocr-service/ocr_app.py,默认端口 9001。",
     }
 
 
-def _probe_gpu() -> dict:
-    """探测并返回 torch 的 CUDA 自检信息,供 /health 暴露,辅助排查 GPU 是否生效。
+def _probe_engine() -> dict:
+    """返回引擎/设备自检信息,供 /health 暴露(替代原 torch 探测;后端不解析此字段)。
 
-    本进程只负责 Whisper(torch);OCR 已拆到独立的 ocr_app(端口 9001)。
-    任何探测异常都不抛出,仅记录到返回字典的 torchError 字段,保证健康检查不被 GPU 问题拖垮。
+    任何探测异常都不抛出,仅记入 engineError,保证健康检查不被环境问题拖垮。
     """
-    # 探测 torch 的 CUDA 状态。本进程只负责 Whisper(torch);OCR 已拆到独立的 ocr_app(端口 9001)。
-    info = {}
+    info = {
+        "engine": "faster-whisper",
+        "computeType": COMPUTE_TYPE,
+        "cpuThreads": CPU_THREADS or "auto",
+    }
     try:
-        import torch
-        cuda_ok = bool(torch.cuda.is_available())
-        info["torchVersion"] = torch.__version__
-        info["torchCudaAvailable"] = cuda_ok
-        info["torchCudaRuntime"] = getattr(torch.version, "cuda", None)
-        if cuda_ok:
-            info["torchDeviceName"] = torch.cuda.get_device_name(0)
-            info["torchCapability"] = ".".join(map(str, torch.cuda.get_device_capability(0)))
+        import ctranslate2
+        info["ctranslate2Version"] = ctranslate2.__version__
         try:
-            arch = torch.cuda.get_arch_list()
-            info["torchArchList"] = arch
-            info["torchHasSm120"] = any("120" in a for a in arch)
+            info["cudaDeviceCount"] = ctranslate2.get_cuda_device_count()
         except Exception:
-            # get_arch_list 异常时同时回填两个键,保持 /health 返回结构稳定(消费方无需做缺键容错)
-            info["torchArchList"] = None
-            info["torchHasSm120"] = None
+            info["cudaDeviceCount"] = 0
     except Exception as exc:
-        info["torchError"] = f"{type(exc).__name__}: {exc}"
+        info["engineError"] = f"{type(exc).__name__}: {exc}"
     return info
 
 
 @app.get("/health")
 async def health():
-    """健康检查:返回模型规格、目标设备、fp16 开关、模型是否已加载,以及 GPU 自检信息。
+    """健康检查:返回模型规格、目标设备、计算精度、模型是否已加载,以及引擎自检信息。
 
-    被后端/运维用来确认 ASR 服务存活及 GPU 是否生效(看 gpu.torchCudaAvailable)。
+    顶层字段(status/model/device/fp16/modelLoaded/gpu)与原版兼容;
+    gpu 子字段改为 faster-whisper 引擎信息(后端不解析此字段,仅供排查)。
     """
     return {
         "status": "ok",
         "model": MODEL_SIZE,
         "device": DEVICE,
         "fp16": FP16,
-        "showTritonWarnings": SHOW_TRITON_WARNINGS,
+        "computeType": COMPUTE_TYPE,
         "modelLoaded": model is not None,
-        "gpu": _probe_gpu(),
+        "gpu": _probe_engine(),
     }
 
 
 def normalize_text(text: str) -> str:
     """去首尾空白并按 CHINESE_CONVERTER 做简繁转换(默认 t2s 繁转简)。
 
-    未配置转换器(CHINESE_CONVERTER 为空)时仅做 strip,不改字形。
-
-    :param text: 待规范化的原始转写文本(段文本或词文本)
-    :return: 规范化后的文本
+    未配置转换器时仅做 strip,不改字形。
     """
-    value = text.strip()
+    value = (text or "").strip()
     return converter.convert(value) if converter else value
 
 
 def get_model():
-    """double-checked locking 懒加载全局 Whisper 模型,返回已加载实例。
+    """double-checked locking 懒加载全局 faster-whisper 模型,返回已加载实例。
 
-    DEVICE 为 cuda 时先校验 torch.cuda 是否可用:不可用直接抛 503 快速失败
-    (而非静默回退 CPU),避免误用 CPU 版 torch 跑出极慢且无提示的转写。
+    首次加载按需从 HuggingFace 下载 CT2 权重(可经 HF_ENDPOINT 走镜像、download_root 落项目内)。
+    加载失败抛 503 快速失败,避免静默卡住。
     """
     global model
     if model is None:
         with _model_lock:
             if model is None:
-                if DEVICE.startswith("cuda"):
-                    import torch
-                    if not torch.cuda.is_available():
-                        raise HTTPException(
-                            status_code=503,
-                            detail=(
-                                "WHISPER_DEVICE=cuda 但 torch.cuda.is_available() 为 False,"
-                                "当前 venv 很可能装的是 CPU 版 PyTorch(版本号带 +cpu)。"
-                                "请运行 asr-service/install-gpu.bat 重装,或手动执行 "
-                                "pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cu130;"
-                                "验证 python -c \"import torch;print(torch.__version__,torch.cuda.is_available())\" 应为 2.12.0+cu130 True。"
-                                "更多详情见 /health 的 gpu 字段。"
-                            ),
-                        )
-                model = whisper.load_model(MODEL_SIZE, device=DEVICE)
+                kwargs = {"device": DEVICE, "compute_type": COMPUTE_TYPE}
+                if DOWNLOAD_ROOT:
+                    kwargs["download_root"] = DOWNLOAD_ROOT
+                if CPU_THREADS > 0:
+                    kwargs["cpu_threads"] = CPU_THREADS
+                try:
+                    model = WhisperModel(MODEL_SIZE, **kwargs)
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            f"加载 faster-whisper 模型失败(model={MODEL_SIZE}, device={DEVICE}, "
+                            f"compute_type={COMPUTE_TYPE}): {type(exc).__name__}: {exc}"
+                        ),
+                    )
     return model
 
 
 async def save_upload_to_temp(file: UploadFile, fallback_name: str) -> str:
-    """把上传音频分块(1MB)流式写入临时文件,返回临时文件路径。
-
-    suffix 优先取原文件名后缀,否则回退 fallback_name 的后缀(供 Whisper 按扩展名识别格式)。
-    delete=False:临时文件不自动删除,由调用方在 finally 中 unlink。
-
-    :param file: FastAPI 上传文件对象
-    :param fallback_name: 原文件名缺失时用于取后缀的兜底文件名
-    :return: 写入完成的临时文件绝对路径
-    """
+    """把上传音频分块(1MB)流式写入临时文件,返回临时文件路径。delete=False,由调用方 unlink。"""
     suffix = Path(file.filename or fallback_name).suffix or Path(fallback_name).suffix
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
         while True:
@@ -192,49 +163,46 @@ async def save_upload_to_temp(file: UploadFile, fallback_name: str) -> str:
 
 @app.post("/transcribe")
 async def transcribe(file: UploadFile = File(...), word_timestamps: bool = True):
-    """转写入口:上传音频 → 落临时文件 → 卸载到线程池做阻塞推理 → 返回带词级时间戳的 segments。
+    """转写入口:上传音频 → 落临时文件 → 线程池阻塞推理 → 返回带词级时间戳的 segments。
 
-    用 run_in_threadpool 把 CPU/GPU 密集的阻塞推理移出事件循环,避免阻塞异步 I/O;
-    推理本身经 _model_infer_lock 串行化(同一全局模型不保证并发推理安全)。
-    所有段/词文本经 normalize_text 做简繁转换;无论成败 finally 必删临时文件。
+    响应结构与原 openai-whisper 版严格一致(后端 WhisperAsrClient 据此反序列化):
+    ``{"segments": [{start, end, text, words: [{word, start, end}]}]}``。
 
-    :param file: 后端抽取的 16k mono 音频
-    :param word_timestamps: 是否输出词级时间戳(默认 True,后端靠它做时间轴定位)
-    :return: ``{"segments": [{start, end, text, words: [{word, start, end}]}]}``
+    faster-whisper 的 transcribe 返回 (segments 生成器, info),迭代生成器才真正解码推理;
+    用 run_in_threadpool 卸载阻塞推理,_model_infer_lock 串行化。所有段/词文本经简繁转换。
     """
     temp_path = await save_upload_to_temp(file, "audio.wav")
     try:
         def _run_blocking_transcribe():
-            # 同一全局 Whisper 模型不保证并发推理安全(多任务并行时),加推理锁串行化。
             with _model_infer_lock:
-                return get_model().transcribe(
+                segments_gen, _info = get_model().transcribe(
                     temp_path,
                     task="transcribe",
+                    language=WHISPER_LANGUAGE,
                     initial_prompt=INITIAL_PROMPT,
-                    language=os.getenv("WHISPER_LANGUAGE") or None,
+                    beam_size=WHISPER_BEAM_SIZE if WHISPER_BEAM_SIZE > 0 else 1,
                     word_timestamps=word_timestamps,
-                    fp16=FP16,
-                    beam_size=WHISPER_BEAM_SIZE if WHISPER_BEAM_SIZE > 0 else None,
-                    verbose=False,
                 )
+                # segments 是惰性生成器,list() 触发真正的转写计算
+                return list(segments_gen)
 
-        result = await run_in_threadpool(_run_blocking_transcribe)
+        segments = await run_in_threadpool(_run_blocking_transcribe)
         output = []
-        for segment in result.get("segments", []):
+        for segment in segments:
             words = []
-            for word in segment.get("words") or []:
+            for word in (getattr(segment, "words", None) or []):
                 words.append(
                     {
-                        "word": normalize_text(word.get("word", "")),
-                        "start": float(word.get("start", segment.get("start", 0.0))),
-                        "end": float(word.get("end", segment.get("end", 0.0))),
+                        "word": normalize_text(word.word),
+                        "start": float(word.start if word.start is not None else segment.start),
+                        "end": float(word.end if word.end is not None else segment.end),
                     }
                 )
             output.append(
                 {
-                    "start": float(segment.get("start", 0.0)),
-                    "end": float(segment.get("end", 0.0)),
-                    "text": normalize_text(segment.get("text", "")),
+                    "start": float(segment.start),
+                    "end": float(segment.end),
+                    "text": normalize_text(segment.text),
                     "words": words,
                 }
             )
@@ -246,7 +214,7 @@ async def transcribe(file: UploadFile = File(...), word_timestamps: bool = True)
 if __name__ == "__main__":
     import uvicorn
 
-    # 直接 python app.py 启动时使用,默认端口需与后端 app.asr.base-url 一致(9000)。
+    # 直接 python app.py 启动,默认端口需与后端 app.asr.base-url 一致(9000)。
     # host/port 可用 ASR_HOST / ASR_PORT 覆盖。
     host = os.getenv("ASR_HOST", "127.0.0.1")
     port = int(os.getenv("ASR_PORT", "9000"))

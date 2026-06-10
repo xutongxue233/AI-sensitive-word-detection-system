@@ -1,8 +1,8 @@
-"""画面硬字幕 OCR 独立服务(PaddleOCR, 默认端口 9001)。
+"""画面硬字幕 OCR 独立服务(RapidOCR / onnxruntime, 默认端口 9001)。
 
-与 Whisper(ASR, 端口 9000)拆成两个进程:本进程只 import paddle(经 ocr_core),
-绝不加载 torch,从而避免 paddle 的 CUDA 12.9 与 torch 的 CUDA 13 运行时在同进程冲突,
-paddle 即可正常使用 GPU。后端 app.subtitle-ocr.base-url 应指向本服务。
+与 Whisper(ASR, 端口 9000)保持两进程拓扑。引擎为 rapidocr-onnxruntime:
+纯 CPU、wheel 自带 PP-OCRv4 中英文模型,不依赖 paddle/torch/CUDA,适配核显机器。
+后端 app.subtitle-ocr.base-url 应指向本服务。
 """
 
 import os

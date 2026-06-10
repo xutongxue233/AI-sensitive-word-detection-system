@@ -1,19 +1,17 @@
-"""画面硬字幕 OCR 核心逻辑(PaddleOCR)。
+"""画面硬字幕 OCR 核心逻辑(RapidOCR / onnxruntime,纯 CPU 轻量版)。
 
-由独立的 ocr_app.py 进程加载(默认端口 9001),跑在 ocr-service 专用 venv(.venv:paddlepaddle-gpu + paddleocr,
-不含 torch)。独立隔离的原因:torch(CUDA 13)与 paddlepaddle-gpu(CUDA 12)的同名 cuDNN 无法在同一
-进程共存(WinError 127),而 paddleocr 在检测到 torch 时会拉起它。专用 venv 不装 torch,paddleocr
-自动降级为纯 paddle,OCR 即可正常用 GPU,并与 Whisper(asr 服务的 torch GPU)进程隔离、互不干扰。
+由独立的 ocr_app.py 进程加载(默认端口 9001),跑在 ocr-service 专用 venv。引擎为
+rapidocr-onnxruntime:ONNXRuntime CPU 推理 + wheel 自带的 PP-OCRv4 中英文检测/识别模型
+(约十几 MB,随包分发、离线可用),不依赖 paddlepaddle/torch/CUDA,适配只有核显的机器,
+识别质量与 PP-OCR 同源。
+
+模块内 PADDLE_OCR_* 环境变量名与 probe_paddle_gpu 等公开名沿自早期 PaddleOCR 实现;
+为保持 ocr_app.py 的 /health 字段与既有部署配置兼容,这些名称全部保留、语义对应适配。
 """
 
 import os
 import re
-import shutil
-import subprocess
-import tempfile
 import threading
-import warnings
-import logging
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -39,9 +37,11 @@ def env_int(name: str, default: int) -> int:
 
 PADDLE_OCR_LANG = os.getenv("PADDLE_OCR_LANG", "ch")
 PADDLE_OCR_VERSION = os.getenv("PADDLE_OCR_VERSION", "PP-OCRv4")
+# 可选:指定自定义 onnx 检测/识别模型路径(默认用 RapidOCR 自带的 PP-OCRv4 模型)。
 PADDLE_OCR_DET_MODEL = os.getenv("PADDLE_OCR_DET_MODEL")
 PADDLE_OCR_REC_MODEL = os.getenv("PADDLE_OCR_REC_MODEL")
-PADDLE_OCR_USE_GPU = env_bool("PADDLE_OCR_USE_GPU", True)
+# RapidOCR 走 onnxruntime CPU 推理,无 GPU 路径;保留变量仅为 /health 与既有配置兼容。
+PADDLE_OCR_USE_GPU = env_bool("PADDLE_OCR_USE_GPU", False)
 PADDLE_OCR_ENABLE_MKLDNN = env_bool("PADDLE_OCR_ENABLE_MKLDNN", False)
 PADDLE_OCR_SHOW_STARTUP_LOGS = env_bool("PADDLE_OCR_SHOW_STARTUP_LOGS", False)
 PADDLE_OCR_MIN_TEXT_LENGTH = max(1, env_int("PADDLE_OCR_MIN_TEXT_LENGTH", 2))
@@ -49,23 +49,6 @@ PADDLE_OCR_DROP_SHORT_LATIN = env_bool("PADDLE_OCR_DROP_SHORT_LATIN", True)
 PADDLE_OCR_MIN_REPEAT_FRAMES = max(1, env_int("PADDLE_OCR_MIN_REPEAT_FRAMES", 2))
 CHINESE_CONVERTER = os.getenv("WHISPER_CHINESE_CONVERTER", "t2s")
 FFMPEG_BIN_DIR = os.getenv("FFMPEG_BIN_DIR")
-
-if not PADDLE_OCR_SHOW_STARTUP_LOGS:
-    # Paddle 初始化时会探测 ccache 并调用 Windows `where ccache`;未安装时会打印本地化 stderr
-    # (PyCharm 下常显示为乱码),随后再发出 UserWarning。这只是编译缓存缺失提示,不影响 OCR 推理。
-    warnings.filterwarnings(
-        "ignore",
-        message=r"No ccache found\..*",
-        category=UserWarning,
-        module=r"paddle\.utils\.cpp_extension\.extension_utils",
-    )
-    # 降低 Paddle C++/glog 启动噪声,如 GPU Compute Capability 提示。需要底层排查时可打开上方开关。
-    os.environ.setdefault("GLOG_minloglevel", "2")
-    os.environ.setdefault("FLAGS_minloglevel", "2")
-
-if not PADDLE_OCR_ENABLE_MKLDNN:
-    os.environ.setdefault("FLAGS_use_mkldnn", "0")
-    os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "0")
 
 if FFMPEG_BIN_DIR:
     os.environ["PATH"] = FFMPEG_BIN_DIR + os.pathsep + os.environ.get("PATH", "")
@@ -77,25 +60,25 @@ else:
 converter = OpenCC(CHINESE_CONVERTER) if CHINESE_CONVERTER else None
 ocr_reader = None
 ocr_reader_lang = None
-# 初始化锁:保护全局 PaddleOCR 预测器的懒加载(double-checked locking)。
+# 初始化锁:保护全局 RapidOCR 引擎的懒加载(double-checked locking)。
 _ocr_lock = threading.Lock()
-# 推理锁:同一个全局 PaddleOCR 预测器不保证并发推理安全(多任务并行时),故串行化。
+# 推理锁:同一个全局 OCR 引擎不保证并发推理安全(多任务并行时),故串行化。
 _ocr_infer_lock = threading.Lock()
 
 
 def probe_paddle_gpu() -> dict:
-    # OCR 进程只关心 paddle 的 CUDA 状态;本进程不加载 torch,避免两套 CUDA 运行时冲突。
-    info = {}
+    """返回 OCR 推理引擎自检信息,供 /health 暴露。
+
+    函数名沿用 paddle 时代(ocr_app.py 引用),内容已改为 onnxruntime 探测;
+    后端不解析此字段,仅供人工排查。任何探测异常都不抛出,记入 engineError。
+    """
+    info = {"engine": "rapidocr-onnxruntime"}
     try:
-        import paddle
-        info["paddleVersion"] = paddle.__version__
-        info["paddleCompiledWithCuda"] = bool(paddle.is_compiled_with_cuda())
-        try:
-            info["paddleGpuCount"] = paddle.device.cuda.device_count()
-        except Exception:
-            info["paddleGpuCount"] = None
+        import onnxruntime
+        info["onnxruntimeVersion"] = onnxruntime.__version__
+        info["providers"] = list(onnxruntime.get_available_providers())
     except Exception as exc:
-        info["paddleError"] = f"{type(exc).__name__}: {exc}"
+        info["engineError"] = f"{type(exc).__name__}: {exc}"
     return info
 
 
@@ -104,7 +87,7 @@ def ocr_model_loaded() -> bool:
 
 
 def run_ocr_on_video(video_path: str, interval_seconds: float, crop_bottom_ratio: float, min_confidence: float, lang: str):
-    # 对外入口:加推理锁串行化,懒加载预测器后识别整段视频底部字幕。
+    # 对外入口:加推理锁串行化,懒加载引擎后识别整段视频底部字幕。
     with _ocr_infer_lock:
         return recognize_video_subtitles(
             video_path,
@@ -121,15 +104,15 @@ def normalize_text(text: str) -> str:
 
 
 def get_ocr_reader(lang: str):
-    """按 cache_key 缓存并返回单例 PaddleOCR 预测器(懒加载)。
+    """按 cache_key 缓存并返回单例 RapidOCR 引擎(懒加载)。
 
-    cache_key 由 语言 + OCR 版本 + det/rec 模型名 组合而成:任一变化都视为不同模型、需重建,
-    否则复用已加载实例(初始化代价高)。用双检锁(_ocr_lock)防止并发首次加载时重复初始化。
-    首次构建失败时,先清理可能的半下载模型缓存再重试一次;仍失败则抛 503,提示检查网络或手动
-    删除模型目录。
+    cache_key 由 语言 + OCR 版本 + det/rec 模型路径组合而成:任一变化都视为不同模型、需重建,
+    否则复用已加载实例(初始化有成本)。RapidOCR 自带中英文模型、离线可用,lang 不再驱动模型
+    下载、仅参与缓存键(后端调用本就不传 lang)。用双检锁(_ocr_lock)防止并发首次加载时重复
+    初始化;依赖缺失或初始化失败抛 503。
 
     :param lang: OCR 语言;为空时回退到环境配置 PADDLE_OCR_LANG,再回退到 "ch"。
-    :return: 可复用的 PaddleOCR 预测器实例。
+    :return: 可复用的 RapidOCR 引擎实例。
     """
     global ocr_reader, ocr_reader_lang
     selected_lang = (lang or PADDLE_OCR_LANG or "ch").strip()
@@ -143,130 +126,27 @@ def get_ocr_reader(lang: str):
         with _ocr_lock:
             if ocr_reader is None or ocr_reader_lang != cache_key:
                 try:
-                    PaddleOCR = import_paddle_ocr()
+                    from rapidocr_onnxruntime import RapidOCR
                 except Exception as exc:
                     raise HTTPException(
                         status_code=503,
-                        detail=f"PaddleOCR 依赖未安装或不可用，请安装 asr-service/requirements.txt: {exc}",
+                        detail=f"RapidOCR 依赖未安装或不可用，请安装 ocr-service/requirements.txt: {exc}",
                     ) from exc
-                cleanup_incomplete_paddlex_models()
+                kwargs = {}
+                if PADDLE_OCR_DET_MODEL:
+                    kwargs["det_model_path"] = PADDLE_OCR_DET_MODEL
+                if PADDLE_OCR_REC_MODEL:
+                    kwargs["rec_model_path"] = PADDLE_OCR_REC_MODEL
                 try:
-                    reader = create_paddle_ocr(PaddleOCR, selected_lang)
+                    reader = RapidOCR(**kwargs)
                 except Exception as exc:
-                    cleanup_incomplete_paddlex_models()
-                    try:
-                        reader = create_paddle_ocr(PaddleOCR, selected_lang)
-                    except Exception as retry_exc:
-                        raise HTTPException(
-                            status_code=503,
-                            detail=(
-                                "PaddleOCR 模型初始化失败。系统已尝试清理不完整模型缓存；"
-                                f"请确认网络可下载模型，或手动删除 {Path.home() / '.paddlex' / 'official_models'} 后重试。"
-                                f"原始错误: {retry_exc or exc}"
-                            ),
-                        ) from retry_exc
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"RapidOCR 引擎初始化失败: {exc}",
+                    ) from exc
                 ocr_reader = reader
                 ocr_reader_lang = cache_key
     return ocr_reader
-
-
-def import_paddle_ocr():
-    """导入 PaddleOCR。
-
-    Paddle 在导入链中会探测 ccache。Windows 未安装 ccache 时,`where ccache` 会向 stderr
-    打印一行本地化文本,在 PyCharm UTF-8 控制台里常显示为乱码。默认拦截这一次探测调用,
-    让它安静地走"未安装 ccache"分支;功能不受影响。
-    """
-    if PADDLE_OCR_SHOW_STARTUP_LOGS:
-        from paddleocr import PaddleOCR
-        return PaddleOCR
-
-    original_check_output = subprocess.check_output
-
-    def quiet_check_output(cmd, *args, **kwargs):
-        if (
-            isinstance(cmd, (list, tuple))
-            and len(cmd) >= 2
-            and str(cmd[0]).lower() in {"where", "which"}
-            and str(cmd[1]).lower() == "ccache"
-        ):
-            raise subprocess.CalledProcessError(1, cmd)
-        return original_check_output(cmd, *args, **kwargs)
-
-    subprocess.check_output = quiet_check_output
-    try:
-        from paddleocr import PaddleOCR
-        logging.getLogger("paddlex").setLevel(logging.WARNING)
-        return PaddleOCR
-    finally:
-        subprocess.check_output = original_check_output
-
-
-def create_paddle_ocr(paddle_ocr_cls, lang: str):
-    """构造 PaddleOCR 预测器,按版本 API 形态逐级回退。
-
-    优先尝试 PaddleOCR 3.x 新 API(用 device 控制 GPU/CPU);参数不被接受时回退 2.x 旧 API
-    (use_gpu)。先试新 API 可避免在 3.x 上先用 use_gpu 触发 ValueError 后留下 paddle 半初始化
-    状态。两套 API 都不接受参数时,最后退回仅传 lang 的最简兜底构造,保证总能拿到一个可用实例。
-
-    :param paddle_ocr_cls: 运行时 import 进来的 PaddleOCR 类(由调用方传入,避免顶部硬 import)。
-    :param lang: OCR 语言。
-    :return: 构造好的 PaddleOCR 实例。
-    """
-    # 优先 PaddleOCR 3.x 新 API(device 控制 GPU/CPU);参数不被接受时回退 2.x 旧 API(use_gpu)。
-    # 先试新 API 可避免在 3.x 上先用 use_gpu 触发 ValueError 后留下 paddle 半初始化状态。
-    kwargs = {
-        "lang": lang,
-        "use_doc_orientation_classify": False,
-        "use_doc_unwarping": False,
-        "use_textline_orientation": False,
-        "device": "gpu" if PADDLE_OCR_USE_GPU else "cpu",
-    }
-    # 默认 PP-OCRv4(与 CPU 时一致);非空才传 ocr_version,显式设为空则用 PaddleOCR 3.x 默认 PP-OCRv5
-    if PADDLE_OCR_VERSION:
-        kwargs["ocr_version"] = PADDLE_OCR_VERSION
-    if PADDLE_OCR_DET_MODEL:
-        kwargs["text_detection_model_name"] = PADDLE_OCR_DET_MODEL
-    if PADDLE_OCR_REC_MODEL:
-        kwargs["text_recognition_model_name"] = PADDLE_OCR_REC_MODEL
-    try:
-        return paddle_ocr_cls(**kwargs)
-    except (TypeError, ValueError):
-        pass
-
-    # 回退 PaddleOCR 2.x 旧 API(use_gpu)
-    try:
-        return paddle_ocr_cls(
-            use_angle_cls=True,
-            lang=lang,
-            use_gpu=PADDLE_OCR_USE_GPU,
-            enable_mkldnn=PADDLE_OCR_ENABLE_MKLDNN,
-            show_log=False,
-            ocr_version=PADDLE_OCR_VERSION,
-        )
-    except (TypeError, ValueError):
-        # 最简兜底:连旧 API 的多参数也不被接受时,退回仅传 lang 的最小构造,确保拿到可用实例。
-        return paddle_ocr_cls(lang=lang)
-
-
-def cleanup_incomplete_paddlex_models():
-    """删除"下载中断的半成品"模型目录,避免反复加载失败。
-
-    判定不完整的依据:目录里有模型配置(inference.json/yml)、且存在 HuggingFace 下载的半成品
-    元数据(.cache/.../inference.pdiparams.metadata),但缺最终权重文件(inference.pdiparams)——
-    即权重还没下载完。这类残缺目录会让 PaddleOCR 初始化时一直失败,删除后由后续重试重新下载。
-    """
-    model_root = Path.home() / ".paddlex" / "official_models"
-    if not model_root.exists():
-        return
-    for model_dir in model_root.iterdir():
-        if not model_dir.is_dir():
-            continue
-        has_model_config = (model_dir / "inference.json").exists() or (model_dir / "inference.yml").exists()
-        has_weights = (model_dir / "inference.pdiparams").exists()
-        has_partial_weights = (model_dir / ".cache" / "huggingface" / "download" / "inference.pdiparams.metadata").exists()
-        if has_model_config and has_partial_weights and not has_weights:
-            shutil.rmtree(model_dir, ignore_errors=True)
 
 
 def recognize_video_subtitles(
@@ -284,7 +164,7 @@ def recognize_video_subtitles(
     擦除时的"开头漏擦"与"前后各露出 0.几秒"闪烁。
 
     :param video_path: 本地视频文件路径。
-    :param reader: 已加载的 PaddleOCR 预测器。
+    :param reader: 已加载的 OCR 引擎。
     :param interval_seconds: 采样间隔(秒)。
     :param crop_bottom_ratio: 只识别画面底部多大比例的区域(0~1)。
     :param min_confidence: 文本置信度过滤阈值。
@@ -392,7 +272,7 @@ def read_subtitle_blocks(reader, frame, crop_bottom_ratio: float, min_confidence
         crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
     try:
-        raw_results = run_paddle_ocr(reader, crop, cv2)
+        raw_results = run_rapid_ocr(reader, crop)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"字幕 OCR 识别失败: {exc}") from exc
 
@@ -405,52 +285,34 @@ def read_subtitle_blocks(reader, frame, crop_bottom_ratio: float, min_confidence
     return blocks
 
 
-def run_paddle_ocr(reader, crop, cv2) -> list[tuple[list, str, float]]:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as image_file:
-        image_path = image_file.name
-    try:
-        cv2.imwrite(image_path, crop)
-        if hasattr(reader, "predict"):
-            try:
-                return parse_paddle_v3_results(reader.predict(input=image_path))
-            except TypeError:
-                return parse_paddle_v3_results(reader.predict(image_path))
-        return parse_paddle_v2_results(reader.ocr(image_path, cls=True))
-    finally:
-        Path(image_path).unlink(missing_ok=True)
+def run_rapid_ocr(reader, crop) -> list[tuple[list, str, float]]:
+    """执行一次 RapidOCR 推理,把结果归一为 (bbox 点列表, 文本, 置信度) 三元组列表。
 
-
-def parse_paddle_v2_results(results) -> list[tuple[list, str, float]]:
-    """解析 PaddleOCR 2.x 的嵌套返回结构,统一归一为 (bbox, text, score)。
-
-    2.x 的 ocr() 返回形如 [page][line] 的嵌套列表,每行 line = [bbox, (text, score)]。
-    逐层防御性跳过空页/残缺行,只保留结构完整的识别项。
-
-    :param results: PaddleOCR 2.x reader.ocr(...) 的原始返回。
-    :return: (bbox 点列表, 文本, 置信度) 三元组列表。
+    直接喂 BGR numpy 帧(无需落临时图片)。兼容两代返回形态:
+    rapidocr_onnxruntime 1.x 返回 (result, elapse) 元组,result 为 [box, text, score] 列表;
+    新版 rapidocr 返回带 boxes/txts/scores 属性的结果对象。统一适配,屏蔽版本差异。
     """
+    output = reader(crop)
+    if isinstance(output, tuple):
+        output = output[0]
+    if output is None:
+        return []
+    boxes = getattr(output, "boxes", None)
+    if boxes is not None:
+        txts = list(getattr(output, "txts", None) or [])
+        scores = list(getattr(output, "scores", None) or [])
+        items = []
+        for index, text in enumerate(txts):
+            box = boxes[index] if index < len(boxes) else None
+            score = scores[index] if index < len(scores) else 1.0
+            items.append((_to_point_list(box), str(text), float(score or 0)))
+        return items
     items = []
-    for page in results or []:
-        if not page:
+    for line in output:
+        if line is None or len(line) < 3:
             continue
-        for line in page:
-            if not line or len(line) < 2:
-                continue
-            bbox = line[0]
-            text_score = line[1]
-            if not text_score or len(text_score) < 2:
-                continue
-            items.append((bbox, str(text_score[0]), float(text_score[1] or 0)))
+        items.append((_to_point_list(line[0]), str(line[1]), float(line[2] or 0)))
     return items
-
-
-def _pick_field(payload, *keys):
-    # 返回第一个非空字段并转为 list;避免对 numpy 数组用 `or`(真值歧义会抛 ValueError)。
-    for key in keys:
-        value = payload.get(key)
-        if value is not None and len(value) > 0:
-            return list(value)
-    return []
 
 
 def _to_point_list(box) -> list:
@@ -467,46 +329,6 @@ def _to_point_list(box) -> list:
         x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
         return [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
     return []
-
-
-def parse_paddle_v3_results(results) -> list[tuple[list, str, float]]:
-    """解析 PaddleOCR 3.x 的 dict 返回结构,统一归一为 (bbox, text, score)。
-
-    3.x 的 predict() 返回结果对象,转 dict 后文本/置信度/坐标分别是平行列表(rec_texts、
-    rec_scores、rec_polys 等,不同版本字段名有别,故用 _pick_field 取首个非空)。按下标对齐三者
-    组装成与 2.x 一致的三元组,屏蔽两版差异供上层统一处理。
-
-    :param results: PaddleOCR 3.x reader.predict(...) 的原始返回(可迭代)。
-    :return: (bbox 点列表, 文本, 置信度) 三元组列表。
-    """
-    items = []
-    for result in results or []:
-        data = paddle_result_to_dict(result)
-        payload = data.get("res", data) if isinstance(data, dict) else {}
-        texts = _pick_field(payload, "rec_texts", "texts")
-        scores = _pick_field(payload, "rec_scores", "scores")
-        boxes = _pick_field(payload, "rec_polys", "dt_polys", "rec_boxes", "boxes")
-        for index, text in enumerate(texts):
-            score = scores[index] if index < len(scores) else 1.0
-            box = _to_point_list(boxes[index] if index < len(boxes) else None)
-            items.append((box, str(text), float(score or 0)))
-    return items
-
-
-def paddle_result_to_dict(result) -> dict:
-    if isinstance(result, dict):
-        return result
-    value = getattr(result, "json", None)
-    if callable(value):
-        value = value()
-    if isinstance(value, dict):
-        return value
-    to_dict = getattr(result, "to_dict", None)
-    if callable(to_dict):
-        value = to_dict()
-        if isinstance(value, dict):
-            return value
-    return {}
 
 
 def bbox_position(bbox) -> tuple[float, float]:
@@ -567,7 +389,7 @@ def significant_text(text: str) -> str:
 
 
 def contains_cjk(text: str) -> bool:
-    return any("\u4e00" <= ch <= "\u9fff" for ch in text or "")
+    return any("一" <= ch <= "鿿" for ch in text or "")
 
 
 def is_ascii_letters(value: str) -> bool:
