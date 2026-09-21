@@ -15,11 +15,13 @@ import org.mockito.ArgumentCaptor;
 import org.springframework.transaction.TransactionStatus;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.*;
 
 class AiReviewServiceTest {
@@ -127,5 +129,57 @@ class AiReviewServiceTest {
         verify(moderationClient, never()).review(any());
         assertThat(hit.getReviewStatus()).isEqualTo(ReviewStatus.VIOLATION);
         assertThat(hit.getAiConfidence()).isEqualTo(0.70);
+    }
+
+    @Test
+    void multipleHitsGoThroughBatchReviewWithoutSingleCalls() {
+        TermHit first = hit();
+        TermHit second = hit();
+        second.setId(101L);
+        when(hitRepository.findByJobIdOrderByStartTimeAsc(1L)).thenReturn(List.of(first, second));
+        when(moderationClient.reviewBatch(anyList())).thenReturn(Arrays.asList(
+                new AiDecision(true, 0.9, "广告极限词", "命中", "raw"),
+                new AiDecision(false, 0.8, "广告极限词", "同形异义", "raw")));
+
+        service(0.6).reviewJob(1L);
+
+        verify(moderationClient, never()).review(any());
+        assertThat(first.getReviewStatus()).isEqualTo(ReviewStatus.VIOLATION);
+        assertThat(second.getReviewStatus()).isEqualTo(ReviewStatus.SAFE);
+    }
+
+    @Test
+    void missingBatchDecisionFallsBackToSingleReview() {
+        TermHit first = hit();
+        TermHit second = hit();
+        second.setId(101L);
+        when(hitRepository.findByJobIdOrderByStartTimeAsc(1L)).thenReturn(List.of(first, second));
+        when(moderationClient.reviewBatch(anyList())).thenReturn(Arrays.asList(
+                new AiDecision(true, 0.9, "广告极限词", "命中", "raw"),
+                null));
+        when(moderationClient.review(second)).thenReturn(new AiDecision(false, 0.7, "广告极限词", "未命中", "raw"));
+
+        service(0.6).reviewJob(1L);
+
+        verify(moderationClient).review(second);
+        verify(moderationClient, never()).review(first);
+        assertThat(first.getReviewStatus()).isEqualTo(ReviewStatus.VIOLATION);
+        assertThat(second.getReviewStatus()).isEqualTo(ReviewStatus.SAFE);
+    }
+
+    @Test
+    void batchFailureFallsBackToSingleReviewForWholeBatch() {
+        TermHit first = hit();
+        TermHit second = hit();
+        second.setId(101L);
+        when(hitRepository.findByJobIdOrderByStartTimeAsc(1L)).thenReturn(List.of(first, second));
+        when(moderationClient.reviewBatch(anyList())).thenThrow(new RuntimeException("boom"));
+        when(moderationClient.review(first)).thenReturn(new AiDecision(true, 0.9, "广告极限词", "命中", "raw"));
+        when(moderationClient.review(second)).thenReturn(new AiDecision(false, 0.7, "广告极限词", "未命中", "raw"));
+
+        service(0.6).reviewJob(1L);
+
+        assertThat(first.getReviewStatus()).isEqualTo(ReviewStatus.VIOLATION);
+        assertThat(second.getReviewStatus()).isEqualTo(ReviewStatus.SAFE);
     }
 }

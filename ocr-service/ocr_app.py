@@ -1,8 +1,8 @@
 """画面硬字幕 OCR 独立服务(RapidOCR / onnxruntime, 默认端口 9001)。
 
 与 Whisper(ASR, 端口 9000)保持两进程拓扑。引擎为 rapidocr-onnxruntime:
-纯 CPU、wheel 自带 PP-OCRv4 中英文模型,不依赖 paddle/torch/CUDA,适配核显机器。
-后端 app.subtitle-ocr.base-url 应指向本服务。
+wheel 自带 PP-OCRv4 中英文模型,不依赖 paddle/torch/CUDA;venv 装 onnxruntime-directml
+时自动用核显(DirectML)推理,否则纯 CPU。后端 app.subtitle-ocr.base-url 应指向本服务。
 """
 
 import os
@@ -34,9 +34,8 @@ async def root():
 async def health():
     """健康探针:供后端探活并据此在前端展示 OCR 服务状态。
 
-    返回 OCR 语言/版本、是否启用 GPU、模型是否已加载,以及对 paddle CUDA 的探测结果
-    (是否编译了 CUDA、可用 GPU 数等)。返回字段刻意只覆盖 paddle 一侧——本进程不加载
-    torch,故不探测 torch CUDA,以维持与 ASR 进程的 CUDA 运行时隔离。
+    返回 OCR 语言/版本、模型是否已加载,以及推理引擎自检(onnxruntime 版本、可用
+    provider、DirectML 是否可用/启用、抽帧硬解开关)。gpu 字段仅供人工排查,后端不解析。
     """
     return {
         "status": "ok",

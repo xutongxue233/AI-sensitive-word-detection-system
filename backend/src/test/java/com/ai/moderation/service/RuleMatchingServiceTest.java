@@ -96,6 +96,67 @@ class RuleMatchingServiceTest {
         assertThat(hits).isEmpty();
     }
 
+    @Test
+    void overlappingDifferentTermsAreKeptForIndependentReview() {
+        DetectionJob job = job();
+        TranscriptSegment segment = segment("这个才几十块钱", 0, 4);
+
+        when(termRepository.findByEnabledTrueOrderByUpdatedAtDesc()).thenReturn(List.of(
+                term(40L, "几十块", MatchType.EXACT),
+                term(41L, "几十", MatchType.EXACT)));
+        when(segmentRepository.findByJobIdOrderBySequenceNoAsc(job.getId())).thenReturn(List.of(segment));
+        when(wordRepository.findBySegmentIdOrderBySequenceNoAsc(segment.getId())).thenReturn(List.of(
+                word(0, "这", 0.0, 0.5),
+                word(1, "个", 0.5, 1.0),
+                word(2, "才", 1.0, 1.5),
+                word(3, "几", 1.5, 2.0),
+                word(4, "十", 2.0, 2.5),
+                word(5, "块", 2.5, 3.0),
+                word(6, "钱", 3.0, 3.5)
+        ));
+
+        List<TermHit> hits = matchingService.matchJob(job);
+
+        assertThat(hits).hasSize(2);
+        assertThat(hits).extracting(TermHit::getMatchedText).containsExactlyInAnyOrder("几十块", "几十");
+        assertThat(hits).extracting(TermHit::getTermId).containsExactlyInAnyOrder(40L, 41L);
+    }
+
+    @Test
+    void repeatedSameTermMatchesInOneTokenAreNotMergedBySharedTimestamp() {
+        DetectionJob job = job();
+        TranscriptSegment segment = segment("几十块几十块", 0, 4);
+        ViolationTerm term = term(40L, "几十块", MatchType.EXACT);
+
+        when(termRepository.findByEnabledTrueOrderByUpdatedAtDesc()).thenReturn(List.of(term));
+        when(segmentRepository.findByJobIdOrderBySequenceNoAsc(job.getId())).thenReturn(List.of(segment));
+        // 整段作为一个词元时两个字符命中会共享同一时间戳；字符偏移仍能区分它们。
+        when(wordRepository.findBySegmentIdOrderBySequenceNoAsc(segment.getId())).thenReturn(List.of(
+                word(0, "几十块几十块", 1.0, 2.0)
+        ));
+
+        List<TermHit> hits = matchingService.matchJob(job);
+
+        assertThat(hits).hasSize(2);
+        assertThat(hits).allMatch(hit -> hit.getStartTime() == 1.0 && hit.getEndTime() == 2.0);
+    }
+
+    @Test
+    void overlappingPricePatternsKeepOnlyMostSpecificHit() {
+        DetectionJob job = job();
+        TranscriptSegment segment = segment("这个才几十块钱", 0, 4);
+        ViolationTerm term = term("价格", MatchType.SEMANTIC);
+
+        when(termRepository.findByEnabledTrueOrderByUpdatedAtDesc()).thenReturn(List.of(term));
+        when(segmentRepository.findByJobIdOrderBySequenceNoAsc(job.getId())).thenReturn(List.of(segment));
+        when(wordRepository.findBySegmentIdOrderBySequenceNoAsc(segment.getId())).thenReturn(List.of());
+
+        List<TermHit> hits = matchingService.matchJob(job);
+
+        assertThat(hits).hasSize(1);
+        assertThat(hits.getFirst().getMatchedText()).isEqualTo("几十块钱");
+    }
+
     private DetectionJob job() {
         DetectionJob job = new DetectionJob();
         job.setId(10L);
@@ -128,8 +189,12 @@ class RuleMatchingServiceTest {
     }
 
     private ViolationTerm term(String value, MatchType matchType) {
+        return term(40L, value, matchType);
+    }
+
+    private ViolationTerm term(long id, String value, MatchType matchType) {
         ViolationTerm term = new ViolationTerm();
-        term.setId(40L);
+        term.setId(id);
         term.setTerm(value);
         term.setCategory(value);
         term.setSeverity(Severity.HIGH);

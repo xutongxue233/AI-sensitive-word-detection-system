@@ -29,6 +29,8 @@ import org.springframework.web.client.RestClientResponseException;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -48,6 +50,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class AiModerationClient {
     private static final Logger log = LoggerFactory.getLogger(AiModerationClient.class);
     private static final String SCHEMA_NAME = "moderation_decision";
+    private static final String BATCH_SCHEMA_NAME = "moderation_batch_decision";
     private static final String EXTRACTION_SCHEMA_NAME = "moderation_extraction";
     private static final String TERM_GENERATION_SCHEMA_NAME = "term_generation";
 
@@ -74,6 +77,20 @@ public class AiModerationClient {
         JsonNode response = callWithFallback(client, config, type, systemPrompt, userPrompt,
                 decisionSchema(), SCHEMA_NAME);
         return parseDecision(response, type, hit.getCategory());
+    }
+
+    /**
+     * 批量复核:把一批候选合并为一次调用,decisions 按候选下标 index 对齐返回。
+     * 判定口径与单条 {@link #review} 完全一致,仅省掉每条重复的指令开销。
+     * 模型遗漏的下标在返回列表中为 null,由调用方对该候选回退单条复核。
+     */
+    public List<AiDecision> reviewBatch(List<TermHit> hits) {
+        AiProperties config = settingsService.currentAi();
+        RestClient client = buildClient(config);
+        ApiType type = config.apiType();
+        JsonNode response = callWithFallback(client, config, type, batchReviewSystemPrompt(),
+                batchReviewUserPrompt(hits), batchDecisionSchema(), BATCH_SCHEMA_NAME);
+        return parseBatchDecisions(response, type, hits);
     }
 
     /**
@@ -536,6 +553,33 @@ public class AiModerationClient {
         return schema;
     }
 
+    private static Map<String, Object> batchDecisionSchema() {
+        Map<String, Object> itemProperties = new LinkedHashMap<>();
+        itemProperties.put("index", Map.of("type", "integer"));
+        itemProperties.put("violation", Map.of("type", "boolean"));
+        itemProperties.put("confidence", Map.of("type", "number"));
+        itemProperties.put("category", Map.of("type", "string"));
+        itemProperties.put("reason", Map.of("type", "string"));
+        Map<String, Object> itemSchema = new LinkedHashMap<>();
+        itemSchema.put("type", "object");
+        itemSchema.put("properties", itemProperties);
+        itemSchema.put("required", List.of("index", "violation", "confidence", "category", "reason"));
+        itemSchema.put("additionalProperties", false);
+
+        Map<String, Object> decisionsArray = new LinkedHashMap<>();
+        decisionsArray.put("type", "array");
+        decisionsArray.put("items", itemSchema);
+
+        Map<String, Object> properties = new LinkedHashMap<>();
+        properties.put("decisions", decisionsArray);
+        Map<String, Object> schema = new LinkedHashMap<>();
+        schema.put("type", "object");
+        schema.put("properties", properties);
+        schema.put("required", List.of("decisions"));
+        schema.put("additionalProperties", false);
+        return schema;
+    }
+
     private String systemPrompt() {
         return """
                 你是敏感词命中复核助手。系统已用规则从文案中召回了候选词，你唯一的任务是判断这个候选词在给定上下文中\
@@ -575,6 +619,98 @@ public class AiModerationClient {
         );
     }
 
+    private String batchReviewSystemPrompt() {
+        return """
+                你是敏感词命中复核助手。系统已用规则从文案中召回了一批候选词，你唯一的任务是逐条判断每个候选词\
+                在其上下文中是否真实命中了用户的敏感词库——即它是否确实就是这个敏感词，或确实属于这个敏感分类。
+                这是“是否命中敏感词”的判断，不是“是否合法合规、是否构成违规”的判断。只要候选在上下文中确实是该敏感词\
+                或属于该敏感分类，就一律算命中（violation=true），不要管它在现实中是否合法、是否属于正常营销、是否构成\
+                虚假或误导——这类合规性结论一概不要做，也不要据此放过命中。
+                仅在以下两种情况判为未命中（violation=false）：一是同形异义或子串误切，即候选指代的事物与该敏感词\
+                完全无关（例如敏感词“上火”却出现在“上火车”中）；二是 SEMANTIC 分类候选在上下文中明显不属于该分类。
+                每个候选相互独立判定。必须对每个候选输出一条结论，index 取该候选的编号，不要遗漏、合并或新增。
+                必须只返回一个 JSON 对象 {"decisions":[...]}，不要输出任何解释文字、Markdown 代码块或多余字符。""";
+    }
+
+    private String batchReviewUserPrompt(List<TermHit> hits) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("""
+                逐条判断下面每个候选词在其上下文中是否命中敏感词库。
+                命中标准是“它是否就是该敏感词 / 是否属于该敏感分类”，不是“是否违法违规”。\
+                不要以“属于正常营销、价格合理、未表明虚假或误导、不构成违规”等合规理由判为未命中。
+                若匹配方式是 SEMANTIC：候选词只是分类候选，请判断该上下文是否属于该分类\
+                （例如分类为“价格”时，出现“0.01元”“九块九”等任何价格表达即属于命中）。
+                若匹配方式是 EXACT / VARIANT / REGEX：候选词已字面出现，除非属于同形异义或子串误切，否则即为命中。
+
+                候选列表:
+                """);
+        for (int i = 0; i < hits.size(); i++) {
+            TermHit hit = hits.get(i);
+            sb.append("[#").append(i).append("] 候选词：").append(nullToEmpty(hit.getMatchedText()))
+                    .append(" | 分类：").append(nullToEmpty(hit.getCategory()))
+                    .append(" | 严重级别：").append(hit.getSeverity())
+                    .append(" | 匹配方式：").append(hit.getRuleSource())
+                    .append(" | 上下文：").append(nullToEmpty(hit.getContextText()))
+                    .append('\n');
+        }
+        sb.append("""
+
+                对每个候选输出一条结论,严格只返回一个 JSON 对象:
+                {"decisions":[{"index":候选编号,"violation":true|false,"confidence":0到1的小数,"category":"分类","reason":"一句中文原因"}]}
+                其中 violation 表示是否命中敏感词库（命中为 true）；confidence 是你对该判断的真实置信度，不要恒定输出同一个值；\
+                reason 只描述命中关系，不要给出合规或违法结论。decisions 必须覆盖全部候选编号。""");
+        return sb.toString();
+    }
+
+    /**
+     * 纯函数:从 AI 原始响应中抽取 decisions 数组并按 index 对齐为与 hits 等长的列表,便于单元测试。
+     * 模型遗漏/越界/重复的 index 对应位置为 null,category 缺省回退该候选自身分类。
+     */
+    public List<AiDecision> parseBatchDecisions(JsonNode root, ApiType type, List<TermHit> hits) {
+        String content = type == ApiType.RESPONSES ? extractResponsesContent(root) : extractChatContent(root);
+        JsonNode decisionsNode = extractArrayField(content, "decisions", "AI 批量复核");
+        List<AiDecision> decisions = new ArrayList<>(Collections.nCopies(hits.size(), (AiDecision) null));
+        if (decisionsNode == null) {
+            return decisions;
+        }
+        Set<Integer> seenIndexes = new HashSet<>();
+        Set<Integer> duplicateIndexes = new HashSet<>();
+        for (JsonNode item : decisionsNode) {
+            if (!item.isObject()) {
+                continue;
+            }
+            // Jackson 的 asInt 会把 1.9 截断为 1；批量结果一旦错位，后续结论会关联到错误候选。
+            // 这里只接受 JSON 整数且能安全转换为 Java int 的 index。
+            JsonNode indexNode = item.get("index");
+            if (indexNode == null || !indexNode.isIntegralNumber() || !indexNode.canConvertToInt()) {
+                continue;
+            }
+            int index = indexNode.intValue();
+            if (index < 0 || index >= hits.size()) {
+                continue;
+            }
+            // 重复编号意味着模型输出不确定：即使第一条看起来有效，也不能任选其一。
+            // 将该位置置空，交调用方回退到单条复核；后续再次出现也保持无效。
+            if (!seenIndexes.add(index) || duplicateIndexes.contains(index)) {
+                duplicateIndexes.add(index);
+                decisions.set(index, null);
+                continue;
+            }
+            String fallbackCategory = hits.get(index).getCategory();
+            boolean violation = item.path("violation").asBoolean(true);
+            double confidence = Math.max(0, Math.min(1, item.path("confidence").asDouble(0.6)));
+            String category = item.path("category").asText("");
+            decisions.set(index, new AiDecision(
+                    violation,
+                    confidence,
+                    category.isBlank() ? (fallbackCategory == null ? "" : fallbackCategory) : category,
+                    item.path("reason").asText("AI 已完成复核。"),
+                    item.toString()
+            ));
+        }
+        return decisions;
+    }
+
     private String extractionSystemPrompt() {
         return """
                 你是敏感词命中提取助手。下面会给你一段视频字幕(按段编号并附时间)和一份敏感词库。
@@ -597,12 +733,15 @@ public class AiModerationClient {
 
     private String extractionUserPrompt(List<TranscriptSegment> segments, List<ViolationTerm> terms) {
         StringBuilder sb = new StringBuilder();
-        sb.append("敏感词库(全量,逐条对照):\n");
+        // 词库每批都会重复下发,逐字段控制行宽:matchType 缺省 EXACT 不下发,省下的输入 token 随批次数线性放大
+        sb.append("敏感词库(全量,逐条对照;未标 matchType 的默认 EXACT):\n");
         for (ViolationTerm term : terms) {
             sb.append("- term=").append(nullToEmpty(term.getTerm()))
                     .append(" | category=").append(nullToEmpty(term.getCategory()))
-                    .append(" | severity=").append(term.getSeverity())
-                    .append(" | matchType=").append(term.getMatchType());
+                    .append(" | severity=").append(term.getSeverity());
+            if (term.getMatchType() != MatchType.EXACT) {
+                sb.append(" | matchType=").append(term.getMatchType());
+            }
             if (StringUtils.hasText(term.getVariants())) {
                 sb.append(" | variants=").append(term.getVariants().replaceAll("\\s+", " ").trim());
             }
@@ -630,7 +769,7 @@ public class AiModerationClient {
      */
     public List<ExtractedHit> parseExtraction(JsonNode root, ApiType type) {
         String content = type == ApiType.RESPONSES ? extractResponsesContent(root) : extractChatContent(root);
-        JsonNode hitsNode = extractHitsArray(content);
+        JsonNode hitsNode = extractArrayField(content, "hits", "AI 提取");
         List<ExtractedHit> hits = new ArrayList<>();
         if (hitsNode == null || !hitsNode.isArray()) {
             return hits;
@@ -663,7 +802,7 @@ public class AiModerationClient {
      */
     public List<GeneratedTermResponse> parseGeneratedTerms(JsonNode root, ApiType type) {
         String content = type == ApiType.RESPONSES ? extractResponsesContent(root) : extractChatContent(root);
-        JsonNode termsNode = extractTermsArray(content);
+        JsonNode termsNode = extractArrayField(content, "terms", "AI 词库生成");
         List<GeneratedTermResponse> terms = new ArrayList<>();
         if (termsNode == null || !termsNode.isArray()) {
             return terms;
@@ -689,10 +828,10 @@ public class AiModerationClient {
     }
 
     /**
-     * 先按 {"hits":[...]} 对象解析;失败则兜底尝试模型直接返回的裸数组 [...]。
-     * 全部失败仅记 warn 并返回 null(本批跳过),不静默吞掉。
+     * 通用数组字段抽取:先按 {"<field>":[...]} 对象解析;失败则兜底尝试模型直接返回的裸数组 [...]。
+     * 全部失败仅记 warn 并返回 null(本次结果为空),不静默吞掉。
      */
-    private JsonNode extractHitsArray(String content) {
+    private JsonNode extractArrayField(String content, String field, String warnContext) {
         String stripped = stripCodeFence(content);
         JsonNode object = tryParseObject(stripped);
         if (object == null) {
@@ -701,8 +840,8 @@ public class AiModerationClient {
                 object = tryParseObject(extracted);
             }
         }
-        if (object != null && object.path("hits").isArray()) {
-            return object.path("hits");
+        if (object != null && object.path(field).isArray()) {
+            return object.path(field);
         }
         JsonNode array = tryParseArray(stripped);
         if (array != null) {
@@ -715,34 +854,7 @@ public class AiModerationClient {
                 return array;
             }
         }
-        log.warn("AI 提取返回内容无法解析为 hits 数组,本批跳过。原始内容: {}", trimForMessage(content));
-        return null;
-    }
-
-    private JsonNode extractTermsArray(String content) {
-        String stripped = stripCodeFence(content);
-        JsonNode object = tryParseObject(stripped);
-        if (object == null) {
-            String extracted = extractJsonObject(stripped);
-            if (extracted != null) {
-                object = tryParseObject(extracted);
-            }
-        }
-        if (object != null && object.path("terms").isArray()) {
-            return object.path("terms");
-        }
-        JsonNode array = tryParseArray(stripped);
-        if (array != null) {
-            return array;
-        }
-        String extractedArray = extractJsonArray(stripped);
-        if (extractedArray != null) {
-            array = tryParseArray(extractedArray);
-            if (array != null) {
-                return array;
-            }
-        }
-        log.warn("AI 词库生成返回内容无法解析为 terms 数组,本次结果为空。原始内容: {}", trimForMessage(content));
+        log.warn("{}返回内容无法解析为 {} 数组,本次结果为空。原始内容: {}", warnContext, field, trimForMessage(content));
         return null;
     }
 

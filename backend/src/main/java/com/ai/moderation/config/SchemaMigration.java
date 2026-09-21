@@ -43,6 +43,11 @@ public class SchemaMigration implements ApplicationRunner {
         addColumnIfMissing("videos", "content_type", "VARCHAR(100)");
         addColumnIfMissing("videos", "width", "INT");
         addColumnIfMissing("videos", "height", "INT");
+        // 运行时设置:ASR 引擎选择(LOCAL 本地 Whisper / ONLINE 在线接口)与在线 ASR 接入参数
+        addColumnIfMissing("app_settings", "asr_provider", "VARCHAR(20) NOT NULL DEFAULT 'LOCAL'");
+        addColumnIfMissing("app_settings", "asr_online_base_url", "VARCHAR(500)");
+        addColumnIfMissing("app_settings", "asr_online_api_key", "VARCHAR(500)");
+        addColumnIfMissing("app_settings", "asr_online_model", "VARCHAR(120)");
     }
 
     private void createExportTasksTableIfMissing() {

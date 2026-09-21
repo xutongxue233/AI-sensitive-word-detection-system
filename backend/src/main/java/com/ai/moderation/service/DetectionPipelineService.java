@@ -132,7 +132,9 @@ public class DetectionPipelineService {
             ruleMatchingService.matchJob(job);
 
             mark(job, JobStatus.AI_REVIEWING, 75);
-            aiExtractionService.extractAndReview(job.getId());
+            // 提取批次完成数映射到 75~89,内容多时让前端能看到 AI 阶段在推进
+            aiExtractionService.extractAndReview(job.getId(),
+                    percent -> mark(job, JobStatus.AI_REVIEWING, 75 + Math.min(14, percent * 15 / 100)));
 
             mark(job, JobStatus.SUGGESTING_CLIPS, 90);
             clipSuggestionService.createSuggestions(job.getId());

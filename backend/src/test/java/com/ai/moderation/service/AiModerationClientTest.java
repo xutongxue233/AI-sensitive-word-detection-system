@@ -1,11 +1,15 @@
 package com.ai.moderation.service;
 
 import com.ai.moderation.config.ApiType;
+import com.ai.moderation.domain.TermHit;
 import com.ai.moderation.service.support.AiDecision;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.within;
@@ -90,5 +94,68 @@ class AiModerationClientTest {
         assertThat(decision.violation()).isTrue();
         assertThat(decision.confidence()).isEqualTo(0.6, within(1e-9));
         assertThat(decision.category()).isEqualTo("兜底分类");
+    }
+
+    /** 把任意文本包装成 chat completions 的 message.content,避免手写转义。 */
+    private JsonNode chat(String content) {
+        ObjectNode root = objectMapper.createObjectNode();
+        root.putArray("choices").addObject().putObject("message").put("content", content);
+        return root;
+    }
+
+    private TermHit hit(String category) {
+        TermHit hit = new TermHit();
+        hit.setCategory(category);
+        return hit;
+    }
+
+    @Test
+    void parsesBatchDecisionsAlignedByIndex() {
+        JsonNode root = chat("""
+                {"decisions":[
+                  {"index":1,"violation":false,"confidence":0.8,"category":"","reason":"同形异义"},
+                  {"index":5,"violation":true,"confidence":0.9,"category":"x","reason":"下标越界应忽略"}
+                ]}""");
+
+        List<AiDecision> decisions = client.parseBatchDecisions(root, ApiType.CHAT,
+                List.of(hit("广告极限词"), hit("价格")));
+
+        assertThat(decisions).hasSize(2);
+        // 模型遗漏 index=0,该位置为 null 交调用方回退单条复核
+        assertThat(decisions.get(0)).isNull();
+        assertThat(decisions.get(1).violation()).isFalse();
+        assertThat(decisions.get(1).confidence()).isEqualTo(0.8);
+        // 空 category 回退候选自身分类
+        assertThat(decisions.get(1).category()).isEqualTo("价格");
+        assertThat(decisions.get(1).reason()).isEqualTo("同形异义");
+    }
+
+    @Test
+    void unparseableBatchContentReturnsAllNulls() {
+        JsonNode root = chat("抱歉,我无法判断");
+
+        List<AiDecision> decisions = client.parseBatchDecisions(root, ApiType.CHAT,
+                List.of(hit("a"), hit("b"), hit("c")));
+
+        assertThat(decisions).hasSize(3);
+        assertThat(decisions).containsOnlyNulls();
+    }
+
+    @Test
+    void rejectsNonIntegralAndDuplicateBatchIndexesWithNullFallback() {
+        JsonNode root = chat("""
+                {"decisions":[
+                  {"index":0.9,"violation":true,"confidence":0.99,"category":"a","reason":"小数下标应忽略"},
+                  {"index":0,"violation":true,"confidence":0.99,"category":"a","reason":"第一条"},
+                  {"index":0,"violation":false,"confidence":0.01,"category":"a","reason":"重复下标应回退"},
+                  {"index":1,"violation":true,"confidence":0.8,"category":"b","reason":"有效"}
+                ]}""");
+
+        List<AiDecision> decisions = client.parseBatchDecisions(root, ApiType.CHAT,
+                List.of(hit("a"), hit("b")));
+
+        assertThat(decisions).hasSize(2);
+        assertThat(decisions.get(0)).isNull();
+        assertThat(decisions.get(1).violation()).isTrue();
     }
 }

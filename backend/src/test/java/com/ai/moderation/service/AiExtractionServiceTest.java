@@ -22,6 +22,7 @@ import org.mockito.ArgumentCaptor;
 import org.springframework.transaction.TransactionStatus;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;
 
@@ -177,6 +178,40 @@ class AiExtractionServiceTest {
 
         verify(hitRepository, never()).save(any(TermHit.class));
         verify(reviewRepository, never()).save(any(AiReview.class));
+    }
+
+    @Test
+    void overlappingAiHitsPreferHigherConfidenceBeforeTextLength() {
+        when(settingsService.currentAi()).thenReturn(ai(true, 0.6));
+        when(segmentRepository.findByJobIdOrderBySequenceNoAsc(1L)).thenReturn(List.of(segment(0, "这个才几十块钱", 0, 4, 100L)));
+        when(termRepository.findByEnabledTrueOrderByUpdatedAtDesc()).thenReturn(List.of(
+                term(40L, "几十块", "价格", Severity.MEDIUM, MatchType.EXACT),
+                term(41L, "几十", "约数", Severity.LOW, MatchType.EXACT)));
+        when(hitRepository.findByJobIdOrderByStartTimeAsc(1L)).thenReturn(List.of());
+        when(moderationClient.extract(anyList(), anyList())).thenReturn(List.of(
+                extracted(0, "几十块", "几十块", "价格", "MEDIUM", 0.8, "价格表达"),
+                extracted(0, "几十", "几十", "约数", "LOW", 0.95, "约数表达")));
+
+        service.extractAndReview(1L);
+
+        ArgumentCaptor<TermHit> hitCaptor = ArgumentCaptor.forClass(TermHit.class);
+        verify(hitRepository).save(hitCaptor.capture());
+        assertThat(hitCaptor.getValue().getMatchedText()).isEqualTo("几十");
+        assertThat(hitCaptor.getValue().getTermId()).isEqualTo(41L);
+    }
+
+    @Test
+    void reportsStageProgressAfterEachBatch() {
+        when(settingsService.currentAi()).thenReturn(ai(true, 0.6));
+        when(segmentRepository.findByJobIdOrderBySequenceNoAsc(1L)).thenReturn(List.of(segment(0, "文本", 0, 4, 100L)));
+        when(termRepository.findByEnabledTrueOrderByUpdatedAtDesc()).thenReturn(List.of(term(40L, "价格", "价格", Severity.MEDIUM, MatchType.SEMANTIC)));
+        when(hitRepository.findByJobIdOrderByStartTimeAsc(1L)).thenReturn(List.of());
+        when(moderationClient.extract(anyList(), anyList())).thenReturn(List.of());
+
+        List<Integer> progress = new ArrayList<>();
+        service.extractAndReview(1L, progress::add);
+
+        assertThat(progress).containsExactly(100);
     }
 
     private AiProperties ai(boolean enabled, double threshold) {

@@ -35,6 +35,7 @@ app:
     ffprobe-path: ${FFPROBE_PATH:${user.dir}/tools/ffmpeg/bin/ffprobe.exe}
     subtitle-blur-sigma: 6.0      # delogo 去字幕后高斯柔化强度;越小越清晰(过小暴露插值痕迹),越大越糊。原 12 偏糊
     subtitle-feather-max: 40      # 字幕块边缘羽化过渡带上限(px);越大边缘越柔和自然。原 22
+    hw-encoder: ${FFMPEG_HW_ENCODER:auto}  # 导出重编码硬件编码器: auto(按 AMF→QSV→NVENC 探测,全不可用回退 libx264)|amf|qsv|nvenc|off
   asr:
     enabled: true
     base-url: http://localhost:9000

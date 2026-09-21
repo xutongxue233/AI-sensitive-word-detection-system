@@ -3,6 +3,7 @@ package com.ai.moderation.domain;
 import com.baomidou.mybatisplus.annotation.IdType;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
+import com.baomidou.mybatisplus.annotation.TableField;
 import lombok.Getter;
 import lombok.Setter;
 
@@ -32,6 +33,16 @@ public class TermHit implements Identifiable {
 
     /** 实际命中的文本片段。 */
     private String matchedText;
+
+    /**
+     * 命中在段内归一化文本中的字符区间。该字段仅用于规则召回阶段的去重，
+     * 不落库；时间戳可能把同一词元内的多个命中映射到相同区间，不能再仅凭时间判断重复。
+     */
+    @TableField(exist = false)
+    private Integer matchStartOffset;
+
+    @TableField(exist = false)
+    private Integer matchEndOffset;
 
     /** 命中所属违规类别。 */
     private String category;

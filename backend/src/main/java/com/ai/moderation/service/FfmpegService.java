@@ -2,6 +2,8 @@ package com.ai.moderation.service;
 
 import com.ai.moderation.common.ApiException;
 import com.ai.moderation.config.FfmpegProperties;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 
@@ -11,6 +13,8 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.TimeUnit;
+import java.util.function.UnaryOperator;
 
 /**
  * FFmpeg/ffprobe 命令行封装:检测管线与导出阶段对外部 FFmpeg 进程的唯一入口。
@@ -20,10 +24,15 @@ import java.util.Locale;
  * - {@link #exportWithoutClips} 删除命中时间片段(切出保留段再 concat 拼接),用于音频命中导出;
  * - {@link #exportWithSubtitleBlur} 用 delogo 邻域插值去字幕(失败回退盒式模糊),用于画面硬字幕命中导出。
  * DELOGO_* 常量为 delogo 修复参数(外扩与分块,见各常量注释)。
+ * 导出重编码支持硬件编码器(AMF/QSV/NVENC,核显即可,由 app.ffmpeg.hw-encoder 控制):首次编码前
+ * 用微型试编码懒探测一次并缓存;真实导出若仍失败则降级 libx264 重跑,硬件路径永不阻断导出。
+ * 滤镜(delogo/gblur 等)仍在 CPU 执行,硬件只加速编码。
  * FFmpeg 可执行路径由 {@link FfmpegProperties} 提供;任何 FFmpeg 调用失败统一抛 {@link ApiException}。
  */
 @Service
 public class FfmpegService {
+    private static final Logger log = LoggerFactory.getLogger(FfmpegService.class);
+
     private final FfmpegProperties properties;
 
     // delogo 字幕修复参数:外扩比例(覆盖字幕描边/抗锯齿边缘),以及超宽字幕条的横向分块阈值与单块像素上限
@@ -32,6 +41,23 @@ public class FfmpegService {
     private static final double DELOGO_PADDING_Y = 0.016;
     private static final int DELOGO_CHUNK_TRIGGER_PX = 700;
     private static final int DELOGO_MAX_CHUNK_PX = 350;
+
+    /** CPU 兜底编码参数:硬件编码器不可用或对真实素材执行失败时使用。 */
+    private static final List<String> CPU_ENCODE_ARGS = List.of("-c:v", "libx264", "-preset", "veryfast", "-crf", "18");
+
+    /**
+     * 硬件 H.264 编码器候选,按部署目标优先级排列:AMF(AMD 核显/独显)→ QSV(Intel 核显)→ NVENC(NVIDIA)。
+     * 硬件编码器不支持 x264 的 -crf,各自改用等价的恒质量码控,档位对齐 libx264 crf 18;
+     * 探测时即用候选的完整参数做试编码,参数不被当前驱动/FFmpeg 构建支持会直接探测失败并跳过该候选。
+     */
+    private static final List<EncoderCandidate> HW_ENCODE_CANDIDATES = List.of(
+            new EncoderCandidate("amf", List.of("-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "18", "-qp_p", "20")),
+            new EncoderCandidate("qsv", List.of("-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "20")),
+            new EncoderCandidate("nvenc", List.of("-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "19"))
+    );
+
+    /** 懒探测后的编码参数缓存;运行期硬件编码失败时会被降级覆写为 {@link #CPU_ENCODE_ARGS}。 */
+    private volatile List<String> resolvedEncodeArgs;
 
     public FfmpegService(FfmpegProperties properties) {
         this.properties = properties;
@@ -161,16 +187,17 @@ public class FfmpegService {
                     : buildSubtitleDelogoFilter(maskRanges, resolution[0], resolution[1]);
             // delogo 不可用(无法探测分辨率,或所有区域换算后无效)时回退盒式模糊,保证遮盖不被静默跳过
             String filter = delogoFilter.isBlank() ? buildSubtitleBlurFilter(maskRanges) : delogoFilter;
-            run(List.of(
-                    properties.ffmpegPath(), "-y",
-                    "-i", inputVideo.toString(),
-                    "-filter_complex", filter,
-                    "-map", "[vout]",
-                    "-map", "0:a?",
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-                    "-c:a", "copy",
-                    output.toString()
-            ));
+            runWithVideoEncoder(encodeArgs -> {
+                List<String> command = new ArrayList<>(List.of(
+                        properties.ffmpegPath(), "-y",
+                        "-i", inputVideo.toString(),
+                        "-filter_complex", filter,
+                        "-map", "[vout]",
+                        "-map", "0:a?"));
+                command.addAll(encodeArgs);
+                command.addAll(List.of("-c:a", "copy", output.toString()));
+                return command;
+            });
             return output;
         } catch (IOException ex) {
             throw new ApiException(HttpStatus.INTERNAL_SERVER_ERROR,
@@ -196,26 +223,34 @@ public class FfmpegService {
                 throw new ApiException(HttpStatus.BAD_REQUEST, "确认剪辑片段覆盖了整段视频，无法导出");
             }
             List<Path> parts = new ArrayList<>();
-            for (int i = 0; i < keepRanges.size(); i++) {
-                TimeRange range = keepRanges.get(i);
-                Path part = outputDir.resolve("keep-" + i + ".mp4");
-                List<String> command = new ArrayList<>(List.of(
-                        properties.ffmpegPath(), "-y",
-                        "-ss", formatSeconds(range.start()),
-                        "-i", inputVideo.toString(),
-                        "-t", formatSeconds(range.end() - range.start())
-                ));
-                if (precise) {
-                    command.addAll(List.of(
-                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-                            "-c:a", "aac"
-                    ));
-                } else {
-                    command.addAll(List.of("-c", "copy"));
+            if (precise) {
+                List<String> encodeArgs = videoEncodeArgs();
+                try {
+                    parts = encodeKeepRanges(inputVideo, outputDir, keepRanges, encodeArgs);
+                } catch (ApiException ex) {
+                    if (CPU_ENCODE_ARGS.equals(encodeArgs)) {
+                        throw ex;
+                    }
+                    log.warn("精确导出中的硬件编码失败,重新用 libx264 生成全部片段: {}", ex.getMessage());
+                    resolvedEncodeArgs = CPU_ENCODE_ARGS;
+                    deleteKeepParts(outputDir, keepRanges.size());
+                    parts = encodeKeepRanges(inputVideo, outputDir, keepRanges, CPU_ENCODE_ARGS);
                 }
-                command.add(part.toString());
-                run(command);
-                parts.add(part);
+            } else {
+                for (int i = 0; i < keepRanges.size(); i++) {
+                    TimeRange range = keepRanges.get(i);
+                    Path part = outputDir.resolve("keep-" + i + ".mp4");
+                    List<String> head = List.of(
+                            properties.ffmpegPath(), "-y",
+                            "-ss", formatSeconds(range.start()),
+                            "-i", inputVideo.toString(),
+                            "-t", formatSeconds(range.end() - range.start())
+                    );
+                    List<String> command = new ArrayList<>(head);
+                    command.addAll(List.of("-c", "copy", part.toString()));
+                    run(command);
+                    parts.add(part);
+                }
             }
             Path concatList = outputDir.resolve("concat.txt");
             StringBuilder listContent = new StringBuilder();
@@ -236,6 +271,37 @@ public class FfmpegService {
         } catch (IOException ex) {
             throw new ApiException(HttpStatus.INTERNAL_SERVER_ERROR,
                     "导出视频失败: 找不到或无法执行 FFmpeg，请检查 app.ffmpeg.ffmpeg-path=" + properties.ffmpegPath());
+        }
+    }
+
+    /** 用同一套视频编码参数生成全部精确裁剪片段,保证 concat -c copy 的流参数一致。 */
+    private List<Path> encodeKeepRanges(
+            Path inputVideo,
+            Path outputDir,
+            List<TimeRange> keepRanges,
+            List<String> encodeArgs
+    ) throws IOException {
+        List<Path> parts = new ArrayList<>();
+        for (int i = 0; i < keepRanges.size(); i++) {
+            TimeRange range = keepRanges.get(i);
+            Path part = outputDir.resolve("keep-" + i + ".mp4");
+            List<String> command = new ArrayList<>(List.of(
+                    properties.ffmpegPath(), "-y",
+                    "-ss", formatSeconds(range.start()),
+                    "-i", inputVideo.toString(),
+                    "-t", formatSeconds(range.end() - range.start())
+            ));
+            command.addAll(encodeArgs);
+            command.addAll(List.of("-c:a", "aac", part.toString()));
+            run(command);
+            parts.add(part);
+        }
+        return parts;
+    }
+
+    private void deleteKeepParts(Path outputDir, int count) throws IOException {
+        for (int i = 0; i < count; i++) {
+            Files.deleteIfExists(outputDir.resolve("keep-" + i + ".mp4"));
         }
     }
 
@@ -373,6 +439,99 @@ public class FfmpegService {
             return min;
         }
         return Math.max(min, Math.min(max, value));
+    }
+
+    /**
+     * 用解析出的视频编码参数执行一次导出编码。硬件编码器虽通过了试编码探测,仍可能对真实素材失败
+     * (驱动版本、异常分辨率、显存不足等):此时降级缓存为 libx264 并立即用 CPU 参数重跑本条命令,
+     * 保证导出结果不因硬件路径而中断;后续导出直接走 CPU,不再反复撞同一错误。
+     *
+     * @param commandBuilder 接收编码参数(形如 -c:v xxx ...)、返回完整 FFmpeg 命令的构造函数
+     */
+    private void runWithVideoEncoder(UnaryOperator<List<String>> commandBuilder) throws IOException {
+        List<String> encodeArgs = videoEncodeArgs();
+        try {
+            run(commandBuilder.apply(encodeArgs));
+        } catch (ApiException ex) {
+            if (CPU_ENCODE_ARGS.equals(encodeArgs)) {
+                throw ex;
+            }
+            log.warn("硬件编码执行失败,本次及后续导出回退 libx264: {}", ex.getMessage());
+            resolvedEncodeArgs = CPU_ENCODE_ARGS;
+            run(commandBuilder.apply(CPU_ENCODE_ARGS));
+        }
+    }
+
+    /** 返回当前应使用的视频编码参数;首次调用时做一次硬件编码器探测并缓存(双检锁防并发重复探测)。 */
+    private List<String> videoEncodeArgs() {
+        List<String> args = resolvedEncodeArgs;
+        if (args == null) {
+            synchronized (this) {
+                if (resolvedEncodeArgs == null) {
+                    resolvedEncodeArgs = resolveEncodeArgs();
+                }
+                args = resolvedEncodeArgs;
+            }
+        }
+        return args;
+    }
+
+    /**
+     * 按 app.ffmpeg.hw-encoder 解析编码参数:off 直接用 CPU;auto 按候选顺序逐个试编码取第一个可用;
+     * 指定 amf/qsv/nvenc 时只试对应候选,不可用同样回退 CPU(只影响速度,不影响导出成败)。
+     */
+    private List<String> resolveEncodeArgs() {
+        String mode = properties.hwEncoder();
+        if ("off".equals(mode) || "none".equals(mode) || "cpu".equals(mode)) {
+            return CPU_ENCODE_ARGS;
+        }
+        for (EncoderCandidate candidate : HW_ENCODE_CANDIDATES) {
+            if (!"auto".equals(mode) && !candidate.name().equals(mode)) {
+                continue;
+            }
+            if (probeEncoder(candidate.args())) {
+                log.info("导出视频启用硬件编码器: {}", candidate.args().get(1));
+                return candidate.args();
+            }
+        }
+        log.info("未探测到可用的硬件编码器(hw-encoder={}),导出使用 CPU libx264", mode);
+        return CPU_ENCODE_ARGS;
+    }
+
+    /** 对候选编码参数做一次微型试编码(lavfi 黑帧 3 帧、null 输出):驱动/构建不支持即失败。 */
+    private boolean probeEncoder(List<String> encodeArgs) {
+        List<String> command = new ArrayList<>(List.of(
+                properties.ffmpegPath(), "-hide_banner", "-v", "error",
+                "-f", "lavfi", "-i", "color=c=black:s=320x240:r=10",
+                "-frames:v", "3"));
+        command.addAll(encodeArgs);
+        command.addAll(List.of("-f", "null", "-"));
+        Process process = null;
+        try {
+            process = new ProcessBuilder(command)
+                    .redirectErrorStream(true)
+                    .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                    .start();
+            if (!process.waitFor(10, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                process.waitFor(2, TimeUnit.SECONDS);
+                return false;
+            }
+            return process.exitValue() == 0;
+        } catch (IOException ex) {
+            return false;
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            return false;
+        } finally {
+            if (process != null && process.isAlive()) {
+                process.destroyForcibly();
+            }
+        }
+    }
+
+    /** 硬件编码器候选:名称(与 hw-encoder 配置值对应)+ 该编码器的完整编码参数。 */
+    private record EncoderCandidate(String name, List<String> args) {
     }
 
     private void run(List<String> command) throws IOException {

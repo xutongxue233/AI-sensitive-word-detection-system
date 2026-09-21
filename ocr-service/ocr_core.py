@@ -1,9 +1,13 @@
-"""画面硬字幕 OCR 核心逻辑(RapidOCR / onnxruntime,纯 CPU 轻量版)。
+"""画面硬字幕 OCR 核心逻辑(RapidOCR / onnxruntime,轻量引擎)。
 
 由独立的 ocr_app.py 进程加载(默认端口 9001),跑在 ocr-service 专用 venv。引擎为
-rapidocr-onnxruntime:ONNXRuntime CPU 推理 + wheel 自带的 PP-OCRv4 中英文检测/识别模型
-(约十几 MB,随包分发、离线可用),不依赖 paddlepaddle/torch/CUDA,适配只有核显的机器,
-识别质量与 PP-OCR 同源。
+rapidocr-onnxruntime:ONNXRuntime 推理 + wheel 自带的 PP-OCRv4 中英文检测/识别模型
+(约十几 MB,随包分发、离线可用),不依赖 paddlepaddle/torch/CUDA。
+
+核显加速(可选):venv 安装 onnxruntime-directml 后,DmlExecutionProvider 可用时默认
+自动启用 DirectML 推理(AMD/Intel/NVIDIA 任意 DX12 GPU 含核显均可),OCR_USE_DML=0 可
+强制关闭;装的是 CPU 版 onnxruntime 则自动纯 CPU,行为不变。抽帧解码默认尝试 D3D11
+硬解(OCR_HW_DECODE 控制),打开失败自动回退软解。
 
 模块内 PADDLE_OCR_* 环境变量名与 probe_paddle_gpu 等公开名沿自早期 PaddleOCR 实现;
 为保持 ocr_app.py 的 /health 字段与既有部署配置兼容,这些名称全部保留、语义对应适配。
@@ -40,13 +44,17 @@ PADDLE_OCR_VERSION = os.getenv("PADDLE_OCR_VERSION", "PP-OCRv4")
 # 可选:指定自定义 onnx 检测/识别模型路径(默认用 RapidOCR 自带的 PP-OCRv4 模型)。
 PADDLE_OCR_DET_MODEL = os.getenv("PADDLE_OCR_DET_MODEL")
 PADDLE_OCR_REC_MODEL = os.getenv("PADDLE_OCR_REC_MODEL")
-# RapidOCR 走 onnxruntime CPU 推理,无 GPU 路径;保留变量仅为 /health 与既有配置兼容。
+# RapidOCR 走 onnxruntime CPU 推理时无 GPU 路径;保留变量仅为 /health 与既有配置兼容。
 PADDLE_OCR_USE_GPU = env_bool("PADDLE_OCR_USE_GPU", False)
 PADDLE_OCR_ENABLE_MKLDNN = env_bool("PADDLE_OCR_ENABLE_MKLDNN", False)
 PADDLE_OCR_SHOW_STARTUP_LOGS = env_bool("PADDLE_OCR_SHOW_STARTUP_LOGS", False)
 PADDLE_OCR_MIN_TEXT_LENGTH = max(1, env_int("PADDLE_OCR_MIN_TEXT_LENGTH", 2))
 PADDLE_OCR_DROP_SHORT_LATIN = env_bool("PADDLE_OCR_DROP_SHORT_LATIN", True)
 PADDLE_OCR_MIN_REPEAT_FRAMES = max(1, env_int("PADDLE_OCR_MIN_REPEAT_FRAMES", 2))
+# DirectML 核显推理开关:auto(默认,DmlExecutionProvider 可用即启用)/1(强制开)/0(强制关)。
+OCR_USE_DML = (os.getenv("OCR_USE_DML") or "auto").strip().lower()
+# 抽帧解码是否尝试 D3D11 硬解(任意厂商 GPU);打开失败自动回退软解,默认开。
+OCR_HW_DECODE = env_bool("OCR_HW_DECODE", True)
 CHINESE_CONVERTER = os.getenv("WHISPER_CHINESE_CONVERTER", "t2s")
 FFMPEG_BIN_DIR = os.getenv("FFMPEG_BIN_DIR")
 
@@ -66,6 +74,24 @@ _ocr_lock = threading.Lock()
 _ocr_infer_lock = threading.Lock()
 
 
+def dml_available() -> bool:
+    """onnxruntime 是否带 DmlExecutionProvider(即装的是 onnxruntime-directml)。"""
+    try:
+        import onnxruntime
+        return "DmlExecutionProvider" in onnxruntime.get_available_providers()
+    except Exception:
+        return False
+
+
+def dml_enabled() -> bool:
+    """是否对 RapidOCR 启用 DirectML 推理:显式 0/1 优先,auto 时看 provider 是否可用。"""
+    if OCR_USE_DML in {"0", "false", "no", "off"}:
+        return False
+    if OCR_USE_DML in {"1", "true", "yes", "on"}:
+        return True
+    return dml_available()
+
+
 def probe_paddle_gpu() -> dict:
     """返回 OCR 推理引擎自检信息,供 /health 暴露。
 
@@ -77,6 +103,9 @@ def probe_paddle_gpu() -> dict:
         import onnxruntime
         info["onnxruntimeVersion"] = onnxruntime.__version__
         info["providers"] = list(onnxruntime.get_available_providers())
+        info["dmlAvailable"] = dml_available()
+        info["dmlEnabled"] = dml_enabled()
+        info["hwDecode"] = OCR_HW_DECODE
     except Exception as exc:
         info["engineError"] = f"{type(exc).__name__}: {exc}"
     return info
@@ -116,11 +145,13 @@ def get_ocr_reader(lang: str):
     """
     global ocr_reader, ocr_reader_lang
     selected_lang = (lang or PADDLE_OCR_LANG or "ch").strip()
+    use_dml = dml_enabled()
     cache_key = "|".join([
         selected_lang,
         PADDLE_OCR_VERSION or "",
         PADDLE_OCR_DET_MODEL or "",
         PADDLE_OCR_REC_MODEL or "",
+        "dml" if use_dml else "cpu",
     ])
     if ocr_reader is None or ocr_reader_lang != cache_key:
         with _ocr_lock:
@@ -137,6 +168,10 @@ def get_ocr_reader(lang: str):
                     kwargs["det_model_path"] = PADDLE_OCR_DET_MODEL
                 if PADDLE_OCR_REC_MODEL:
                     kwargs["rec_model_path"] = PADDLE_OCR_REC_MODEL
+                if use_dml:
+                    # DirectML 核显推理(det/cls/rec 三个模型分别开);provider 实际缺失时
+                    # RapidOCR 内部会告警并自动回退 CPU,不会失败。
+                    kwargs.update(det_use_dml=True, cls_use_dml=True, rec_use_dml=True)
                 try:
                     reader = RapidOCR(**kwargs)
                 except Exception as exc:
@@ -147,6 +182,53 @@ def get_ocr_reader(lang: str):
                 ocr_reader = reader
                 ocr_reader_lang = cache_key
     return ocr_reader
+
+
+def _open_video_capture(video_path: str, cv2, allow_hw: bool = True):
+    """Open a capture and return ``(capture, hardware_active)``.
+
+    ``VideoCapture.isOpened`` only validates that the backend was created.  Some
+    hardware decoders fail on the first ``read`` (or later when a stream changes
+    codec), so callers need to know whether a software retry is still available.
+    The public :func:`open_video_capture` wrapper below keeps its historical
+    capture-only return value for callers outside this module.
+    """
+    if allow_hw and OCR_HW_DECODE:
+        try:
+            cap = cv2.VideoCapture(
+                video_path,
+                cv2.CAP_FFMPEG,
+                [cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY],
+            )
+            if cap.isOpened():
+                return cap, True
+            cap.release()
+        except Exception:
+            # OpenCV builds vary in support for the hardware-acceleration
+            # parameters.  Falling through preserves the old software path.
+            pass
+    return cv2.VideoCapture(video_path), False
+
+
+def open_video_capture(video_path: str, cv2):
+    """打开视频:默认先尝试 D3D11 硬解(任意厂商 GPU 含核显),失败回退纯软解。
+
+    VIDEO_ACCELERATION_ANY 本身在无可用硬解时由 OpenCV 回退软件路径,这里再兜一层
+    "打不开就按老方式重开",保证行为最多退化为原纯 CPU 解码、绝不因硬解而失败。
+    """
+    return _open_video_capture(video_path, cv2)[0]
+
+
+def _reopen_software_capture(video_path: str, cv2, previous_capture):
+    """Release a failed hardware capture and reopen the video with software decode."""
+    try:
+        previous_capture.release()
+    except Exception:
+        pass
+    try:
+        return cv2.VideoCapture(video_path)
+    except Exception:
+        return None
 
 
 def recognize_video_subtitles(
@@ -178,7 +260,9 @@ def recognize_video_subtitles(
             detail=f"OCR 视频处理依赖不可用，请安装 opencv-python-headless: {exc}",
         ) from exc
 
-    cap = cv2.VideoCapture(video_path)
+    # ``isOpened`` can succeed while a hardware decoder still cannot decode a
+    # frame. Keep the mode flag so a failed read can retry through software.
+    cap, hardware_active = _open_video_capture(video_path, cv2)
     if not cap.isOpened():
         raise HTTPException(status_code=400, detail="无法打开视频文件进行字幕 OCR")
     try:
@@ -186,15 +270,43 @@ def recognize_video_subtitles(
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         duration = frame_count / fps if frame_count > 0 else 0.0
         if duration <= 0:
+            # A hardware capture with no metadata is especially likely to fail
+            # while probing. Retry the probe on a fresh software capture when
+            # no usable duration was obtained.
             duration = probe_video_duration_by_reading(cap, fps)
+            if duration <= 0 and hardware_active:
+                cap = _reopen_software_capture(video_path, cv2, cap)
+                hardware_active = False
+                if cap is None or not cap.isOpened():
+                    raise HTTPException(status_code=400, detail="无法打开视频文件进行字幕 OCR")
+                fps = float(cap.get(cv2.CAP_PROP_FPS) or 0) or fps or 25.0
+                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                duration = frame_count / fps if frame_count > 0 else 0.0
+                if duration <= 0:
+                    duration = probe_video_duration_by_reading(cap, fps)
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
         segments = []
         actives = []  # 每块字幕独立跟踪: {key, text, bbox, start, end, last_seen, seen}
         t = 0.0
         while t <= duration + 0.001:
-            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-            ok, frame = cap.read()
+            try:
+                cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+                ok, frame = cap.read()
+            except Exception:
+                ok, frame = False, None
+            if not ok and hardware_active:
+                # Hardware backends may initialize successfully but fail on
+                # the first frame or after a seek/codec change. Reopen once at
+                # the same timestamp so this cannot silently truncate OCR.
+                cap = _reopen_software_capture(video_path, cv2, cap)
+                hardware_active = False
+                if cap is not None and cap.isOpened():
+                    try:
+                        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+                        ok, frame = cap.read()
+                    except Exception:
+                        ok, frame = False, None
             if not ok:
                 break
             seg_end = min(duration, t + interval_seconds)
@@ -244,13 +356,17 @@ def recognize_video_subtitles(
         segments.sort(key=lambda seg: seg["start"])
         return segments
     finally:
-        cap.release()
+        if cap is not None:
+            cap.release()
 
 
 def probe_video_duration_by_reading(cap, fps: float) -> float:
     frames = 0
     while True:
-        ok, _ = cap.read()
+        try:
+            ok, _ = cap.read()
+        except Exception:
+            break
         if not ok:
             break
         frames += 1

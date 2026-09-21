@@ -50,6 +50,22 @@ export function formatTimeShort(iso?: string): string {
 }
 
 /**
+ * 把秒数格式化为「X小时Y分Z秒」的可读耗时,按需省略高位;10 秒内保留一位小数。
+ * 无效值(undefined/null/NaN/负数)返回 '-'。
+ * @param value 耗时(秒)
+ */
+export function formatDuration(value?: number | null): string {
+  if (value === undefined || value === null || Number.isNaN(value) || value < 0) return '-';
+  if (value < 60) return value < 10 ? `${value.toFixed(1)}秒` : `${Math.round(value)}秒`;
+  const total = Math.round(value);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h}小时${m}分${s}秒`;
+  return s > 0 ? `${m}分${s}秒` : `${m}分钟`;
+}
+
+/**
  * 把字节数格式化为带单位的可读大小,按 1024 进制选取单位(B/KB/MB/GB/TB)。
  * 0 与无效值(undefined/null/NaN/负数)返回占位符;B 档不保留小数,其余档保留一位小数。
  * @param value 字节数

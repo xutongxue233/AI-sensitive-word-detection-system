@@ -90,7 +90,7 @@ import type {
 } from './types';
 
 import { cn } from '@/lib/utils';
-import { formatBytes, formatClock, formatDateTime, formatTimeShort, seconds } from '@/lib/format';
+import { formatBytes, formatClock, formatDateTime, formatDuration, formatTimeShort, seconds } from '@/lib/format';
 import {
   CLIP_STATUS,
   EmptyState,
@@ -1185,6 +1185,11 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
     if (timeline.length === 0) return null;
     return timeline.find((item) => item.hitId === activeEvidenceHitId) ?? timeline[0];
   }, [activeEvidenceHitId, timeline]);
+
+  // 检测耗时:运行中取「现在 - 开始」(随 2.5s 轮询刷新),终态取「完成 - 开始」定格
+  const jobElapsedSeconds = job?.startedAt
+    ? Math.max(0, ((job.completedAt ? new Date(job.completedAt) : new Date()).getTime() - new Date(job.startedAt).getTime()) / 1000)
+    : null;
   const activeEvidenceHit = activeEvidence ? hits.find((item) => item.id === activeEvidence.hitId) : undefined;
   const activeEvidenceSuggestion = activeEvidence
     ? suggestions.find((item) => item.hitId === activeEvidence.hitId)
@@ -1431,6 +1436,11 @@ function JobDetail({ videoId, initialJobId }: { videoId: number; initialJobId?: 
                     <span className="text-[12px] text-muted-foreground">
                       {job.startedAt ? `开始于 ${formatTimeShort(job.startedAt)}` : '等待启动'}
                     </span>
+                    {jobElapsedSeconds != null && (
+                      <span className="text-[12px] text-muted-foreground">
+                        {job.completedAt ? `耗时 ${formatDuration(jobElapsedSeconds)}` : `已用 ${formatDuration(jobElapsedSeconds)}`}
+                      </span>
+                    )}
                   </div>
                   <div className="flex flex-wrap gap-x-6 gap-y-1 text-[12px] text-muted-foreground">
                     <span>

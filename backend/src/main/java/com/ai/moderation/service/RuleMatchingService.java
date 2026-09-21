@@ -82,7 +82,7 @@ public class RuleMatchingService {
     }
 
     /**
-     * 对整个检测任务做规则召回:先清除该任务旧候选,逐段比对全部启用词库,落库候选命中。
+     * 对整个检测任务做规则召回:先清除该任务旧候选,逐段比对全部启用词库,段内同位置去重后落库候选命中。
      * 每段都预构建上下文(前后相邻段)与段内时间索引,供命中定位时间轴与 AI 复核取上下文。
      *
      * @param job 当前检测任务,提供 jobId 关联候选并界定处理范围
@@ -99,11 +99,78 @@ public class RuleMatchingService {
             String context = segmentTimeLocator.buildContext(segments, i);
             List<TranscriptWord> words = wordRepository.findBySegmentIdOrderBySequenceNoAsc(segment.getId());
             SegmentIndex index = segmentTimeLocator.index(segment, words);
+            List<TermHit> segmentHits = new ArrayList<>();
             for (ViolationTerm term : terms) {
-                hits.addAll(matchTerm(job, segment, context, index, term));
+                segmentHits.addAll(matchTerm(job, segment, context, index, term));
             }
+            hits.addAll(dedupeContained(segmentHits));
         }
         return hitRepository.saveAll(hits);
+    }
+
+    /**
+     * 段内同词条同位置去重。不同词条即使命中文本互为包含也必须全部保留，交给 AI
+     * 分别复核；同一词元中多个命中可能共享词级时间戳，因此去重必须依据召回时保留的
+     * 字符偏移区间，而不能仅凭时间重叠判断。
+     */
+    private List<TermHit> dedupeContained(List<TermHit> hits) {
+        if (hits.size() < 2) {
+            return hits;
+        }
+        List<TermHit> kept = new ArrayList<>();
+        for (TermHit candidate : hits) {
+            TermHit duplicate = null;
+            for (TermHit existing : kept) {
+                if (isContainedDuplicate(candidate, existing)) {
+                    duplicate = existing;
+                    break;
+                }
+            }
+            if (duplicate == null) {
+                kept.add(candidate);
+            } else if (isMoreSpecific(candidate, duplicate)) {
+                kept.set(kept.indexOf(duplicate), candidate);
+            }
+        }
+        return kept;
+    }
+
+    private boolean isContainedDuplicate(TermHit a, TermHit b) {
+        // termId 是规则候选所属词条的稳定身份。跨词条候选必须分别交 AI 复核，
+        // 否则较长词条被判安全时会把较短但真实命中的候选一并删除。
+        if (a.getTermId() == null || !a.getTermId().equals(b.getTermId())) {
+            return false;
+        }
+        Integer startA = a.getMatchStartOffset();
+        Integer endA = a.getMatchEndOffset();
+        Integer startB = b.getMatchStartOffset();
+        Integer endB = b.getMatchEndOffset();
+        // 没有字符偏移时无法证明是同一处命中。宁可保留候选，也不能因粗粒度时间戳漏检。
+        if (startA == null || endA == null || startB == null || endB == null
+                || startA >= endA || startB >= endB
+                || Math.max(startA, startB) >= Math.min(endA, endB)) {
+            return false;
+        }
+        String normalizedA = textNormalizer.normalizeForMatch(a.getMatchedText() == null ? "" : a.getMatchedText());
+        String normalizedB = textNormalizer.normalizeForMatch(b.getMatchedText() == null ? "" : b.getMatchedText());
+        if (normalizedA.isBlank() || normalizedB.isBlank()) {
+            return false;
+        }
+        return normalizedA.contains(normalizedB) || normalizedB.contains(normalizedA);
+    }
+
+    private boolean isMoreSpecific(TermHit candidate, TermHit existing) {
+        int candidateLength = normalizedLength(candidate);
+        int existingLength = normalizedLength(existing);
+        if (candidateLength != existingLength) {
+            return candidateLength > existingLength;
+        }
+        return candidate.getSeverity() != null
+                && (existing.getSeverity() == null || candidate.getSeverity().ordinal() > existing.getSeverity().ordinal());
+    }
+
+    private int normalizedLength(TermHit hit) {
+        return textNormalizer.normalizeForMatch(hit.getMatchedText() == null ? "" : hit.getMatchedText()).length();
     }
 
     /**
@@ -137,7 +204,8 @@ public class RuleMatchingService {
                     break;
                 }
                 SegmentTimeRange timeRange = index.locate(found, found + normalizedCandidate.length());
-                hits.add(createHit(job, segment, term, candidate, context, timeRange.start(), timeRange.end()));
+                hits.add(createHit(job, segment, term, candidate, context, timeRange.start(), timeRange.end(),
+                        found, found + normalizedCandidate.length()));
                 from = found + Math.max(1, normalizedCandidate.length());
             }
         }
@@ -192,7 +260,8 @@ public class RuleMatchingService {
         while (matcher.find()) {
             double start = mapSourceOffset(segment, matcher.start());
             double end = mapSourceOffset(segment, matcher.end());
-            hits.add(createHit(job, segment, term, matcher.group().trim(), context, start, Math.max(end, start + 0.2)));
+            hits.add(createHit(job, segment, term, matcher.group().trim(), context, start, Math.max(end, start + 0.2),
+                    matcher.start(), matcher.end()));
         }
     }
 
@@ -222,7 +291,8 @@ public class RuleMatchingService {
             while (matcher.find()) {
                 double start = mapSourceOffset(segment, matcher.start());
                 double end = mapSourceOffset(segment, matcher.end());
-                hits.add(createHit(job, segment, term, matcher.group(), context, start, Math.max(end, start + 0.2)));
+                hits.add(createHit(job, segment, term, matcher.group(), context, start, Math.max(end, start + 0.2),
+                        matcher.start(), matcher.end()));
             }
         } catch (PatternSyntaxException ignored) {
             // 跳过非法正则词条,避免一条坏规则拖垮整个检测任务。
@@ -239,11 +309,27 @@ public class RuleMatchingService {
             double startTime,
             double endTime
     ) {
+        return createHit(job, segment, term, matchedText, context, startTime, endTime, null, null);
+    }
+
+    private TermHit createHit(
+            DetectionJob job,
+            TranscriptSegment segment,
+            ViolationTerm term,
+            String matchedText,
+            String context,
+            double startTime,
+            double endTime,
+            Integer matchStartOffset,
+            Integer matchEndOffset
+    ) {
         TermHit hit = new TermHit();
         hit.setJobId(job.getId());
         hit.setSegmentId(segment.getId());
         hit.setTermId(term.getId());
         hit.setMatchedText(matchedText);
+        hit.setMatchStartOffset(matchStartOffset);
+        hit.setMatchEndOffset(matchEndOffset);
         hit.setCategory(term.getCategory());
         hit.setSeverity(term.getSeverity());
         hit.setRuleSource(term.getMatchType());

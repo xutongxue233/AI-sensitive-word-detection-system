@@ -19,6 +19,7 @@ import com.ai.moderation.repository.ViolationTermRepository;
 import com.ai.moderation.service.support.ExtractedHit;
 import com.ai.moderation.service.support.PreparedAiHit;
 import com.ai.moderation.service.support.SegmentTimeRange;
+import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -30,6 +31,11 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.function.IntConsumer;
 
 /**
  * AI 整篇提取召回:把整篇字幕 + 全量词库交给模型,一次性提取所有命中敏感词库的片段,
@@ -39,8 +45,19 @@ import java.util.Objects;
 @Service
 public class AiExtractionService {
     private static final Logger log = LoggerFactory.getLogger(AiExtractionService.class);
-    private static final int BATCH_SIZE = 20;
+    private static final int BATCH_SIZE = 40;
+    private static final int EXTRACT_CONCURRENCY = 4;
     private static final double OVERLAP_TOLERANCE = 0.1;
+
+    // 批次并行的专用线程池:与 buildTranscript 的 transcriptExecutor 同理,故意不注册为 Spring Bean,
+    // 与 @Async 框架执行器彻底分离,避免 processAsync 等待批次时同池自饥饿死锁。
+    // 并发度收敛在 4,既能摊平批次串行等待,又不至于触发模型网关限流。
+    private final ExecutorService extractExecutor = Executors.newFixedThreadPool(EXTRACT_CONCURRENCY, runnable -> {
+        Thread thread = new Thread(runnable);
+        thread.setName("ai-extract-" + thread.threadId());
+        thread.setDaemon(true);
+        return thread;
+    });
 
     private final SettingsService settingsService;
     private final TransactionTemplate transactionTemplate;
@@ -80,17 +97,30 @@ public class AiExtractionService {
         this.termRepository = termRepository;
     }
 
+    /** 容器销毁时优雅关闭提取线程池,避免守护线程残留。 */
+    @PreDestroy
+    public void shutdownExtractExecutor() {
+        extractExecutor.shutdown();
+    }
+
+    /** 不关心阶段内进度的入口,等价于传入空回调。 */
+    public void extractAndReview(Long jobId) {
+        extractAndReview(jobId, progress -> { });
+    }
+
     /**
      * AI 复核阶段入口:决定走「整篇提取」主路径还是「逐条复核」回退路径。
      * AI 未启用、或无字幕/无词库时,直接回退 {@link AiReviewService#reviewJob}(规则候选逐条复核)。
-     * 否则把字幕按 {@link #BATCH_SIZE} 分批交给模型整篇提取命中:
+     * 否则把字幕按 {@link #BATCH_SIZE} 分批,在 {@link #extractExecutor} 上以 {@link #EXTRACT_CONCURRENCY}
+     * 并发交给模型整篇提取命中(批与批相互独立,并行不影响结果,仅缩短墙钟时间):
      * 只要有任一批成功即采用提取结果(失败批仅告警跳过,不拖垮整体);全部批失败才整体回退逐条复核。
      * 提取命中经去重、与规则候选合并去重后,清掉原始候选并按置信度阈值落库;
      * 未被任一 AI 命中覆盖的规则残余候选仍交逐条复核兜底。
      *
-     * @param jobId 当前检测任务 id
+     * @param jobId         当前检测任务 id
+     * @param stageProgress 阶段内进度回调(0~100,按已完成批次数推进),由管线映射到全局进度
      */
-    public void extractAndReview(Long jobId) {
+    public void extractAndReview(Long jobId, IntConsumer stageProgress) {
         AiProperties ai = settingsService.currentAi();
         if (!ai.enabled()) {
             aiReviewService.reviewJob(jobId);
@@ -118,26 +148,33 @@ public class AiExtractionService {
                     jobId, segments.size() - aiSegments.size(), segments.size());
         }
 
-        List<ExtractedHit> extracted = new ArrayList<>();
-        boolean anyBatchOk = false;
         int batchCount = (aiSegments.size() + BATCH_SIZE - 1) / BATCH_SIZE;
-        log.info("AI 整篇提取开始 jobId={} segments={} terms={} batchSize={}",
-                jobId, aiSegments.size(), terms.size(), BATCH_SIZE);
+        log.info("AI 整篇提取开始 jobId={} segments={} terms={} batchSize={} batches={} concurrency={}",
+                jobId, aiSegments.size(), terms.size(), BATCH_SIZE, batchCount, EXTRACT_CONCURRENCY);
+        List<CompletableFuture<List<ExtractedHit>>> futures = new ArrayList<>(batchCount);
         for (int from = 0; from < aiSegments.size(); from += BATCH_SIZE) {
             List<TranscriptSegment> batch = aiSegments.subList(from, Math.min(aiSegments.size(), from + BATCH_SIZE));
             int batchNo = from / BATCH_SIZE + 1;
-            try {
-                log.info("AI 整篇提取批次开始 jobId={} batch={}/{} start={} size={}",
-                        jobId, batchNo, batchCount, from, batch.size());
+            futures.add(CompletableFuture.supplyAsync(() -> {
+                log.info("AI 整篇提取批次开始 jobId={} batch={}/{} size={}", jobId, batchNo, batchCount, batch.size());
                 List<ExtractedHit> batchHits = moderationClient.extract(batch, terms);
-                extracted.addAll(batchHits);
-                log.info("AI 整篇提取批次完成 jobId={} batch={}/{} hits={}",
-                        jobId, batchNo, batchCount, batchHits.size());
+                log.info("AI 整篇提取批次完成 jobId={} batch={}/{} hits={}", jobId, batchNo, batchCount, batchHits.size());
+                return batchHits;
+            }, extractExecutor));
+        }
+
+        // 按提交顺序逐个 join 汇总:失败批仅告警跳过;进度在调用线程上报,避免并发写任务行
+        List<ExtractedHit> extracted = new ArrayList<>();
+        boolean anyBatchOk = false;
+        for (int i = 0; i < futures.size(); i++) {
+            try {
+                extracted.addAll(futures.get(i).join());
                 anyBatchOk = true;
-            } catch (Exception ex) {
-                log.warn("AI 整篇提取批次失败 jobId={} batch={}/{} batchStart={} : {}",
-                        jobId, batchNo, batchCount, from, ex.toString());
+            } catch (CompletionException ex) {
+                Throwable cause = ex.getCause() == null ? ex : ex.getCause();
+                log.warn("AI 整篇提取批次失败 jobId={} batch={}/{} : {}", jobId, i + 1, batchCount, cause.toString());
             }
+            stageProgress.accept((i + 1) * 100 / batchCount);
         }
         if (!anyBatchOk) {
             log.warn("AI 整篇提取全部失败 jobId={},回退规则候选逐条复核", jobId);
@@ -145,7 +182,7 @@ public class AiExtractionService {
             return;
         }
 
-        List<PreparedAiHit> aiHits = dedupe(toAiHits(jobId, segments, terms, extracted));
+        List<PreparedAiHit> aiHits = dedupe(toAiHits(jobId, segments, terms, extracted), ai.confidenceThreshold());
         List<TermHit> residualRuleHits = residualRuleHits(ruleHits, aiHits);
 
         persistExtractedHits(jobId, aiHits, ai.confidenceThreshold());
@@ -223,9 +260,11 @@ public class AiExtractionService {
     }
 
     /**
-     * AI 命中内部去重:同段 + 时间区间重叠 + 同 termId/同分类 视为同一处,保留置信度最高者。
+     * AI 命中内部去重:同段 + 时间区间重叠 + (同 termId/同分类/命中文本互为包含) 视为同一处。
+     * 先保留达到置信度阈值的命中；两者都达到或都未达到时，再保留置信度更高者，
+     * 最后才用命中文本长度解决仍然相同的情况，避免低置信度长文本覆盖可靠短命中。
      */
-    private List<PreparedAiHit> dedupe(List<PreparedAiHit> candidates) {
+    private List<PreparedAiHit> dedupe(List<PreparedAiHit> candidates, double threshold) {
         List<PreparedAiHit> kept = new ArrayList<>();
         for (PreparedAiHit candidate : candidates) {
             PreparedAiHit duplicate = null;
@@ -237,12 +276,34 @@ public class AiExtractionService {
             }
             if (duplicate == null) {
                 kept.add(candidate);
-            } else if (confidence(candidate.hit()) > confidence(duplicate.hit())) {
+            } else if (isMoreSpecific(candidate.hit(), duplicate.hit(), threshold)) {
                 kept.remove(duplicate);
                 kept.add(candidate);
             }
         }
         return kept;
+    }
+
+    /** 去重保留策略:先比较是否达到阈值，再比较置信度，最后比较命中文本长度。 */
+    private boolean isMoreSpecific(TermHit candidate, TermHit existing, double threshold) {
+        boolean candidatePasses = confidence(candidate) >= threshold;
+        boolean existingPasses = confidence(existing) >= threshold;
+        if (candidatePasses != existingPasses) {
+            return candidatePasses;
+        }
+        if (Double.compare(confidence(candidate), confidence(existing)) != 0) {
+            return confidence(candidate) > confidence(existing);
+        }
+        int candidateLength = normalizedLength(candidate);
+        int existingLength = normalizedLength(existing);
+        if (candidateLength != existingLength) {
+            return candidateLength > existingLength;
+        }
+        return false;
+    }
+
+    private int normalizedLength(TermHit hit) {
+        return textNormalizer.normalizeForMatch(hit.getMatchedText() == null ? "" : hit.getMatchedText()).length();
     }
 
     /**
@@ -294,7 +355,20 @@ public class AiExtractionService {
         }
         boolean sameTerm = a.getTermId() != null && a.getTermId().equals(b.getTermId());
         boolean sameCategory = a.getCategory() != null && a.getCategory().equalsIgnoreCase(b.getCategory());
-        return sameTerm || sameCategory;
+        return sameTerm || sameCategory || isTextContained(a, b);
+    }
+
+    /**
+     * 命中文本归一化后互为包含(如「几十块」与「几十」)也视为同一处:
+     * 同位置文本命中多个词条时跨词条/跨分类去重,只展示更具体的一条。
+     */
+    private boolean isTextContained(TermHit a, TermHit b) {
+        String normalizedA = textNormalizer.normalizeForMatch(a.getMatchedText() == null ? "" : a.getMatchedText());
+        String normalizedB = textNormalizer.normalizeForMatch(b.getMatchedText() == null ? "" : b.getMatchedText());
+        if (normalizedA.isBlank() || normalizedB.isBlank()) {
+            return false;
+        }
+        return normalizedA.contains(normalizedB) || normalizedB.contains(normalizedA);
     }
 
     private ViolationTerm findTerm(List<ViolationTerm> terms, ExtractedHit eh) {

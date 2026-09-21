@@ -244,6 +244,8 @@ export interface TermBatchUpdateRequest {
 
 export type AiApiType = 'CHAT' | 'RESPONSES';
 
+export type AsrProvider = 'LOCAL' | 'ONLINE';
+
 export interface AppSettings {
   aiEnabled: boolean;
   aiApiType: AiApiType;
@@ -253,6 +255,10 @@ export interface AppSettings {
   aiTemperature: number;
   aiConfidenceThreshold: number;
   aiTimeoutSeconds: number;
+  asrProvider: AsrProvider; // 语音转写引擎:LOCAL 本地 Whisper / ONLINE 在线接口(如 MiMo)
+  asrOnlineBaseUrl: string;
+  asrOnlineApiKeyConfigured: boolean; // 同 aiApiKeyConfigured,不回传明文
+  asrOnlineModel: string;
   clipPaddingSeconds: number;
   clipPreciseExport: boolean; // 是否精确导出(按词级时间戳精剪),关闭则按整段处理
 }
@@ -266,6 +272,10 @@ export interface AppSettingsUpdate {
   aiTemperature?: number;
   aiConfidenceThreshold?: number;
   aiTimeoutSeconds?: number;
+  asrProvider?: AsrProvider;
+  asrOnlineBaseUrl?: string;
+  asrOnlineApiKey?: string;
+  asrOnlineModel?: string;
   clipPaddingSeconds?: number;
   clipPreciseExport?: boolean;
 }

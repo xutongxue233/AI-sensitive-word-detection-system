@@ -15,9 +15,12 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.util.List;
 
 /**
- * 逐条复核服务(回退策略):对规则召回的候选命中逐条判定违规与否,并按置信阈值把关写
+ * 逐条复核服务(回退策略):对规则召回的候选命中判定违规与否,并按置信阈值把关写
  * {@link ReviewStatus}。是整篇提取(主策略)之外的兜底,用于 AI 未启用、整篇提取整体失败、
  * 或整篇提取未覆盖的规则残余候选。
+ *
+ * <p>AI 启用时按 {@link #REVIEW_BATCH_SIZE} 条一批走 {@link AiModerationClient#reviewBatch} 批量判定
+ * (一批一次调用,省掉每条重复的指令开销);批量调用失败或模型遗漏某条时,该条回退单条复核。
  *
  * <p>三种来源的置信度策略:
  * <ul>
@@ -29,6 +32,7 @@ import java.util.List;
 @Service
 public class AiReviewService {
     private static final Logger log = LoggerFactory.getLogger(AiReviewService.class);
+    private static final int REVIEW_BATCH_SIZE = 10;
 
     private final SettingsService settingsService;
     private final TransactionTemplate transactionTemplate;
@@ -56,15 +60,40 @@ public class AiReviewService {
     }
 
     /**
-     * 对给定命中逐条复核并按阈值把关。AI 启用时调用模型,未启用时保留规则命中。
+     * 对给定命中复核并按阈值把关。AI 启用时按批走批量判定(单条批退化为单条调用,
+     * 批量失败或遗漏的条目回退单条复核),未启用时保留规则命中。
      * 传入的命中可为已持久化记录(update)或新建命中(insert),由 save 按 id 决定;
      * 先落库拿到自增 id,再写对应 ai_reviews,保证新建命中的 hitId 不为空。
      */
     public void reviewHits(List<TermHit> hits, AiProperties ai) {
         double threshold = ai.confidenceThreshold();
-        for (TermHit hit : hits) {
-            AiDecision decision = ai.enabled() ? review(hit) : localFallback(hit);
-            transactionTemplate.executeWithoutResult(status -> persistReview(hit, decision, threshold));
+        if (!ai.enabled()) {
+            for (TermHit hit : hits) {
+                AiDecision decision = localFallback(hit);
+                transactionTemplate.executeWithoutResult(status -> persistReview(hit, decision, threshold));
+            }
+            return;
+        }
+        for (int from = 0; from < hits.size(); from += REVIEW_BATCH_SIZE) {
+            List<TermHit> batch = hits.subList(from, Math.min(hits.size(), from + REVIEW_BATCH_SIZE));
+            List<AiDecision> batchDecisions = batch.size() == 1 ? null : reviewBatchSafe(batch);
+            for (int i = 0; i < batch.size(); i++) {
+                TermHit hit = batch.get(i);
+                AiDecision fromBatch = batchDecisions == null ? null : batchDecisions.get(i);
+                AiDecision decision = fromBatch != null ? fromBatch : review(hit);
+                transactionTemplate.executeWithoutResult(status -> persistReview(hit, decision, threshold));
+            }
+        }
+    }
+
+    /** 批量复核一批候选;调用失败或返回长度不符时返回 null,整批回退单条复核。 */
+    private List<AiDecision> reviewBatchSafe(List<TermHit> batch) {
+        try {
+            List<AiDecision> decisions = moderationClient.reviewBatch(batch);
+            return decisions != null && decisions.size() == batch.size() ? decisions : null;
+        } catch (Exception ex) {
+            log.warn("AI 批量复核失败,整批回退单条复核 size={} : {}", batch.size(), ex.toString());
+            return null;
         }
     }
 

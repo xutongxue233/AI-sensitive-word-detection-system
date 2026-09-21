@@ -256,30 +256,175 @@ function Copy-DirectoryClean {
     Copy-Item -LiteralPath $Source -Destination $Destination -Recurse -Force
 }
 
+function Get-PythonRuntimeMode {
+    param([string]$PythonExe)
+
+    # Keep this probe deliberately small: importing onnxruntime is enough to
+    # tell whether the OCR venv has the CPU or DirectML provider installed.
+    # A failed import is reported as "missing" so the caller repairs the venv
+    # instead of treating a half-installed environment as ready.
+    $probe = "import onnxruntime; print('dml' if 'DmlExecutionProvider' in onnxruntime.get_available_providers() else 'cpu')"
+    try {
+        $output = & $PythonExe -c $probe 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            return "missing"
+        }
+        $mode = ($output | Select-Object -Last 1).ToString().Trim().ToLowerInvariant()
+        if ($mode -eq "dml" -or $mode -eq "cpu") {
+            return $mode
+        }
+    } catch {
+        return "missing"
+    }
+    return "missing"
+}
+
+function Test-PythonPip {
+    param([string]$PythonExe)
+
+    try {
+        $null = & $PythonExe -m pip --version 2>$null
+        return $LASTEXITCODE -eq 0
+    } catch {
+        return $false
+    }
+}
+
+function Get-PythonDependencyState {
+    param(
+        [string]$RequirementsPath,
+        [string[]]$ExtraPackages,
+        [switch]$UseDirectML
+    )
+
+    if (-not (Test-Path $RequirementsPath)) {
+        throw "Python requirements file was not found: $RequirementsPath"
+    }
+    $hash = (Get-FileHash -LiteralPath $RequirementsPath -Algorithm SHA256).Hash
+    $extras = if ($ExtraPackages) { $ExtraPackages -join ";" } else { "" }
+    return "$hash|$extras|$([bool]$UseDirectML)"
+}
+
+function Install-PythonRequirements {
+    param(
+        [string]$PythonExe,
+        [string]$ServiceDir,
+        [string[]]$ExtraPackages
+    )
+
+    Invoke-Checked -FilePath $PythonExe -Arguments @("-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel") -WorkingDirectory $ServiceDir
+    Invoke-Checked -FilePath $PythonExe -Arguments @("-m", "pip", "install", "-r", "requirements.txt") -WorkingDirectory $ServiceDir
+    foreach ($package in $ExtraPackages) {
+        Invoke-Checked -FilePath $PythonExe -Arguments @("-m", "pip", "install", $package) -WorkingDirectory $ServiceDir
+    }
+}
+
+function Ensure-OcrRuntime {
+    param(
+        [string]$PythonExe,
+        [string]$ServiceDir,
+        [switch]$UseDirectML
+    )
+
+    $mode = Get-PythonRuntimeMode -PythonExe $PythonExe
+    $desired = if ($UseDirectML) { "dml" } else { "cpu" }
+    if ($mode -eq $desired) {
+        return
+    }
+
+    if ($UseDirectML) {
+        Write-Host "Installing DirectML onnxruntime for ocr-service..."
+        try {
+            # The two distributions expose the same import name and cannot be
+            # installed side by side. Remove both names before migration.
+            Invoke-Checked -FilePath $PythonExe -Arguments @("-m", "pip", "uninstall", "-y", "onnxruntime", "onnxruntime-directml") -WorkingDirectory $ServiceDir
+            Invoke-Checked -FilePath $PythonExe -Arguments @("-m", "pip", "install", "onnxruntime-directml==1.23.0") -WorkingDirectory $ServiceDir
+        } catch {
+            # Do not leave a venv without an onnxruntime implementation. The
+            # CPU package is a safe recovery path; the state marker is written
+            # only after this function returns, so a later start retries DML.
+            Write-Warning "DirectML installation failed; restoring CPU onnxruntime before retrying next start."
+            try {
+                Install-PythonRequirements -PythonExe $PythonExe -ServiceDir $ServiceDir -ExtraPackages @()
+            } catch {
+                Write-Warning "CPU onnxruntime recovery also failed: $($_.Exception.Message)"
+            }
+            throw
+        }
+    } else {
+        Write-Host "Switching ocr-service to CPU onnxruntime..."
+        try {
+            Invoke-Checked -FilePath $PythonExe -Arguments @("-m", "pip", "uninstall", "-y", "onnxruntime-directml") -WorkingDirectory $ServiceDir
+            Invoke-Checked -FilePath $PythonExe -Arguments @("-m", "pip", "install", "onnxruntime") -WorkingDirectory $ServiceDir
+        } catch {
+            # A failed migration must be visible and must not be marked ready.
+            # The next invocation probes the provider again and retries.
+            throw
+        }
+    }
+
+    $actual = Get-PythonRuntimeMode -PythonExe $PythonExe
+    if ($actual -ne $desired) {
+        throw "onnxruntime migration did not provide the requested '$desired' provider (detected '$actual')."
+    }
+}
+
 function Ensure-PythonVenv {
     param(
         [string]$Root,
         [string]$ServiceName,
         [string]$PythonExe,
-        [string[]]$ExtraPackages = @()
+        [string[]]$ExtraPackages = @(),
+        [switch]$UseDirectML
     )
 
     $serviceDir = Join-Path $Root $ServiceName
-    $venvPython = Join-Path $serviceDir ".venv\Scripts\python.exe"
-    if (Test-Path $venvPython) {
-        Write-Host "$ServiceName\.venv exists; skipping Python dependency install."
-        return
+    $venvDir = Join-Path $serviceDir ".venv"
+    $venvPython = Join-Path $venvDir "Scripts\python.exe"
+    $requirementsPath = Join-Path $serviceDir "requirements.txt"
+    $statePath = Join-Path $venvDir ".codex-dependencies.state"
+
+    $created = $false
+    if (-not (Test-Path $venvPython)) {
+        if (Test-Path $venvDir) {
+            Write-Warning "$ServiceName\.venv is incomplete; removing it so the next setup starts clean."
+            Remove-Item -LiteralPath $venvDir -Recurse -Force
+        }
+        if (-not $PythonExe -or -not (Test-Path $PythonExe)) {
+            throw "Python 3.10 is required to create $ServiceName\.venv."
+        }
+        Invoke-Checked -FilePath $PythonExe -Arguments @("-m", "venv", ".venv") -WorkingDirectory $serviceDir
+        $created = $true
     }
 
-    if (-not $PythonExe -or -not (Test-Path $PythonExe)) {
-        throw "Python 3.10 is required to create $ServiceName\.venv."
+    if (-not (Test-PythonPip -PythonExe $venvPython)) {
+        if (-not $PythonExe -or -not (Test-Path $PythonExe)) {
+            throw "$ServiceName\.venv is missing a working pip and Python 3.10 is unavailable to rebuild it."
+        }
+        Write-Warning "$ServiceName\.venv has no working pip; removing it so setup can recreate it."
+        Remove-Item -LiteralPath $venvDir -Recurse -Force
+        Invoke-Checked -FilePath $PythonExe -Arguments @("-m", "venv", ".venv") -WorkingDirectory $serviceDir
+        $created = $true
     }
-    Invoke-Checked -FilePath $PythonExe -Arguments @("-m", "venv", ".venv") -WorkingDirectory $serviceDir
-    Invoke-Checked -FilePath $venvPython -Arguments @("-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel") -WorkingDirectory $serviceDir
-    Invoke-Checked -FilePath $venvPython -Arguments @("-m", "pip", "install", "-r", "requirements.txt") -WorkingDirectory $serviceDir
-    foreach ($package in $ExtraPackages) {
-        Invoke-Checked -FilePath $venvPython -Arguments @("-m", "pip", "install", $package) -WorkingDirectory $serviceDir
+
+    $desiredState = Get-PythonDependencyState -RequirementsPath $requirementsPath -ExtraPackages $ExtraPackages -UseDirectML:$UseDirectML
+    $recordedState = if (Test-Path $statePath) { (Get-Content -LiteralPath $statePath -Raw).Trim() } else { "" }
+    $needsRequirements = $created -or ($recordedState -ne $desiredState)
+
+    if ($needsRequirements) {
+        Write-Host "Installing or repairing $ServiceName Python dependencies..."
+        Install-PythonRequirements -PythonExe $venvPython -ServiceDir $serviceDir -ExtraPackages $ExtraPackages
+    } else {
+        Write-Host "$ServiceName\.venv dependencies are up to date; checking runtime provider."
     }
+
+    if ($ServiceName -eq "ocr-service") {
+        Ensure-OcrRuntime -PythonExe $venvPython -ServiceDir $serviceDir -UseDirectML:$UseDirectML
+    }
+
+    # Write the marker only after every install/migration and provider probe
+    # succeeds. A failed setup therefore remains retryable on the next start.
+    Set-Content -LiteralPath $statePath -Value $desiredState -Encoding UTF8
 }
 
 function Build-BackendJar {
@@ -430,12 +575,16 @@ function Ensure-Ready {
 
     $asrVenvPython = Join-Path $Root "asr-service\.venv\Scripts\python.exe"
     $ocrVenvPython = Join-Path $Root "ocr-service\.venv\Scripts\python.exe"
-    $needsPython = -not (Test-Path $asrVenvPython) -or -not (Test-Path $ocrVenvPython)
+    $needsPython = `
+        -not (Test-Path $asrVenvPython) -or `
+        -not (Test-Path $ocrVenvPython) -or `
+        -not (Test-PythonPip -PythonExe $asrVenvPython) -or `
+        -not (Test-PythonPip -PythonExe $ocrVenvPython)
     $python = if ($needsPython) { Resolve-Python310 -Root $Root } else { "" }
 
     Write-Step "Checking Python service dependencies"
     Ensure-PythonVenv -Root $Root -ServiceName "asr-service" -PythonExe $python
-    Ensure-PythonVenv -Root $Root -ServiceName "ocr-service" -PythonExe $python
+    Ensure-PythonVenv -Root $Root -ServiceName "ocr-service" -PythonExe $python -UseDirectML
 
     if ($needsBuild) {
         $npm = Resolve-Executable -Root $Root -RuntimePath ".runtime\node\npm.cmd" -CommandName "npm.cmd" -DisplayName "Node.js/npm"
