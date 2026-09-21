@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("start", "stop", "status", "setup", "rebuild")]
+    [ValidateSet("start", "stop", "status", "setup", "rebuild", "download-model")]
     [string]$Action = "start",
     [switch]$NoBrowser,
     [switch]$RunTests
@@ -90,10 +90,25 @@ function Initialize-LocalEnvironment {
 
     if (-not $env:WHISPER_DEVICE) { $env:WHISPER_DEVICE = "cpu" }
     if (-not $env:WHISPER_FP16) { $env:WHISPER_FP16 = "false" }
+    if (-not $env:WHISPER_DOWNLOAD_ROOT) { $env:WHISPER_DOWNLOAD_ROOT = Join-Path $runtimeRoot "models\faster-whisper" }
+    if (-not $env:WHISPER_LOCAL_FILES_ONLY) { $env:WHISPER_LOCAL_FILES_ONLY = "false" }
+    if (-not $env:WHISPER_PRELOAD) { $env:WHISPER_PRELOAD = "false" }
+    if (-not $env:PIP_CACHE_DIR) { $env:PIP_CACHE_DIR = Join-Path $runtimeRoot "pip-cache" }
+    if (-not $env:PIP_TIMEOUT) { $env:PIP_TIMEOUT = "120" }
+    if (-not $env:PIP_RETRIES) { $env:PIP_RETRIES = "4" }
+    if (-not $env:OCR_USE_DML) { $env:OCR_USE_DML = "0" }
+    if (-not $env:OCR_MAX_WIDTH) { $env:OCR_MAX_WIDTH = "1280" }
+    if (-not $env:OCR_UPSCALE) { $env:OCR_UPSCALE = "false" }
     if (-not $env:PADDLE_OCR_USE_GPU) { $env:PADDLE_OCR_USE_GPU = "false" }
     if (-not $env:PADDLE_OCR_MIN_TEXT_LENGTH) { $env:PADDLE_OCR_MIN_TEXT_LENGTH = "2" }
     if (-not $env:PADDLE_OCR_DROP_SHORT_LATIN) { $env:PADDLE_OCR_DROP_SHORT_LATIN = "true" }
     if (-not $env:PADDLE_OCR_MIN_REPEAT_FRAMES) { $env:PADDLE_OCR_MIN_REPEAT_FRAMES = "2" }
+
+    foreach ($cacheDir in @($env:PIP_CACHE_DIR, $env:WHISPER_DOWNLOAD_ROOT)) {
+        if ($cacheDir -and -not (Test-Path $cacheDir)) {
+            New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
+        }
+    }
 }
 
 function Get-CommandText {
@@ -305,6 +320,21 @@ function Get-PythonDependencyState {
     return "$hash|$extras|$([bool]$UseDirectML)"
 }
 
+function Get-PipOptions {
+    # Keep all network/cache knobs in one place so setup, provider migration and
+    # offline wheelhouse installs use the same user-configured behavior.
+    $options = @()
+    if ($env:PIP_INDEX_URL) { $options += @("--index-url", $env:PIP_INDEX_URL) }
+    if ($env:PIP_EXTRA_INDEX_URL) { $options += @("--extra-index-url", $env:PIP_EXTRA_INDEX_URL) }
+    if ($env:PIP_FIND_LINKS) { $options += @("--find-links", $env:PIP_FIND_LINKS) }
+    if ($env:PIP_NO_INDEX -match "^(1|true|yes|on)$") { $options += "--no-index" }
+    if ($env:PIP_CACHE_DIR) { $options += @("--cache-dir", $env:PIP_CACHE_DIR) }
+    if ($env:PIP_TIMEOUT) { $options += @("--timeout", $env:PIP_TIMEOUT) }
+    if ($env:PIP_RETRIES) { $options += @("--retries", $env:PIP_RETRIES) }
+    if ($env:PIP_TRUSTED_HOST) { $options += @("--trusted-host", $env:PIP_TRUSTED_HOST) }
+    return $options
+}
+
 function Install-PythonRequirements {
     param(
         [string]$PythonExe,
@@ -312,10 +342,11 @@ function Install-PythonRequirements {
         [string[]]$ExtraPackages
     )
 
-    Invoke-Checked -FilePath $PythonExe -Arguments @("-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel") -WorkingDirectory $ServiceDir
-    Invoke-Checked -FilePath $PythonExe -Arguments @("-m", "pip", "install", "-r", "requirements.txt") -WorkingDirectory $ServiceDir
+    $pipOptions = @(Get-PipOptions)
+    Invoke-Checked -FilePath $PythonExe -Arguments (@("-m", "pip") + $pipOptions + @("install", "--upgrade", "pip", "setuptools", "wheel")) -WorkingDirectory $ServiceDir
+    Invoke-Checked -FilePath $PythonExe -Arguments (@("-m", "pip") + $pipOptions + @("install", "-r", "requirements.txt")) -WorkingDirectory $ServiceDir
     foreach ($package in $ExtraPackages) {
-        Invoke-Checked -FilePath $PythonExe -Arguments @("-m", "pip", "install", $package) -WorkingDirectory $ServiceDir
+        Invoke-Checked -FilePath $PythonExe -Arguments (@("-m", "pip") + $pipOptions + @("install", $package)) -WorkingDirectory $ServiceDir
     }
 }
 
@@ -332,13 +363,15 @@ function Ensure-OcrRuntime {
         return
     }
 
+    $pipOptions = @(Get-PipOptions)
+
     if ($UseDirectML) {
         Write-Host "Installing DirectML onnxruntime for ocr-service..."
         try {
             # The two distributions expose the same import name and cannot be
             # installed side by side. Remove both names before migration.
-            Invoke-Checked -FilePath $PythonExe -Arguments @("-m", "pip", "uninstall", "-y", "onnxruntime", "onnxruntime-directml") -WorkingDirectory $ServiceDir
-            Invoke-Checked -FilePath $PythonExe -Arguments @("-m", "pip", "install", "onnxruntime-directml==1.23.0") -WorkingDirectory $ServiceDir
+            Invoke-Checked -FilePath $PythonExe -Arguments (@("-m", "pip") + $pipOptions + @("uninstall", "-y", "onnxruntime", "onnxruntime-directml")) -WorkingDirectory $ServiceDir
+            Invoke-Checked -FilePath $PythonExe -Arguments (@("-m", "pip") + $pipOptions + @("install", "onnxruntime-directml==1.23.0")) -WorkingDirectory $ServiceDir
         } catch {
             # Do not leave a venv without an onnxruntime implementation. The
             # CPU package is a safe recovery path; the state marker is written
@@ -354,8 +387,8 @@ function Ensure-OcrRuntime {
     } else {
         Write-Host "Switching ocr-service to CPU onnxruntime..."
         try {
-            Invoke-Checked -FilePath $PythonExe -Arguments @("-m", "pip", "uninstall", "-y", "onnxruntime-directml") -WorkingDirectory $ServiceDir
-            Invoke-Checked -FilePath $PythonExe -Arguments @("-m", "pip", "install", "onnxruntime") -WorkingDirectory $ServiceDir
+            Invoke-Checked -FilePath $PythonExe -Arguments (@("-m", "pip") + $pipOptions + @("uninstall", "-y", "onnxruntime-directml")) -WorkingDirectory $ServiceDir
+            Invoke-Checked -FilePath $PythonExe -Arguments (@("-m", "pip") + $pipOptions + @("install", "onnxruntime")) -WorkingDirectory $ServiceDir
         } catch {
             # A failed migration must be visible and must not be marked ready.
             # The next invocation probes the provider again and retries.
@@ -582,9 +615,13 @@ function Ensure-Ready {
         -not (Test-PythonPip -PythonExe $ocrVenvPython)
     $python = if ($needsPython) { Resolve-Python310 -Root $Root } else { "" }
 
+    # DirectML is opt-in. CPU onnxruntime is the compatible default for
+    # machines without a supported GPU or Windows ML runtime.
+    $useDirectML = $env:OCR_USE_DML -match "^(1|true|yes|on|dml)$"
+
     Write-Step "Checking Python service dependencies"
     Ensure-PythonVenv -Root $Root -ServiceName "asr-service" -PythonExe $python
-    Ensure-PythonVenv -Root $Root -ServiceName "ocr-service" -PythonExe $python -UseDirectML
+    Ensure-PythonVenv -Root $Root -ServiceName "ocr-service" -PythonExe $python -UseDirectML:$useDirectML
 
     if ($needsBuild) {
         $npm = Resolve-Executable -Root $Root -RuntimePath ".runtime\node\npm.cmd" -CommandName "npm.cmd" -DisplayName "Node.js/npm"
@@ -617,6 +654,17 @@ function Ensure-Ready {
         Java = $java
         BackendJar = $backendJar
     }
+}
+
+function Warmup-AsrModel {
+    param([string]$Root, [string]$PythonExe)
+
+    if (-not (Test-Path $PythonExe)) {
+        throw "ASR Python environment not found: $PythonExe"
+    }
+    Write-Step "Preparing faster-whisper model"
+    $code = "from app import get_model; get_model(); print('faster-whisper model is ready')"
+    Invoke-Checked -FilePath $PythonExe -Arguments @("-c", $code) -WorkingDirectory (Join-Path $Root "asr-service")
 }
 
 function Write-Status {
@@ -662,9 +710,21 @@ if ($Action -eq "status") {
     exit 0
 }
 
+if ($Action -eq "download-model") {
+    $venvPython = Join-Path $Root "asr-service\.venv\Scripts\python.exe"
+    $python = if (Test-Path $venvPython) { "" } else { Resolve-Python310 -Root $Root }
+    Write-Step "Checking ASR Python dependencies"
+    Ensure-PythonVenv -Root $Root -ServiceName "asr-service" -PythonExe $python
+    Warmup-AsrModel -Root $Root -PythonExe $venvPython
+    exit 0
+}
+
 $forceBuild = $Action -in @("setup", "rebuild")
 $ready = Ensure-Ready -Root $Root -ForceBuild $forceBuild
 if ($Action -in @("setup", "rebuild")) {
+    if ($env:WHISPER_PRELOAD -match "^(1|true|yes|on)$") {
+        Warmup-AsrModel -Root $Root -PythonExe (Join-Path $Root "asr-service\.venv\Scripts\python.exe")
+    }
     Write-Host "Setup completed. Double-click start-local.bat to start."
     exit 0
 }

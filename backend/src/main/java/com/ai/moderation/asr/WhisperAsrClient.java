@@ -9,6 +9,9 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
+import java.io.ByteArrayInputStream;
+import java.io.InputStream;
+import java.io.SequenceInputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -16,7 +19,7 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
 
@@ -83,8 +86,8 @@ public class WhisperAsrClient {
     }
 
     /**
-     * 构造并发送 multipart 请求到 asr-service。音频文件较小,故 {@link #addFileField} 直接全量读入内存拼包,
-     * 无需流式上传。强制 HTTP/1.1 避免与服务端 h2 协商问题;附带 {@code word_timestamps=true} 索取词级时间戳。
+     * 构造并发送 multipart 请求到 asr-service。音频本体通过 {@code InputStream} 分段读取，避免把整段音频
+     * 再复制到 Java 堆。强制 HTTP/1.1 避免与服务端 h2 协商问题;附带 {@code word_timestamps=true} 索取词级时间戳。
      * 在线引擎时追加 provider/online_* form 字段,asr-service 据此改调在线识别接口。
      *
      * @param audioPath   音频文件路径
@@ -95,21 +98,14 @@ public class WhisperAsrClient {
      */
     private TranscriptionResult sendMultipart(Path audioPath, AsrOnlineSettings asrSettings) throws IOException, InterruptedException {
         String boundary = "----asr-" + UUID.randomUUID();
-        List<byte[]> body = new ArrayList<>();
-        addFormField(body, boundary, "word_timestamps", "true");
-        if (asrSettings.online()) {
-            addFormField(body, boundary, "provider", "online");
-            addFormField(body, boundary, "online_base_url", asrSettings.baseUrl());
-            addFormField(body, boundary, "online_api_key", asrSettings.apiKey());
-            addFormField(body, boundary, "online_model", asrSettings.model());
-        }
-        addFileField(body, boundary, "file", audioPath);
-        body.add(("--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
+        byte[] prefix = multipartPrefix(boundary, audioPath, asrSettings);
+        byte[] suffix = ("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8);
 
         HttpRequest request = HttpRequest.newBuilder(asrUri())
                 .version(HttpClient.Version.HTTP_1_1)
                 .header("Content-Type", "multipart/form-data; boundary=" + boundary)
-                .POST(HttpRequest.BodyPublishers.ofByteArrays(body))
+                .POST(HttpRequest.BodyPublishers.ofInputStream(
+                        () -> multipartStream(audioPath, prefix, suffix)))
                 .build();
         HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
@@ -129,23 +125,39 @@ public class WhisperAsrClient {
         return URI.create(baseUrl + path);
     }
 
-    /** 追加一个普通 multipart 文本字段(form-data)。 */
-    private void addFormField(List<byte[]> body, String boundary, String name, String value) {
-        body.add(("--" + boundary + "\r\n"
-                + "Content-Disposition: form-data; name=\"" + name + "\"\r\n\r\n"
-                + value + "\r\n").getBytes(StandardCharsets.UTF_8));
+    /** 构造 multipart 前缀(普通字段与文件头);音频文件本体由流式 BodyPublisher 读取。 */
+    private byte[] multipartPrefix(String boundary, Path audioPath, AsrOnlineSettings asrSettings) {
+        StringBuilder builder = new StringBuilder();
+        appendFormField(builder, boundary, "word_timestamps", "true");
+        if (asrSettings.online()) {
+            appendFormField(builder, boundary, "provider", "online");
+            appendFormField(builder, boundary, "online_base_url", asrSettings.baseUrl());
+            appendFormField(builder, boundary, "online_api_key", asrSettings.apiKey());
+            appendFormField(builder, boundary, "online_model", asrSettings.model());
+        }
+        String filename = audioPath.getFileName().toString().replace("\"", "_");
+        builder.append("--").append(boundary).append("\r\n")
+                .append("Content-Disposition: form-data; name=\"file\"; filename=\"")
+                .append(filename).append("\"\r\n")
+                .append("Content-Type: application/octet-stream\r\n\r\n");
+        return builder.toString().getBytes(StandardCharsets.UTF_8);
     }
 
-    /**
-     * 追加一个文件 multipart 字段:文件名转义双引号后写头,随后将文件内容<b>全量读入内存</b>拼入包体。
-     * 仅适用于较小音频;大文件应改用流式上传(参见 {@link SubtitleOcrClient} 的 SequenceInputStream 方案)。
-     */
-    private void addFileField(List<byte[]> body, String boundary, String name, Path file) throws IOException {
-        String filename = file.getFileName().toString().replace("\"", "_");
-        body.add(("--" + boundary + "\r\n"
-                + "Content-Disposition: form-data; name=\"" + name + "\"; filename=\"" + filename + "\"\r\n"
-                + "Content-Type: application/octet-stream\r\n\r\n").getBytes(StandardCharsets.UTF_8));
-        body.add(Files.readAllBytes(file));
-        body.add("\r\n".getBytes(StandardCharsets.UTF_8));
+    private void appendFormField(StringBuilder builder, String boundary, String name, String value) {
+        builder.append("--").append(boundary).append("\r\n")
+                .append("Content-Disposition: form-data; name=\"").append(name).append("\"\r\n\r\n")
+                .append(value).append("\r\n");
+    }
+
+    private InputStream multipartStream(Path audioPath, byte[] prefix, byte[] suffix) {
+        try {
+            return new SequenceInputStream(Collections.enumeration(List.of(
+                    new ByteArrayInputStream(prefix),
+                    Files.newInputStream(audioPath),
+                    new ByteArrayInputStream(suffix)
+            )));
+        } catch (IOException ex) {
+            throw new java.io.UncheckedIOException(ex);
+        }
     }
 }

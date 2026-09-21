@@ -19,7 +19,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | asr-service | FastAPI / faster-whisper(**CTranslate2,纯 CPU**) | 9000 | 语音转写,词级时间戳 |
 | ocr-service | FastAPI / RapidOCR(**onnxruntime,可选 DirectML 核显**) | 9001 | 画面硬字幕识别 |
 
-**两个 Python 服务均为轻量引擎**(面向核显/无 NVIDIA 机器):ASR 用 faster-whisper(CTranslate2 INT8,纯 CPU——CTranslate2 无任何核显后端,勿尝试给 ASR 上 GPU),OCR 用 rapidocr-onnxruntime(PP-OCRv4 模型随 wheel 自带、离线可用,无 paddle)。OCR venv 装的是 `onnxruntime-directml`(与 CPU 版 onnxruntime 同名 import、不能共存,须先卸载再装,`start-local.bat setup` 已自动换装):DmlExecutionProvider 可用时默认走核显推理(AMD/Intel/NVIDIA 的 DX12 GPU 通吃),`OCR_USE_DML=0` 可强制纯 CPU;抽帧解码默认尝试 D3D11 硬解、失败回退软解(`OCR_HW_DECODE`)。两服务仍保持独立进程、独立 venv 的拓扑(职责与依赖隔离);历史上的 torch/paddle CUDA 冲突随引擎更换已不存在,但**不要**往这两个 venv 里引入 torch/paddle 等重依赖。OCR 模块内 `PADDLE_OCR_*` 环境变量名与 `probe_paddle_gpu` 等公开名是 PaddleOCR 时代的遗留命名,为兼容 /health 字段与既有配置而保留。
+**两个 Python 服务均为轻量引擎**(面向核显/无 NVIDIA 机器):ASR 用 faster-whisper(CTranslate2 INT8,纯 CPU——CTranslate2 无任何核显后端,勿尝试给 ASR 上 GPU),OCR 用 rapidocr-onnxruntime(PP-OCRv4 模型随 wheel 自带、离线可用,无 paddle)。OCR 默认安装 CPU onnxruntime，只有设置 `OCR_USE_DML=1` 才换装 `onnxruntime-directml` 走核显推理；抽帧解码默认尝试 D3D11 硬解、失败回退软解(`OCR_HW_DECODE`)。两服务仍保持独立进程、独立 venv 的拓扑(职责与依赖隔离);历史上的 torch/paddle CUDA 冲突随引擎更换已不存在,但**不要**往这两个 venv 里引入 torch/paddle 等重依赖。OCR 模块内 `PADDLE_OCR_*` 环境变量名与 `probe_paddle_gpu` 等公开名是 PaddleOCR 时代的遗留命名,为兼容 /health 字段与既有配置而保留。
 
 后端是混合架构中唯一不可被 Python 替代的部分(转写/OCR 推理保持独立进程,职责与依赖隔离)。`backend/tools/ffmpeg/bin/{ffmpeg,ffprobe}.exe` 不入库,由本地提供或环境变量 `FFMPEG_PATH`/`FFPROBE_PATH` 覆盖。
 

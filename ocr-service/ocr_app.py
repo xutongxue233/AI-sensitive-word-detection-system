@@ -46,6 +46,8 @@ async def health():
         "minTextLength": ocr_core.PADDLE_OCR_MIN_TEXT_LENGTH,
         "dropShortLatin": ocr_core.PADDLE_OCR_DROP_SHORT_LATIN,
         "minRepeatFrames": ocr_core.PADDLE_OCR_MIN_REPEAT_FRAMES,
+        "maxWidth": ocr_core.OCR_MAX_WIDTH,
+        "upscale": ocr_core.OCR_UPSCALE,
         "ocrModelLoaded": ocr_core.ocr_model_loaded(),
         "gpu": ocr_core.probe_paddle_gpu(),
     }
@@ -74,8 +76,8 @@ async def save_upload_to_temp(file: UploadFile, fallback_name: str) -> str:
 @app.post("/ocr-subtitles")
 async def ocr_subtitles(
     file: UploadFile = File(...),
-    interval_seconds: float = Form(0.75),
-    crop_bottom_ratio: float = Form(1.0),
+    interval_seconds: float = Form(1.5),
+    crop_bottom_ratio: float = Form(0.35),
     min_confidence: float = Form(0.65),
     lang: str = Form(ocr_core.PADDLE_OCR_LANG),
 ):

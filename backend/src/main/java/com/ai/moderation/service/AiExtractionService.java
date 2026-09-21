@@ -22,6 +22,7 @@ import com.ai.moderation.service.support.SegmentTimeRange;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -46,18 +47,13 @@ import java.util.function.IntConsumer;
 public class AiExtractionService {
     private static final Logger log = LoggerFactory.getLogger(AiExtractionService.class);
     private static final int BATCH_SIZE = 40;
-    private static final int EXTRACT_CONCURRENCY = 4;
     private static final double OVERLAP_TOLERANCE = 0.1;
 
     // 批次并行的专用线程池:与 buildTranscript 的 transcriptExecutor 同理,故意不注册为 Spring Bean,
     // 与 @Async 框架执行器彻底分离,避免 processAsync 等待批次时同池自饥饿死锁。
     // 并发度收敛在 4,既能摊平批次串行等待,又不至于触发模型网关限流。
-    private final ExecutorService extractExecutor = Executors.newFixedThreadPool(EXTRACT_CONCURRENCY, runnable -> {
-        Thread thread = new Thread(runnable);
-        thread.setName("ai-extract-" + thread.threadId());
-        thread.setDaemon(true);
-        return thread;
-    });
+    private final ExecutorService extractExecutor;
+    private final int extractionConcurrency;
 
     private final SettingsService settingsService;
     private final TransactionTemplate transactionTemplate;
@@ -82,7 +78,8 @@ public class AiExtractionService {
             AiReviewRepository reviewRepository,
             TranscriptSegmentRepository segmentRepository,
             TranscriptWordRepository wordRepository,
-            ViolationTermRepository termRepository
+            ViolationTermRepository termRepository,
+            @Value("${app.ai.extraction-concurrency:1}") int extractionConcurrency
     ) {
         this.settingsService = settingsService;
         this.transactionTemplate = transactionTemplate;
@@ -95,6 +92,14 @@ public class AiExtractionService {
         this.segmentRepository = segmentRepository;
         this.wordRepository = wordRepository;
         this.termRepository = termRepository;
+        int workers = Math.max(1, Math.min(4, extractionConcurrency));
+        this.extractionConcurrency = workers;
+        this.extractExecutor = Executors.newFixedThreadPool(workers, runnable -> {
+            Thread thread = new Thread(runnable);
+            thread.setName("ai-extract-" + thread.threadId());
+            thread.setDaemon(true);
+            return thread;
+        });
     }
 
     /** 容器销毁时优雅关闭提取线程池,避免守护线程残留。 */
@@ -111,8 +116,7 @@ public class AiExtractionService {
     /**
      * AI 复核阶段入口:决定走「整篇提取」主路径还是「逐条复核」回退路径。
      * AI 未启用、或无字幕/无词库时,直接回退 {@link AiReviewService#reviewJob}(规则候选逐条复核)。
-     * 否则把字幕按 {@link #BATCH_SIZE} 分批,在 {@link #extractExecutor} 上以 {@link #EXTRACT_CONCURRENCY}
-     * 并发交给模型整篇提取命中(批与批相互独立,并行不影响结果,仅缩短墙钟时间):
+     * 否则把字幕按 {@link #BATCH_SIZE} 分批,在可配置线程池上并发交给模型整篇提取命中:
      * 只要有任一批成功即采用提取结果(失败批仅告警跳过,不拖垮整体);全部批失败才整体回退逐条复核。
      * 提取命中经去重、与规则候选合并去重后,清掉原始候选并按置信度阈值落库;
      * 未被任一 AI 命中覆盖的规则残余候选仍交逐条复核兜底。
@@ -150,7 +154,7 @@ public class AiExtractionService {
 
         int batchCount = (aiSegments.size() + BATCH_SIZE - 1) / BATCH_SIZE;
         log.info("AI 整篇提取开始 jobId={} segments={} terms={} batchSize={} batches={} concurrency={}",
-                jobId, aiSegments.size(), terms.size(), BATCH_SIZE, batchCount, EXTRACT_CONCURRENCY);
+                jobId, aiSegments.size(), terms.size(), BATCH_SIZE, batchCount, extractionConcurrency);
         List<CompletableFuture<List<ExtractedHit>>> futures = new ArrayList<>(batchCount);
         for (int from = 0; from < aiSegments.size(); from += BATCH_SIZE) {
             List<TranscriptSegment> batch = aiSegments.subList(from, Math.min(aiSegments.size(), from + BATCH_SIZE));

@@ -51,6 +51,11 @@ PADDLE_OCR_SHOW_STARTUP_LOGS = env_bool("PADDLE_OCR_SHOW_STARTUP_LOGS", False)
 PADDLE_OCR_MIN_TEXT_LENGTH = max(1, env_int("PADDLE_OCR_MIN_TEXT_LENGTH", 2))
 PADDLE_OCR_DROP_SHORT_LATIN = env_bool("PADDLE_OCR_DROP_SHORT_LATIN", True)
 PADDLE_OCR_MIN_REPEAT_FRAMES = max(1, env_int("PADDLE_OCR_MIN_REPEAT_FRAMES", 2))
+# OCR 输入图像的最大宽度。高分辨率视频先缩小再推理，避免 2K/4K 帧在低配 CPU 上
+# 产生过大的检测张量；设为 0 可关闭上限（不建议）。默认 1280 兼顾字幕可读性和速度。
+OCR_MAX_WIDTH = max(0, env_int("OCR_MAX_WIDTH", 1280))
+# 小于 OCR_MAX_WIDTH 的视频是否放大后再识别。低配默认关闭，质量模式可设为 1。
+OCR_UPSCALE = env_bool("OCR_UPSCALE", False)
 # DirectML 核显推理开关:auto(默认,DmlExecutionProvider 可用即启用)/1(强制开)/0(强制关)。
 OCR_USE_DML = (os.getenv("OCR_USE_DML") or "auto").strip().lower()
 # 抽帧解码是否尝试 D3D11 硬解(任意厂商 GPU);打开失败自动回退软解,默认开。
@@ -240,7 +245,7 @@ def recognize_video_subtitles(
 ):
     """逐帧采样识别视频底部硬字幕,归并为带时间轴/坐标框的 segment 列表。
 
-    工作流程:按 interval_seconds 间隔取帧 → 对每帧识别到的文字块,按文本相似度+位置关联到正在
+    工作流程:顺序读取视频并按 interval_seconds 跳过中间帧 → 对每个采样帧识别到的文字块,按文本相似度+位置关联到正在
     跟踪的"活跃字幕"(actives);同一条字幕连续多帧未再出现(超过 1.5 个采样间隔)即视为消失,
     收尾成一条 segment。最后统一做前后 padding(片头字幕收到 0、其余前后各外扩半个间隔),减少
     擦除时的"开头漏擦"与"前后各露出 0.几秒"闪烁。
@@ -286,65 +291,123 @@ def recognize_video_subtitles(
                     duration = probe_video_duration_by_reading(cap, fps)
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
+        # Seek once to the beginning, then walk the stream forward. Random
+        # CAP_PROP_POS_MSEC seeks force codecs to decode from a keyframe for
+        # every sample and are especially expensive on long H.264 videos.
+        # ``grab`` discards intermediate frames without materialising images;
+        # only the requested sample frames are passed through OCR.
+        try:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        except Exception:
+            pass
+        interval_frames = max(1, int(round(interval_seconds * fps)))
+        frame_index = 0
+        next_sample_frame = 0
+        observed_duration = 0.0
         segments = []
         actives = []  # 每块字幕独立跟踪: {key, text, bbox, start, end, last_seen, seen}
-        t = 0.0
-        while t <= duration + 0.001:
-            try:
-                cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-                ok, frame = cap.read()
-            except Exception:
-                ok, frame = False, None
-            if not ok and hardware_active:
-                # Hardware backends may initialize successfully but fail on
-                # the first frame or after a seek/codec change. Reopen once at
-                # the same timestamp so this cannot silently truncate OCR.
-                cap = _reopen_software_capture(video_path, cv2, cap)
-                hardware_active = False
-                if cap is not None and cap.isOpened():
-                    try:
-                        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-                        ok, frame = cap.read()
-                    except Exception:
-                        ok, frame = False, None
-            if not ok:
-                break
-            seg_end = min(duration, t + interval_seconds)
-            blocks = read_subtitle_blocks(reader, frame, crop_bottom_ratio, min_confidence, cv2)
-            matched = set()
-            for block in blocks:
-                key = normalize_for_group(block.get("text", ""))
-                if not key:
+        while True:
+            # Advance sequentially to the next sample. This preserves the
+            # timestamp based API while avoiding a decoder seek per sample.
+            while frame_index < next_sample_frame:
+                try:
+                    # OpenCV exposes grab(); the read fallback keeps custom
+                    # capture backends/test doubles compatible.
+                    grab = getattr(cap, "grab", None)
+                    if callable(grab):
+                        ok = grab()
+                    else:
+                        ok, _ = cap.read()
+                except Exception:
+                    ok = False
+                if not ok and hardware_active:
+                    # A hardware decoder can fail during a grab after opening
+                    # successfully. Reopen software decoding once and resume
+                    # at the same frame number, so samples are not lost.
+                    cap = _reopen_software_capture(video_path, cv2, cap)
+                    hardware_active = False
+                    if cap is not None and cap.isOpened():
+                        try:
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                            grab = getattr(cap, "grab", None)
+                            if callable(grab):
+                                ok = grab()
+                            else:
+                                ok, _ = cap.read()
+                        except Exception:
+                            ok = False
+                if not ok:
+                    break
+                frame_index += 1
+                # Keep a useful duration estimate even when the container
+                # omits FRAME_COUNT; skipped frames still tell us where EOF
+                # is, although they do not go through OCR.
+                observed_duration = max(observed_duration, frame_index / fps)
+            else:
+                try:
+                    ok, frame = cap.read()
+                except Exception:
+                    ok, frame = False, None
+                if not ok and hardware_active:
+                    # See the grab path above; retry this exact sample through
+                    # software decoding before treating it as end of stream.
+                    cap = _reopen_software_capture(video_path, cv2, cap)
+                    hardware_active = False
+                    if cap is not None and cap.isOpened():
+                        try:
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                            ok, frame = cap.read()
+                        except Exception:
+                            ok, frame = False, None
+                if ok:
+                    t = frame_index / fps
+                    observed_duration = max(observed_duration, (frame_index + 1) / fps)
+                    seg_end = min(duration, t + interval_seconds) if duration > 0 else t + interval_seconds
+                    blocks = read_subtitle_blocks(reader, frame, crop_bottom_ratio, min_confidence, cv2)
+                    matched = set()
+                    for block in blocks:
+                        key = normalize_for_group(block.get("text", ""))
+                        if not key:
+                            continue
+                        found = None
+                        for idx, active in enumerate(actives):
+                            if idx in matched:
+                                continue
+                            if same_subtitle_key(active["key"], key) and same_subtitle_box(active["bbox"], block):
+                                found = idx
+                                break
+                        if found is not None:
+                            active = actives[found]
+                            active["end"] = max(active["end"], seg_end)
+                            active["last_seen"] = t
+                            active["seen"] = int(active.get("seen", 1)) + 1
+                            if len(block["text"]) > len(active["text"]):
+                                active["text"] = block["text"]
+                            active["bbox"] = merge_bbox(active["bbox"], block)
+                            matched.add(found)
+                        else:
+                            actives.append({"key": key, "text": block["text"], "bbox": block,
+                                            "start": t, "end": max(seg_end, t + 0.2), "last_seen": t, "seen": 1})
+                            matched.add(len(actives) - 1)
+                    # 连续多帧未再出现的块视为该字幕已消失,收尾成一条 segment
+                    survivors = []
+                    for active in actives:
+                        if t - active["last_seen"] > interval_seconds * 1.5:
+                            append_active_segment(segments, active, interval_seconds)
+                        else:
+                            survivors.append(active)
+                    actives = survivors
+                    frame_index += 1
+                    next_sample_frame += interval_frames
                     continue
-                found = None
-                for idx, active in enumerate(actives):
-                    if idx in matched:
-                        continue
-                    if same_subtitle_key(active["key"], key) and same_subtitle_box(active["bbox"], block):
-                        found = idx
-                        break
-                if found is not None:
-                    active = actives[found]
-                    active["end"] = max(active["end"], seg_end)
-                    active["last_seen"] = t
-                    active["seen"] = int(active.get("seen", 1)) + 1
-                    if len(block["text"]) > len(active["text"]):
-                        active["text"] = block["text"]
-                    active["bbox"] = merge_bbox(active["bbox"], block)
-                    matched.add(found)
-                else:
-                    actives.append({"key": key, "text": block["text"], "bbox": block,
-                                    "start": t, "end": max(seg_end, t + 0.2), "last_seen": t, "seen": 1})
-                    matched.add(len(actives) - 1)
-            # 连续多帧未再出现的块视为该字幕已消失,收尾成一条 segment
-            survivors = []
-            for active in actives:
-                if t - active["last_seen"] > interval_seconds * 1.5:
-                    append_active_segment(segments, active, interval_seconds)
-                else:
-                    survivors.append(active)
-            actives = survivors
-            t += interval_seconds
+                # Software decode reached EOF (or failed without a hardware
+                # fallback). Leave the loop and flush active subtitles below.
+                break
+            # ``while frame_index < next_sample_frame`` can only reach this
+            # branch when the stream ended while discarding frames.
+            break
+        if duration <= 0:
+            duration = observed_duration
         for active in actives:
             append_active_segment(segments, active, interval_seconds)
         # 边界 padding:OCR 按 interval 采样,segment 起止最多差一个采样间隔;前后各外扩半个间隔、
@@ -383,9 +446,21 @@ def read_subtitle_blocks(reader, frame, crop_bottom_ratio: float, min_confidence
     if crop.size == 0:
         return []
 
-    scale = min(2.0, max(1.0, 1280 / max(1, width)))
-    if scale > 1.01:
-        crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    # Keep OCR tensors bounded for 2K/4K sources.  Upscaling small sources is
+    # useful for quality but costs CPU, so it is opt-in through OCR_UPSCALE;
+    # either mode keeps ``scale`` for exact bbox projection back to the frame.
+    if OCR_MAX_WIDTH > 0:
+        target_width = OCR_MAX_WIDTH if OCR_UPSCALE else min(OCR_MAX_WIDTH, width)
+    else:
+        target_width = width
+    scale = target_width / max(1, width)
+    if abs(scale - 1.0) > 0.01:
+        interpolation = (
+            cv2.INTER_CUBIC
+            if scale > 1.0
+            else getattr(cv2, "INTER_AREA", cv2.INTER_CUBIC)
+        )
+        crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=interpolation)
 
     try:
         raw_results = run_rapid_ocr(reader, crop)

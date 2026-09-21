@@ -19,6 +19,7 @@ Completions 兼容形态,如小米 MiMo ``mimo-v2.5-asr``):后端把运行时设
 
 import base64
 import io
+import logging
 import os
 import tempfile
 import threading
@@ -44,6 +45,24 @@ except Exception:  # opencc 缺失时退化为不做简繁转换,不致命
 # 模型规格:默认 medium(faster-whisper INT8 下 CPU 可接受且较准);可用 WHISPER_MODEL 覆盖。
 # 求快可用 small/base,求准可用 large-v3。
 MODEL_SIZE = os.getenv("WHISPER_MODEL", "medium")
+# 本地 CT2 模型目录优先于 WHISPER_MODEL。将该目录复制到没有代理的电脑后，
+# faster-whisper 不需要访问 HuggingFace；不存在时会快速返回 503，而不会悄悄联网下载。
+MODEL_PATH = os.getenv("WHISPER_MODEL_PATH", "").strip()
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """解析常见环境变量布尔值，兼容 1/true/yes/on 与 0/false/no/off。"""
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on", "y", "t"}
+
+
+# WHISPER_LOCAL_FILES_ONLY 是本服务开关，HF_HUB_OFFLINE 是 HuggingFace 标准开关；
+# 任一开启都传给 faster-whisper，避免无代理电脑在首次任务中长时间等待。
+LOCAL_FILES_ONLY = _env_bool("WHISPER_LOCAL_FILES_ONLY") or _env_bool("HF_HUB_OFFLINE")
+# 默认仍是懒加载；设置 WHISPER_PRELOAD=true 可在服务启动时预热模型。
+PRELOAD_MODEL = _env_bool("WHISPER_PRELOAD")
 # 设备:核显机器固定 cpu。保留 cuda 别名规范化,但 CTranslate2 GPU 需 CUDA,核显无效。
 _device_lower = os.getenv("WHISPER_DEVICE", "cpu").strip().lower()
 if _device_lower in {"gpu", "cuda"} or _device_lower.startswith("cuda:"):
@@ -91,6 +110,8 @@ ONLINE_RETRY_MAX_WAIT_SECONDS = float(os.getenv("ASR_ONLINE_RETRY_MAX_WAIT_SECON
 app = FastAPI(title="faster-whisper ASR Service")
 model = None
 converter = OpenCC(CHINESE_CONVERTER) if (CHINESE_CONVERTER and OpenCC is not None) else None
+_model_load_error = None
+_logger = logging.getLogger("asr-service")
 # 初始化锁:保护全局模型懒加载(double-checked locking)。
 _model_lock = threading.Lock()
 # 推理锁:同一全局模型并发推理不一定安全(多任务并行时),故串行化。
@@ -142,6 +163,11 @@ async def health():
     return {
         "status": "ok",
         "model": MODEL_SIZE,
+        "modelPath": _resolved_model_path(),
+        "modelAvailable": _model_available(),
+        "modelLocalFilesOnly": LOCAL_FILES_ONLY,
+        "modelPreload": PRELOAD_MODEL,
+        "modelLoadError": _model_load_error,
         "device": DEVICE,
         "fp16": FP16,
         "computeType": COMPUTE_TYPE,
@@ -159,32 +185,121 @@ def normalize_text(text: str) -> str:
     return converter.convert(value) if converter else value
 
 
+def _resolved_model_path() -> str | None:
+    """返回配置的本地模型目录（若存在），供 health 和加载逻辑复用。"""
+    if not MODEL_PATH:
+        return None
+    return str(Path(MODEL_PATH).expanduser().resolve(strict=False))
+
+
+def _local_model_dir() -> Path | None:
+    """解析本地模型目录，也接受 HuggingFace cache 根目录作为输入。"""
+    configured = _resolved_model_path()
+    if not configured:
+        return None
+    path = Path(configured)
+    if not path.is_dir():
+        return None
+    if (path / "config.json").is_file():
+        return path
+    # faster-whisper 的 download_root 通常是
+    # models--Systran--faster-whisper-*/snapshots/<revision>，允许用户直接
+    # 将该缓存根目录填入 WHISPER_MODEL_PATH，省去手工寻找 revision。
+    candidates = [candidate.parent for candidate in path.glob("models--*/snapshots/*/config.json")]
+    if not candidates:
+        candidates = [candidate.parent for candidate in path.glob("snapshots/*/config.json")]
+    if candidates:
+        return max(candidates, key=lambda candidate: candidate.stat().st_mtime)
+    # WHISPER_MODEL_PATH 也允许指向尚未被 faster-whisper 校验的 CT2 目录；
+    # 交给引擎报告缺少文件，比把用户配置误判成“未配置”更容易排查。
+    if not any(path.glob("models--*")) and not (path / "snapshots").is_dir():
+        return path
+    return None
+
+
+def _cached_model_dir() -> Path | None:
+    """查找当前模型规格在 HuggingFace cache 中的已下载 snapshot。"""
+    cache_roots = []
+    if DOWNLOAD_ROOT:
+        cache_roots.append(Path(DOWNLOAD_ROOT).expanduser())
+    for env_name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        value = os.getenv(env_name, "").strip()
+        if value:
+            cache_roots.append(Path(value).expanduser())
+    hf_home = os.getenv("HF_HOME", "").strip()
+    cache_roots.append(Path(hf_home).expanduser() / "hub" if hf_home else Path.home() / ".cache" / "huggingface" / "hub")
+
+    model_name = MODEL_SIZE.rsplit("/", 1)[-1]
+    for cache_root in cache_roots:
+        snapshot_root = cache_root / f"models--Systran--faster-whisper-{model_name}" / "snapshots"
+        candidates = [candidate.parent for candidate in snapshot_root.glob("*/config.json")]
+        if candidates:
+            return max(candidates, key=lambda candidate: candidate.stat().st_mtime)
+    return None
+
+
+def _model_available() -> bool:
+    """判断模型引用是否已在本地可用，不触发网络下载或模型加载。"""
+    if model is not None:
+        return True
+    if MODEL_PATH:
+        return _local_model_dir() is not None
+    return _cached_model_dir() is not None
+
+
 def get_model():
     """double-checked locking 懒加载全局 faster-whisper 模型,返回已加载实例。
 
     首次加载按需从 HuggingFace 下载 CT2 权重(可经 HF_ENDPOINT 走镜像、download_root 落项目内)。
     加载失败抛 503 快速失败,避免静默卡住。
     """
-    global model
+    global model, _model_load_error
     if model is None:
         with _model_lock:
             if model is None:
-                kwargs = {"device": DEVICE, "compute_type": COMPUTE_TYPE}
+                model_ref = MODEL_SIZE
+                local_path = _local_model_dir()
+                if MODEL_PATH:
+                    if local_path is None:
+                        detail = f"WHISPER_MODEL_PATH 未找到可用模型目录: {_resolved_model_path()}"
+                        _model_load_error = detail
+                        raise HTTPException(status_code=503, detail=detail)
+                    model_ref = str(local_path)
+
+                kwargs = {
+                    "device": DEVICE,
+                    "compute_type": COMPUTE_TYPE,
+                    "local_files_only": LOCAL_FILES_ONLY,
+                }
                 if DOWNLOAD_ROOT:
                     kwargs["download_root"] = DOWNLOAD_ROOT
                 if CPU_THREADS > 0:
                     kwargs["cpu_threads"] = CPU_THREADS
                 try:
-                    model = WhisperModel(MODEL_SIZE, **kwargs)
+                    model = WhisperModel(model_ref, **kwargs)
+                    _model_load_error = None
                 except Exception as exc:
+                    _model_load_error = f"{type(exc).__name__}: {exc}"
                     raise HTTPException(
                         status_code=503,
                         detail=(
-                            f"加载 faster-whisper 模型失败(model={MODEL_SIZE}, device={DEVICE}, "
+                            f"加载 faster-whisper 模型失败(model={model_ref}, device={DEVICE}, "
                             f"compute_type={COMPUTE_TYPE}): {type(exc).__name__}: {exc}"
                         ),
                     )
     return model
+
+
+@app.on_event("startup")
+async def preload_model_if_requested():
+    """按需预热模型；失败只记录到 health，不阻止 HTTP 服务启动。"""
+    if not PRELOAD_MODEL:
+        return
+    try:
+        await run_in_threadpool(get_model)
+        _logger.info("faster-whisper model preloaded: %s", _resolved_model_path() or MODEL_SIZE)
+    except Exception as exc:
+        _logger.warning("faster-whisper model preload failed: %s", exc)
 
 
 def _online_endpoint(base_url: str) -> str:

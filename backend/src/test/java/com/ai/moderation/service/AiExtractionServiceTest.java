@@ -59,7 +59,7 @@ class AiExtractionServiceTest {
         SegmentTimeLocator locator = new SegmentTimeLocator(textNormalizer);
         service = new AiExtractionService(
                 settingsService, transactionTemplate, moderationClient, aiReviewService, locator, textNormalizer,
-                hitRepository, reviewRepository, segmentRepository, wordRepository, termRepository
+                hitRepository, reviewRepository, segmentRepository, wordRepository, termRepository, 1
         );
         doAnswer(invocation -> {
             Consumer<TransactionStatus> callback = invocation.getArgument(0);

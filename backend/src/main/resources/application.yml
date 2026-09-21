@@ -36,6 +36,7 @@ app:
     subtitle-blur-sigma: 6.0      # delogo 去字幕后高斯柔化强度;越小越清晰(过小暴露插值痕迹),越大越糊。原 12 偏糊
     subtitle-feather-max: 40      # 字幕块边缘羽化过渡带上限(px);越大边缘越柔和自然。原 22
     hw-encoder: ${FFMPEG_HW_ENCODER:auto}  # 导出重编码硬件编码器: auto(按 AMF→QSV→NVENC 探测,全不可用回退 libx264)|amf|qsv|nvenc|off
+    threads: ${FFMPEG_THREADS:2}  # 每个 FFmpeg 进程线程上限，低配可设 1
   asr:
     enabled: true
     base-url: http://localhost:9000
@@ -44,9 +45,13 @@ app:
     enabled: true
     base-url: http://localhost:9001   # OCR 独立服务,与 Whisper(9000) 拆开避免 torch/paddle 同进程 CUDA 冲突;留空则回退用 asr.base-url
     ocr-path: /ocr-subtitles
-    interval-seconds: 0.75
-    crop-bottom-ratio: 1.0       # 1.0=扫描整个画面(识别任意位置文字);如只需要底部字幕可调到 0.35
-    min-confidence: 0.65         # 整帧扫描时提高阈值,减少角标/Logo/背景碎片误识别
+    # 低配默认每 1.5 秒顺序抽一帧，并只扫描底部字幕带；质量模式可调回 0.75/1.0。
+    interval-seconds: ${APP_SUBTITLE_OCR_INTERVAL_SECONDS:1.5}
+    crop-bottom-ratio: ${APP_SUBTITLE_OCR_CROP_BOTTOM_RATIO:0.35} # 1.0=扫描整个画面;0.35 适合底部硬字幕且更省 CPU
+    min-confidence: ${APP_SUBTITLE_OCR_MIN_CONFIDENCE:0.65} # 提高此值可减少角标/Logo/背景碎片误识别
+  pipeline:
+    transcript-concurrency: ${APP_PIPELINE_TRANSCRIPT_CONCURRENCY:2} # 音频/OCR 并行腿线程数
+    max-concurrent-jobs: ${APP_PIPELINE_MAX_CONCURRENT_JOBS:1} # 低配默认一次处理一个视频
   ai:
     enabled: false
     api-type: chat
@@ -56,6 +61,7 @@ app:
     temperature: 0
     confidence-threshold: 0.6
     timeout-seconds: 60
+    extraction-concurrency: ${AI_EXTRACTION_CONCURRENCY:1}
   clip:
     padding-seconds: 0.2
     precise-export: false

@@ -86,6 +86,8 @@ function Initialize-LocalEnvironment {
 
     if (-not $env:WHISPER_DEVICE) { $env:WHISPER_DEVICE = "cpu" }
     if (-not $env:WHISPER_FP16) { $env:WHISPER_FP16 = "false" }
+    if (-not $env:OCR_MAX_WIDTH) { $env:OCR_MAX_WIDTH = "1280" }
+    if (-not $env:OCR_UPSCALE) { $env:OCR_UPSCALE = "false" }
     if (-not $env:PADDLE_OCR_USE_GPU) { $env:PADDLE_OCR_USE_GPU = "false" }
     if (-not $env:PADDLE_OCR_MIN_TEXT_LENGTH) { $env:PADDLE_OCR_MIN_TEXT_LENGTH = "2" }
     if (-not $env:PADDLE_OCR_DROP_SHORT_LATIN) { $env:PADDLE_OCR_DROP_SHORT_LATIN = "true" }

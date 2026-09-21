@@ -150,11 +150,12 @@ $env:PADDLE_OCR_ENABLE_MKLDNN='false'
 
 说明：
 
-- ASR 引擎是 faster-whisper（CTranslate2），首次识别会从 HuggingFace 下载 CT2 模型权重（缓存目录可用 `WHISPER_DOWNLOAD_ROOT` 指定，建议指向仓库 `.runtime\models`）。
+- ASR 引擎是 faster-whisper（CTranslate2）。首次使用可运行 `start-local.bat download-model` 预下载模型；模型缓存目录可用 `WHISPER_DOWNLOAD_ROOT` 指定，无法联网时把已复制的 CT2 目录填入 `WHISPER_MODEL_PATH` 并开启 `WHISPER_LOCAL_FILES_ONLY=true`。
 - OCR 引擎是 RapidOCR（ONNXRuntime），PP-OCRv4 中英文模型随包内置、离线可用，无需下载；可用 `PADDLE_OCR_DET_MODEL` / `PADDLE_OCR_REC_MODEL` 指定自定义 onnx 模型路径。
 - `WHISPER_MODEL` 可改为 `tiny/base/small/medium/large-v3` 等；默认 `medium`（配 INT8 量化，准确度与速度平衡），求快改 `small`，求更准改 `large-v3`。
 - `WHISPER_COMPUTE_TYPE` 默认 `int8`（CPU 最快最省内存）；`WHISPER_CPU_THREADS` 建议设为物理性能核数（引擎默认 4 线程偏保守，开满全部核反而可能更慢）。
 - 默认启用 beam search（`WHISPER_BEAM_SIZE=5`）提升数字/口语识别（如「几十块」不易被听成「十块」）；追求速度可设 `WHISPER_BEAM_SIZE=0` 改用贪心解码。
+- 无代理电脑可先运行 `start-local.bat download-model`，或把可联网电脑的模型目录复制后设置 `WHISPER_MODEL_PATH`；`WHISPER_LOCAL_FILES_ONLY=true` 会禁止首次任务联网等待。安装依赖时可在 `config/local.env` 配置 `PIP_INDEX_URL`、`PIP_CACHE_DIR`、`PIP_FIND_LINKS` 与 `PIP_NO_INDEX`。
 - 默认输出会使用简体中文提示词，并通过 OpenCC 做繁转简。
 - 两个推理服务均为纯 CPU 轻量引擎，无 torch/paddle/CUDA 依赖，核显机器可直接运行。
 
@@ -185,14 +186,14 @@ app:
   subtitle-ocr:
     enabled: true
     ocr-path: /ocr-subtitles
-    interval-seconds: 0.75
+    interval-seconds: 1.5
     crop-bottom-ratio: 0.35
     min-confidence: 0.35
 ```
 
 说明：
 
-- `crop-bottom-ratio` 表示从画面底部向上扫描的高度占比：`1.0` 扫描整个画面（识别任意位置文字，默认）；`0.35` 仅扫底部字幕条（更快，但会漏掉非底部的文字）。
+- `crop-bottom-ratio` 表示从画面底部向上扫描的高度占比：`1.0` 扫描整个画面（识别任意位置文字）；`0.35` 仅扫底部字幕条（低配默认，更快，但会漏掉非底部的文字）。
 - `interval-seconds` 越小越不容易漏字幕，但 OCR 更慢。
 - OCR 结果会与音频 ASR 结果合并为两层；同一时间段口播和字幕文本相同也会保留两条来源，因为音频和字幕需要分别处理。
 - 导出时，音频来源命中按现有方式删除对应时间片段；画面字幕来源命中走 ffmpeg delogo 邻域插值修复（抹除字幕并尽量融入背景，超宽字幕条自动横向分块，再做高斯柔化与边缘羽化），无法探测分辨率时回退盒式模糊。
@@ -252,7 +253,7 @@ http://127.0.0.1:8090/
 两处本地推理均采用轻量纯 CPU 引擎，无 torch/paddle/CUDA 依赖，只有核显的机器可直接运行：
 
 - **Whisper 语音识别**：faster-whisper（CTranslate2）INT8 量化，比 openai-whisper 纯 CPU 推理快约 4 倍、内存更省。提速优先级：`WHISPER_CPU_THREADS` 设为物理性能核数 > 换小模型（`small`）> `WHISPER_BEAM_SIZE=0` 贪心解码。
-- **画面字幕 OCR**：RapidOCR（ONNXRuntime）+ 内置 PP-OCRv4 中英文模型，识别质量与 PP-OCR 同源；调大 `interval-seconds` 抽帧间隔可加快扫描。
+- **画面字幕 OCR**：RapidOCR（ONNXRuntime）+ 内置 PP-OCRv4 中英文模型，识别质量与 PP-OCR 同源；服务顺序解码视频并限制 OCR 输入宽度，调大 `interval-seconds` 或设置 `OCR_MAX_WIDTH` 可进一步降低低配机 CPU 负载。
 
 两服务 `/health` 的 `gpu` 字段现为引擎自检信息（onnxruntime providers、ctranslate2 版本等），仅供排查。
 
@@ -566,7 +567,7 @@ app:
   subtitle-ocr:
     enabled: true
     ocr-path: /ocr-subtitles
-    interval-seconds: 0.75
+    interval-seconds: 1.5
     crop-bottom-ratio: 0.35
     min-confidence: 0.35
 ```

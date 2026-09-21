@@ -12,9 +12,9 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * @param enabled         是否启用画面 OCR 接入
  * @param baseUrl         OCR 服务基址
  * @param ocrPath         OCR 接口相对路径,默认 {@code /ocr-subtitles}
- * @param intervalSeconds 抽帧间隔秒数,默认 0.75;越小越密、越慢
+ * @param intervalSeconds 抽帧间隔秒数,默认 1.5;越小越密、越慢
  * @param cropBottomRatio 仅识别画面底部的高度比例(0~1),默认 0.35,因硬字幕多在底部,裁剪可提速并降误检
- * @param minConfidence   OCR 结果最低置信度过滤阈值(0~1),默认 0.35,低于此值的识别结果丢弃
+ * @param minConfidence   OCR 结果最低置信度过滤阈值(0~1),默认 0.65,低于此值的识别结果丢弃
  */
 @ConfigurationProperties(prefix = "app.subtitle-ocr")
 public record SubtitleOcrProperties(
@@ -31,15 +31,15 @@ public record SubtitleOcrProperties(
             ocrPath = "/ocr-subtitles";
         }
         if (intervalSeconds <= 0) {
-            intervalSeconds = 0.75;
+            intervalSeconds = 1.5;
         }
         // 比例须在 (0,1] 内,越界回到默认底部 35%
         if (cropBottomRatio <= 0 || cropBottomRatio > 1) {
             cropBottomRatio = 0.35;
         }
-        // 置信度须在 (0,1] 内,越界回到默认 0.35
+        // 置信度须在 (0,1] 内,越界回到默认 0.65
         if (minConfidence <= 0 || minConfidence > 1) {
-            minConfidence = 0.35;
+            minConfidence = 0.65;
         }
     }
 }

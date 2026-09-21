@@ -31,6 +31,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
@@ -69,12 +70,8 @@ public class DetectionPipelineService {
     // 音画两腿并行的专用线程池:故意不注册为 Spring Bean,避免触发 applicationTaskExecutor 的
     // @ConditionalOnMissingBean(Executor.class) 退避,从而保证 @Async processAsync 仍用框架默认执行器,
     // 与本池彻底分离——否则 processAsync 与其子任务同池,join 等待子任务会自饥饿死锁。
-    private final ExecutorService transcriptExecutor = Executors.newFixedThreadPool(8, runnable -> {
-        Thread thread = new Thread(runnable);
-        thread.setName("transcript-" + thread.threadId());
-        thread.setDaemon(true);
-        return thread;
-    });
+    private final ExecutorService transcriptExecutor;
+    private final Semaphore jobSemaphore;
 
     public DetectionPipelineService(
             DetectionJobRepository jobRepository,
@@ -87,7 +84,9 @@ public class DetectionPipelineService {
             TranscriptService transcriptService,
             RuleMatchingService ruleMatchingService,
             AiExtractionService aiExtractionService,
-            ClipSuggestionService clipSuggestionService
+            ClipSuggestionService clipSuggestionService,
+            @org.springframework.beans.factory.annotation.Value("${app.pipeline.transcript-concurrency:2}") int transcriptConcurrency,
+            @org.springframework.beans.factory.annotation.Value("${app.pipeline.max-concurrent-jobs:1}") int maxConcurrentJobs
     ) {
         this.jobRepository = jobRepository;
         this.videoRepository = videoRepository;
@@ -100,6 +99,14 @@ public class DetectionPipelineService {
         this.ruleMatchingService = ruleMatchingService;
         this.aiExtractionService = aiExtractionService;
         this.clipSuggestionService = clipSuggestionService;
+        int workers = Math.max(1, Math.min(4, transcriptConcurrency));
+        this.transcriptExecutor = Executors.newFixedThreadPool(workers, runnable -> {
+            Thread thread = new Thread(runnable);
+            thread.setName("transcript-" + thread.threadId());
+            thread.setDaemon(true);
+            return thread;
+        });
+        this.jobSemaphore = new Semaphore(Math.max(1, maxConcurrentJobs));
     }
 
     /** 容器销毁时优雅关闭转写线程池,避免守护线程残留。 */
@@ -121,6 +128,7 @@ public class DetectionPipelineService {
     public void processAsync(Long jobId) {
         DetectionJob job = jobRepository.findById(jobId).orElseThrow();
         VideoFile video = videoRepository.findById(job.getVideoId()).orElseThrow();
+        jobSemaphore.acquireUninterruptibly();
         try {
             mark(job, JobStatus.EXTRACTING_AUDIO, 10);
             TranscriptionResult transcription = buildTranscript(job, video);
@@ -156,6 +164,7 @@ public class DetectionPipelineService {
         } finally {
             // 检测产生的音频(job-{id}/audio.wav)是中间产物,无论成败都清理,避免累积占用磁盘
             cleanupWorkDir(video, jobId);
+            jobSemaphore.release();
         }
     }
 

@@ -77,6 +77,7 @@ public class FfmpegService {
             Path audioPath = outputDir.resolve("audio.wav");
             run(List.of(
                     properties.ffmpegPath(), "-y",
+                    "-threads", properties.threads().toString(),
                     "-i", videoPath.toString(),
                     "-vn", "-ac", "1", "-ar", "16000",
                     audioPath.toString()
@@ -190,6 +191,7 @@ public class FfmpegService {
             runWithVideoEncoder(encodeArgs -> {
                 List<String> command = new ArrayList<>(List.of(
                         properties.ffmpegPath(), "-y",
+                        "-threads", properties.threads().toString(),
                         "-i", inputVideo.toString(),
                         "-filter_complex", filter,
                         "-map", "[vout]",
@@ -287,6 +289,7 @@ public class FfmpegService {
             Path part = outputDir.resolve("keep-" + i + ".mp4");
             List<String> command = new ArrayList<>(List.of(
                     properties.ffmpegPath(), "-y",
+                    "-threads", properties.threads().toString(),
                     "-ss", formatSeconds(range.start()),
                     "-i", inputVideo.toString(),
                     "-t", formatSeconds(range.end() - range.start())

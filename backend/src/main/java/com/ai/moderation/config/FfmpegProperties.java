@@ -17,6 +17,7 @@ import java.util.Locale;
  * @param hwEncoder          导出重编码用的硬件 H.264 编码器:auto(默认,按 AMF→QSV→NVENC 探测,
  *                           全部不可用回退 libx264)/amf(AMD)/qsv(Intel)/nvenc(NVIDIA)/off(强制 CPU libx264)。
  *                           仅影响导出阶段的视频重编码,滤镜(delogo 等)仍在 CPU 上执行
+ * @param threads            每个 FFmpeg 进程的线程上限,低配机器可设为 1~2
  */
 @ConfigurationProperties(prefix = "app.ffmpeg")
 public record FfmpegProperties(
@@ -24,7 +25,8 @@ public record FfmpegProperties(
         String ffprobePath,
         Double subtitleBlurSigma,
         Integer subtitleFeatherMax,
-        String hwEncoder
+        String hwEncoder,
+        Integer threads
 ) {
     /** 紧凑构造器:旧配置未提供新增参数时用默认值兜底,保证启动不失败。 */
     public FfmpegProperties {
@@ -37,5 +39,6 @@ public record FfmpegProperties(
         hwEncoder = hwEncoder == null || hwEncoder.isBlank()
                 ? "auto"
                 : hwEncoder.trim().toLowerCase(Locale.ROOT);
+        threads = threads == null ? 2 : Math.max(1, threads);
     }
 }
