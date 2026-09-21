@@ -38,7 +38,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 用**专用线程池 `transcriptExecutor`**(故意不注册为 Spring Bean)跑两腿,避免与 `@Async` 框架执行器同池导致 join 子任务自饥饿死锁——改动并发逻辑时务必保持此隔离。
 
-- **腿 A 音频**:FFmpeg 抽 16k mono wav → Whisper 转写。**失败 = 任务失败,不降级**。转写引擎可在运行时设置切换:LOCAL(本地 faster-whisper)或 ONLINE(OpenAI Chat Completions 兼容在线 ASR,如小米 MiMo `mimo-v2.5-asr`)。在线模式仍经由 asr-service 进程:后端把端点/密钥/模型以 form 字段透传,asr-service 用 faster-whisper 自带 Silero VAD 按静音切片逐片上送(在线 API 只返回纯文本),片段起止作段级时间戳、段内按字符权重线性插值出**伪词级时间戳**——响应结构与本地模式一致,下游(规则召回完全建立在词级时间戳上,words 为空的段不参与匹配)无需改动,且不加载本地 Whisper 模型。
+- **腿 A 音频**:FFmpeg 抽 16k mono wav → 本地 faster-whisper 转写。**失败 = 任务失败,不降级**。ASR 服务只返回模型生成的段级和词级真实时间戳，规则召回、时间轴定位与剪辑建议都基于这些时间戳。
 - **腿 B 画面 OCR**:仅当无外部字幕文件时跑;**失败降级为空,不拖垮音频腿**。
 - 有外部 `.srt/.vtt` 时跳过腿 B,改用 `SubtitleParser`。
 - 各层经 `TranscriptionMerger.merge` 按 source + 时间重叠去重合并。同一时段音频与字幕文本相同也各保留一条(`TranscriptSource` 不同,导出处理方式不同)。
@@ -53,7 +53,7 @@ AI 启用与否、端点/密钥/模型走的是**运行时设置**(见下),`extr
 
 ## 其他关键设计
 
-- **运行时设置(SettingsService + `app_settings` 单行表)**:AI 与剪辑参数、ASR 引擎(本地/在线及其端点、密钥、模型)可在前端齿轮即时改,对**新建任务**立即生效、无需重启。`application.yml` 的 `app.ai.*`/`app.clip.*` 仅在 DB 无记录时**种子化**。内存缓存,`GET /settings` 不回传明文 API Key(只给 `aiApiKeyConfigured`/`asrOnlineApiKeyConfigured`)。
+- **运行时设置(SettingsService + `app_settings` 单行表)**:AI 与剪辑参数可在前端齿轮即时改,对**新建任务**立即生效、无需重启。ASR 模型与设备参数通过本地环境变量配置。`application.yml` 的 `app.ai.*`/`app.clip.*` 仅在 DB 无记录时**种子化**。内存缓存,`GET /settings` 不回传明文 AI API Key(只给 `aiApiKeyConfigured`)。
 - **OpenAI 兼容客户端(AiModerationClient)**:支持 CHAT(`/v1/chat/completions`)与 RESPONSES(`/v1/responses`)两形态;结构化输出**自动降级阶梯** `json_schema → json_object → none`(按 400 报文判别并按端点缓存可用档位);对夹带解释文字/代码块的国产网关做容错 JSON 解析。因设置可变,每次调用临时构建 `RestClient`。
 - **两种命中两种导出(`TranscriptSource`)**:`AUDIO` 命中 → `exportWithoutClips` 删时间片段(保留段 concat);`VIDEO_SUBTITLE` 命中 → `exportWithSubtitleBlur` 用 FFmpeg **delogo 邻域插值去字幕** + 高斯柔化 + 边缘羽化(探测分辨率失败回退盒式模糊)。擦除时段用整条字幕显示时长(非命中词的零点几秒)以免闪烁。字幕框 bbox(归一化 0~1)由 OCR 写入 `transcript_segments`。**GPU 去字幕(VSR)已移除**,统一用 CPU 的 ffmpeg delogo,`subtitle-blur-sigma`/`subtitle-feather-max` 在 `application.yml` 调。导出**重编码**支持硬件编码器(`app.ffmpeg.hw-encoder`,默认 auto 按 AMF→QSV→NVENC 试编码懒探测,核显即可;真实导出失败自动降级 libx264 重跑,硬件路径永不阻断导出),滤镜仍在 CPU 执行。
 - **规则匹配(RuleMatchingService)**:`MatchType` 四类 EXACT/VARIANT/REGEX/SEMANTIC。SEMANTIC 目前仅价格语义(中英文带单位、符号小数、口语约数如「60几」「几十块」),靠正则在价格上下文召回候选交 AI 判真伪。

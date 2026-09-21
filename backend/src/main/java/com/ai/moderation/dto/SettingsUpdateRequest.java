@@ -3,7 +3,6 @@ package com.ai.moderation.dto;
 /**
  * 系统设置更新请求。所有字段可选,null 表示保持原值不变。
  * aiApiKey 为 null 时保留原 key;传入非空字符串则更新,传入空字符串则清空。
- * 更换在线 ASR Base URL 时若未同时提交 asrOnlineApiKey,后端会清除原在线密钥。
  *
  * @param aiEnabled            是否启用 AI 复核;null 保持不变
  * @param aiApiType            接口形态(CHAT/RESPONSES);null 保持不变
@@ -13,10 +12,6 @@ package com.ai.moderation.dto;
  * @param aiTemperature        采样温度;null 保持不变
  * @param aiConfidenceThreshold 置信度阈值;null 保持不变
  * @param aiTimeoutSeconds     单次调用超时秒数;null 保持不变
- * @param asrProvider          ASR 引擎(LOCAL/ONLINE);null 保持不变
- * @param asrOnlineBaseUrl     在线 ASR 基址;null 保持不变
- * @param asrOnlineApiKey      在线 ASR 密钥,三态同 aiApiKey;端点变更时 null 不再复用原密钥
- * @param asrOnlineModel       在线 ASR 模型名;null 保持不变
  * @param clipPaddingSeconds   剪辑区间前后留白(秒);null 保持不变
  * @param clipPreciseExport    是否精确导出;null 保持不变
  */
@@ -29,10 +24,6 @@ public record SettingsUpdateRequest(
         Double aiTemperature,
         Double aiConfidenceThreshold,
         Integer aiTimeoutSeconds,
-        String asrProvider,
-        String asrOnlineBaseUrl,
-        String asrOnlineApiKey,
-        String asrOnlineModel,
         Double clipPaddingSeconds,
         Boolean clipPreciseExport
 ) {

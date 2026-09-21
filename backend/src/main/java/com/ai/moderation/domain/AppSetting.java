@@ -31,13 +31,6 @@ public class AppSetting implements Identifiable {
     private Double aiConfidenceThreshold;
     private Integer aiTimeoutSeconds;
 
-    /** ASR 引擎选择:LOCAL 本地 Whisper / ONLINE 在线接口,取值见 {@link com.ai.moderation.config.AsrProvider}。 */
-    private String asrProvider;
-    /** 在线 ASR(OpenAI Chat Completions 兼容,如小米 MiMo)基址。 */
-    private String asrOnlineBaseUrl;
-    private String asrOnlineApiKey;
-    private String asrOnlineModel;
-
     /** 剪辑/去字幕导出时命中时段前后的留白秒数。 */
     private Double clipPaddingSeconds;
     /** 是否启用精确导出(按命中精确时点切割,而非按段对齐)。 */

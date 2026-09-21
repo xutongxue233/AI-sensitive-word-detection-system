@@ -14,7 +14,7 @@ import {
 } from 'lucide-react';
 
 import { getErrorMessage, getSettings, testAiConnection, updateSettings } from '@/api';
-import type { AiApiType, AppSettings, AppSettingsUpdate, AsrProvider } from '@/types';
+import type { AiApiType, AppSettings, AppSettingsUpdate } from '@/types';
 import {
   Dialog,
   DialogContent,
@@ -38,21 +38,15 @@ import { NumberField } from '@/components/ui/number-field';
 import { ScrollArea } from '@/components/ui/scroll-area';
 
 /**
- * 表单态:在完整 {@link AppSettings} 基础上去掉只读标志 aiApiKeyConfigured/asrOnlineApiKeyConfigured。
- * 后端不下发明文 Key,两个标志分别由 keyConfigured/asrKeyConfigured 单独存储,故不进入可编辑表单。
+ * 表单态:在完整 {@link AppSettings} 基础上去掉只读标志 aiApiKeyConfigured。
+ * 后端不下发明文 Key,标志由 keyConfigured 单独存储,故不进入可编辑表单。
  */
-type Form = Omit<AppSettings, 'aiApiKeyConfigured' | 'asrOnlineApiKeyConfigured'>;
+type Form = Omit<AppSettings, 'aiApiKeyConfigured'>;
 
 /** 接口形态枚举到中文说明的映射,须与后端 AiApiType 同步。 */
 const API_TYPE_LABEL: Record<AiApiType, string> = {
   CHAT: 'Chat Completions（/v1/chat/completions）',
   RESPONSES: 'Responses（/v1/responses）'
-};
-
-/** ASR 引擎枚举到中文说明的映射,须与后端 AsrProvider 同步。 */
-const ASR_PROVIDER_LABEL: Record<AsrProvider, string> = {
-  LOCAL: '本地 Whisper（faster-whisper，离线）',
-  ONLINE: '在线接口（OpenAI 兼容，如小米 MiMo）'
 };
 
 /** 表单项容器:统一标签 + 控件 + 可选提示文案的纵向布局。 */
@@ -126,7 +120,7 @@ function SettingsSection({
  *
  * API Key 采用 keyConfigured + apiKey 双状态:后端出于安全不下发明文 Key,
  * 仅以 aiApiKeyConfigured 标志告知是否已配置;apiKey 输入框留空即表示沿用
- * 后端已有 Key,仅在用户实际填入时才随保存载荷下发。更换在线 ASR 端点时需重新填写在线密钥。
+ * 后端已有 Key,仅在用户实际填入时才随保存载荷下发。
  *
  * @param open 对话框是否打开,关闭→打开切换时触发设置加载
  * @param onOpenChange 开关状态回调,保存成功或点击取消时关闭对话框
@@ -135,8 +129,6 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
   const [form, setForm] = useState<Form | null>(null);
   const [keyConfigured, setKeyConfigured] = useState(false); // 后端已配置 Key 的只读标志,决定占位文案与提示
   const [apiKey, setApiKey] = useState(''); // 用户新输入的 Key;留空则保存时不改动后端原 Key
-  const [asrKeyConfigured, setAsrKeyConfigured] = useState(false); // 在线 ASR Key 已配置的只读标志
-  const [asrApiKey, setAsrApiKey] = useState(''); // 用户新输入的在线 ASR Key;更换端点时必须填写
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -147,15 +139,13 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
     let cancelled = false;
     setLoading(true);
     setApiKey('');
-    setAsrApiKey('');
     setTestResult(null);
     getSettings()
       .then((data) => {
         if (cancelled) return;
-        const { aiApiKeyConfigured, asrOnlineApiKeyConfigured, ...rest } = data;
+        const { aiApiKeyConfigured, ...rest } = data;
         setForm(rest);
         setKeyConfigured(aiApiKeyConfigured);
-        setAsrKeyConfigured(asrOnlineApiKeyConfigured);
       })
       .catch((error) => toast.error(getErrorMessage(error, '加载设置失败')))
       .finally(() => !cancelled && setLoading(false));
@@ -202,7 +192,7 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
     }
   };
 
-  /** 保存设置:两个 apiKey 均仅当非空才下发;在线端点变更时后端会要求新 Key。 */
+  /** 保存设置:API Key 仅当非空才下发。 */
   const save = async () => {
     if (!form) return;
     setSaving(true);
@@ -211,14 +201,9 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
       if (apiKey.trim() !== '') {
         payload.aiApiKey = apiKey.trim();
       }
-      if (asrApiKey.trim() !== '') {
-        payload.asrOnlineApiKey = asrApiKey.trim();
-      }
       const updated = await updateSettings(payload);
       setKeyConfigured(updated.aiApiKeyConfigured);
-      setAsrKeyConfigured(updated.asrOnlineApiKeyConfigured);
       setApiKey('');
-      setAsrApiKey('');
       toast.success('设置已保存，下次检测即生效');
       onOpenChange(false);
     } catch (error) {
@@ -397,61 +382,11 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
               <SettingsSection
                 icon={AudioLines}
                 title="语音识别（ASR）"
-                description="选择检测管线音频腿使用的转写引擎，对新建任务生效。"
+                description="使用本地 faster-whisper 生成带词级时间戳的转写结果。"
               >
-                <div className="space-y-4">
-                  <Field label="转写引擎" hint="在线接口仅返回文本，系统会按静音切片并估算词级时间戳，定位精度略低于本地引擎。">
-                    <Select
-                      value={form.asrProvider}
-                      onValueChange={(v) => patch({ asrProvider: v as AsrProvider })}
-                    >
-                      <SelectTrigger>
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {(Object.keys(ASR_PROVIDER_LABEL) as AsrProvider[]).map((key) => (
-                          <SelectItem key={key} value={key}>
-                            {ASR_PROVIDER_LABEL[key]}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </Field>
-
-                  {form.asrProvider === 'ONLINE' && (
-                    <>
-                      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-                        <Field label="Base URL" hint="OpenAI Chat Completions 兼容端点，例如 https://api.xiaomimimo.com。">
-                          <Input
-                            value={form.asrOnlineBaseUrl}
-                            placeholder="https://api.xiaomimimo.com"
-                            onChange={(e) => patch({ asrOnlineBaseUrl: e.target.value })}
-                          />
-                        </Field>
-                        <Field label="模型" hint="例如 mimo-v2.5-asr。">
-                          <Input
-                            value={form.asrOnlineModel}
-                            placeholder="mimo-v2.5-asr"
-                            onChange={(e) => patch({ asrOnlineModel: e.target.value })}
-                          />
-                        </Field>
-                      </div>
-                  <Field label="API Key" hint={asrKeyConfigured ? '已配置，留空则保持不变；更换端点需重新填写。' : '未配置，在线识别必须填写。'}>
-                        <div className="relative">
-                          <KeyRound className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                          <Input
-                            className="pl-9"
-                            type="password"
-                            value={asrApiKey}
-                            autoComplete="off"
-                            placeholder={asrKeyConfigured ? '••••••••（更换端点需重填）' : 'sk-...'}
-                            onChange={(e) => setAsrApiKey(e.target.value)}
-                          />
-                        </div>
-                      </Field>
-                    </>
-                  )}
-                </div>
+                <p className="text-sm text-muted-foreground">
+                  音频只在本地处理，不会发送到第三方服务。模型与设备参数通过本地环境变量配置。
+                </p>
               </SettingsSection>
 
               <SettingsSection

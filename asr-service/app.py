@@ -8,33 +8,19 @@
 在纯 CPU 上以 INT8 量化推理:比 openai-whisper 约快 4 倍、内存更省,且不依赖 torch/CUDA。
 对外 HTTP 接口(/、/health、/transcribe)与原 openai-whisper 版完全一致,后端无需改动。
 
-除本地 faster-whisper 外,``/transcribe`` 还支持按请求切换到**在线 ASR**(OpenAI Chat
-Completions 兼容形态,如小米 MiMo ``mimo-v2.5-asr``):后端把运行时设置里的端点/密钥/模型
-以 form 字段透传过来。在线 API 只返回整段纯文本、无时间戳,因此本服务先用 faster-whisper
-自带的 Silero VAD(onnxruntime,无新增依赖)把音频按静音切成语音片段,逐片上送识别,
-片段起止即段级时间戳,段内再按字符权重线性插值生成伪词级时间戳——响应结构与本地模式
-完全一致,后端管线(规则召回 / 时间轴定位 / 剪辑建议)无需任何改动。在线模式不加载
-本地 Whisper 模型。
+``/transcribe`` 只使用本地 faster-whisper，并返回引擎生成的段级和词级时间戳。
+这样规则命中、时间轴定位和剪辑建议都基于真实模型时间戳，不接受没有可靠时间轴的远程转写结果。
 """
 
-import base64
-import io
 import logging
 import os
 import tempfile
 import threading
-import time
-import wave
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import numpy as np
-import requests
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from faster_whisper import WhisperModel
-from faster_whisper.audio import decode_audio
-from faster_whisper.vad import VadOptions, get_speech_timestamps
 
 try:
     from opencc import OpenCC
@@ -85,27 +71,6 @@ WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
 WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE") or None
 # 仅为兼容原 /health 的 fp16 字段保留(CPU INT8 下无实际意义)。
 FP16 = os.getenv("WHISPER_FP16", "false").lower() in {"1", "true", "yes", "on"}
-
-# ---- 在线 ASR(MiMo 等 OpenAI Chat Completions 兼容)参数,均可用环境变量微调 ----
-# VAD/上送统一按 16k 采样处理(与后端 FFmpeg 抽取的 wav 一致)。
-ONLINE_SAMPLE_RATE = 16000
-# 单个语音片段上限秒数:在线 API 按整片返回文本,片段越短伪词时间戳越准,但调用次数越多。
-ONLINE_MAX_SPEECH_SECONDS = float(os.getenv("ASR_ONLINE_MAX_SPEECH_SECONDS", "28"))
-# 静音超过该毫秒数即切片(Silero VAD)。
-ONLINE_MIN_SILENCE_MS = int(os.getenv("ASR_ONLINE_MIN_SILENCE_MS", "500"))
-# 片段首尾保留的语音垫片毫秒数,避免切掉吞音的字头字尾。
-ONLINE_SPEECH_PAD_MS = int(os.getenv("ASR_ONLINE_SPEECH_PAD_MS", "150"))
-# 并发上送的片段数(对在线 API 的并发请求数)。在线服务普遍有 QPS/并发限流,默认保守取 2;
-# 触发 429 时会按退避重试,但并发越高越容易反复撞限。
-ONLINE_CONCURRENCY = max(1, int(os.getenv("ASR_ONLINE_CONCURRENCY", "2")))
-# 单片识别请求超时秒数。
-ONLINE_TIMEOUT_SECONDS = int(os.getenv("ASR_ONLINE_TIMEOUT_SECONDS", "120"))
-# 单片在 429 限流/5xx/网络抖动时的最大重试次数(指数退避,优先尊重 Retry-After 响应头)。
-ONLINE_MAX_RETRIES = max(0, int(os.getenv("ASR_ONLINE_MAX_RETRIES", "5")))
-# 退避基数秒:第 n 次重试等待 base * 2^n(上限 30s)。
-ONLINE_RETRY_BASE_SECONDS = float(os.getenv("ASR_ONLINE_RETRY_BASE_SECONDS", "1.5"))
-# 单次退避等待上限秒数。
-ONLINE_RETRY_MAX_WAIT_SECONDS = float(os.getenv("ASR_ONLINE_RETRY_MAX_WAIT_SECONDS", "30"))
 
 app = FastAPI(title="faster-whisper ASR Service")
 model = None
@@ -302,191 +267,6 @@ async def preload_model_if_requested():
         _logger.warning("faster-whisper model preload failed: %s", exc)
 
 
-def _online_endpoint(base_url: str) -> str:
-    """把在线 ASR 基址拼成 chat/completions 端点,容忍末尾斜杠与是否已带 /v1。"""
-    trimmed = (base_url or "").strip().rstrip("/")
-    if not trimmed:
-        raise HTTPException(status_code=400, detail="在线 ASR 未配置 Base URL")
-    if trimmed.endswith("/v1"):
-        return trimmed + "/chat/completions"
-    return trimmed + "/v1/chat/completions"
-
-
-def _encode_wav_base64(samples: np.ndarray) -> str:
-    """把 float32 单声道采样([-1,1])编成 16bit PCM wav 并 base64,供 input_audio 上送。"""
-    pcm = (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16)
-    buffer = io.BytesIO()
-    with wave.open(buffer, "wb") as wav_file:
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(ONLINE_SAMPLE_RATE)
-        wav_file.writeframes(pcm.tobytes())
-    return base64.b64encode(buffer.getvalue()).decode("ascii")
-
-
-def _is_cjk(ch: str) -> bool:
-    """是否中日韩统一表意文字(含扩展A)——按单字计伪词时间权重。"""
-    code = ord(ch)
-    return 0x3400 <= code <= 0x9FFF or 0xF900 <= code <= 0xFAFF
-
-
-def _build_pseudo_words(text: str, start: float, end: float) -> list:
-    """为无时间戳的整段文本按字符权重线性插值出伪词级时间戳。
-
-    在线 API 只返回纯文本,而后端规则召回完全建立在词级时间戳拼接的归一化文本之上
-    (words 为空的段不参与匹配),因此必须补出伪词。切词规则:CJK 逐字一词、
-    连续的非 CJK 非空白字符(拉丁词/数字/标点)合为一词,按词内字符数占比在
-    [start, end] 区间内线性分布。片段由 VAD 按静音切出(默认上限 28s),
-    线性近似的误差与片段时长成正比,足够支撑时间轴定位与剪辑留白。
-    """
-    tokens = []
-    pending = ""
-    for ch in text:
-        if ch.isspace():
-            if pending:
-                tokens.append(pending)
-                pending = ""
-        elif _is_cjk(ch):
-            if pending:
-                tokens.append(pending)
-                pending = ""
-            tokens.append(ch)
-        else:
-            pending += ch
-    if pending:
-        tokens.append(pending)
-    if not tokens:
-        return []
-
-    total_chars = sum(len(token) for token in tokens)
-    duration = max(end - start, 0.0)
-    words = []
-    consumed = 0
-    for token in tokens:
-        token_start = start + duration * (consumed / total_chars)
-        consumed += len(token)
-        token_end = start + duration * (consumed / total_chars)
-        words.append({"word": token, "start": float(token_start), "end": float(token_end)})
-    return words
-
-
-def _retry_wait_seconds(attempt: int, retry_after: str) -> float:
-    """计算第 attempt 次重试前的等待秒数:优先尊重 Retry-After 响应头,否则指数退避。"""
-    if retry_after:
-        try:
-            return min(max(float(retry_after), 0.0), ONLINE_RETRY_MAX_WAIT_SECONDS)
-        except ValueError:
-            pass
-    return min(ONLINE_RETRY_BASE_SECONDS * (2 ** attempt), ONLINE_RETRY_MAX_WAIT_SECONDS)
-
-
-def _recognize_chunk_online(endpoint: str, api_key: str, model_name: str, samples: np.ndarray) -> str:
-    """单个语音片段上送在线 ASR,返回识别文本。
-
-    429 限流、5xx、网络抖动按指数退避重试(最多 ONLINE_MAX_RETRIES 次,优先尊重
-    Retry-After 响应头);重试耗尽或其余 4xx(配置/鉴权类错误,重试无意义)抛 502。
-    """
-    payload = {
-        "model": model_name,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_audio",
-                        "input_audio": {"data": "data:audio/wav;base64," + _encode_wav_base64(samples)},
-                    }
-                ],
-            }
-        ],
-        "asr_options": {"language": "auto"},
-    }
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-
-    last_error = ""
-    for attempt in range(ONLINE_MAX_RETRIES + 1):
-        try:
-            # Credentials and audio must never follow an untrusted redirect to another host.
-            response = requests.post(
-                endpoint,
-                json=payload,
-                headers=headers,
-                timeout=ONLINE_TIMEOUT_SECONDS,
-                allow_redirects=False,
-            )
-        except requests.RequestException as exc:
-            last_error = f"在线 ASR 请求失败: {type(exc).__name__}: {exc}"
-            if attempt < ONLINE_MAX_RETRIES:
-                time.sleep(_retry_wait_seconds(attempt, ""))
-                continue
-            break
-
-        if response.status_code == 429 or response.status_code >= 500:
-            last_error = f"在线 ASR 服务返回 HTTP {response.status_code}: {response.text[:500]}"
-            if attempt < ONLINE_MAX_RETRIES:
-                time.sleep(_retry_wait_seconds(attempt, response.headers.get("Retry-After", "")))
-                continue
-            break
-        if response.status_code < 200 or response.status_code >= 300:
-            raise HTTPException(
-                status_code=502,
-                detail=f"在线 ASR 服务返回 HTTP {response.status_code}: {response.text[:500]}",
-            )
-        try:
-            content = response.json()["choices"][0]["message"]["content"]
-        except (ValueError, KeyError, IndexError, TypeError) as exc:
-            raise HTTPException(status_code=502, detail=f"在线 ASR 响应结构异常: {exc}: {response.text[:500]}")
-        return content or ""
-
-    raise HTTPException(status_code=502, detail=f"{last_error}（已重试 {ONLINE_MAX_RETRIES} 次）")
-
-
-def _transcribe_online(audio_path: str, base_url: str, api_key: str, model_name: str) -> list:
-    """在线转写主流程:解码音频 → Silero VAD 按静音切片 → 并发逐片上送 → 组装 segments。
-
-    与音频腿「失败即任务失败」的语义一致:任意片段识别失败都直接抛出,不做降级。
-    返回结构与本地 faster-whisper 路径完全相同。
-    """
-    if not (api_key or "").strip():
-        raise HTTPException(status_code=400, detail="在线 ASR 未配置 API Key")
-    if not (model_name or "").strip():
-        raise HTTPException(status_code=400, detail="在线 ASR 未配置模型名")
-    endpoint = _online_endpoint(base_url)
-
-    audio = decode_audio(audio_path, sampling_rate=ONLINE_SAMPLE_RATE)
-    vad_options = VadOptions(
-        max_speech_duration_s=ONLINE_MAX_SPEECH_SECONDS,
-        min_silence_duration_ms=ONLINE_MIN_SILENCE_MS,
-        speech_pad_ms=ONLINE_SPEECH_PAD_MS,
-    )
-    chunks = get_speech_timestamps(audio, vad_options, sampling_rate=ONLINE_SAMPLE_RATE)
-    if not chunks:
-        return []
-
-    def _recognize(chunk: dict) -> str:
-        return _recognize_chunk_online(endpoint, api_key.strip(), model_name.strip(), audio[chunk["start"]:chunk["end"]])
-
-    with ThreadPoolExecutor(max_workers=min(ONLINE_CONCURRENCY, len(chunks))) as executor:
-        texts = list(executor.map(_recognize, chunks))
-
-    output = []
-    for chunk, raw_text in zip(chunks, texts):
-        text = normalize_text(raw_text)
-        if not text:
-            continue
-        start = chunk["start"] / ONLINE_SAMPLE_RATE
-        end = chunk["end"] / ONLINE_SAMPLE_RATE
-        output.append(
-            {
-                "start": float(start),
-                "end": float(end),
-                "text": text,
-                "words": _build_pseudo_words(text, start, end),
-            }
-        )
-    return output
-
-
 async def save_upload_to_temp(file: UploadFile, fallback_name: str) -> str:
     """把上传音频分块(1MB)流式写入临时文件,返回临时文件路径。delete=False,由调用方 unlink。"""
     suffix = Path(file.filename or fallback_name).suffix or Path(fallback_name).suffix
@@ -503,31 +283,17 @@ async def save_upload_to_temp(file: UploadFile, fallback_name: str) -> str:
 async def transcribe(
     file: UploadFile = File(...),
     word_timestamps: bool = True,
-    provider: str = Form("local"),
-    online_base_url: str = Form(""),
-    online_api_key: str = Form(""),
-    online_model: str = Form(""),
 ):
     """转写入口:上传音频 → 落临时文件 → 线程池阻塞推理 → 返回带词级时间戳的 segments。
 
     响应结构与原 openai-whisper 版严格一致(后端 WhisperAsrClient 据此反序列化):
     ``{"segments": [{start, end, text, words: [{word, start, end}]}]}``。
 
-    ``provider=online`` 时切换到在线 ASR(OpenAI Chat Completions 兼容,如 MiMo):
-    端点/密钥/模型由后端按运行时设置以 form 字段透传,本地 Whisper 模型不加载;
-    其余取值(含缺省 ``local``)走本地 faster-whisper 推理。
-
     faster-whisper 的 transcribe 返回 (segments 生成器, info),迭代生成器才真正解码推理;
     用 run_in_threadpool 卸载阻塞推理,_model_infer_lock 串行化。所有段/词文本经简繁转换。
     """
     temp_path = await save_upload_to_temp(file, "audio.wav")
     try:
-        if (provider or "").strip().lower() == "online":
-            output = await run_in_threadpool(
-                _transcribe_online, temp_path, online_base_url, online_api_key, online_model
-            )
-            return {"segments": output}
-
         def _run_blocking_transcribe():
             with _model_infer_lock:
                 segments_gen, _info = get_model().transcribe(

@@ -2,24 +2,16 @@ package com.ai.moderation.service;
 
 import com.ai.moderation.config.AiProperties;
 import com.ai.moderation.config.ApiType;
-import com.ai.moderation.config.AsrProvider;
 import com.ai.moderation.config.ClipProperties;
-import com.ai.moderation.common.ApiException;
 import com.ai.moderation.domain.AppSetting;
 import com.ai.moderation.dto.SettingsResponse;
 import com.ai.moderation.dto.SettingsUpdateRequest;
 import com.ai.moderation.repository.AppSettingRepository;
-import com.ai.moderation.service.support.AsrOnlineSettings;
-import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
 import java.time.Instant;
-import java.net.URI;
-import java.net.URISyntaxException;
-import java.util.Locale;
-import java.util.Objects;
 
 /**
  * 运行时系统设置中心。设置持久化在 app_settings 单行(id=1),支持前台即时调整。
@@ -29,10 +21,6 @@ import java.util.Objects;
 @Service
 public class SettingsService {
     private static final Long ROW_ID = 1L;
-    /** 在线 ASR 默认端点/模型(小米 MiMo),DB 未配置时兜底,亦作为种子值。 */
-    private static final String DEFAULT_ASR_ONLINE_BASE_URL = "https://api.xiaomimimo.com";
-    private static final String DEFAULT_ASR_ONLINE_MODEL = "mimo-v2.5-asr";
-
     private final AppSettingRepository repository;
     private final AiProperties aiDefaults;
     private final ClipProperties clipDefaults;
@@ -68,23 +56,11 @@ public class SettingsService {
         );
     }
 
-    /** 当前 ASR 引擎设置投影:provider 缺省 LOCAL,在线端点/模型为空时回落 MiMo 默认值。 */
-    public AsrOnlineSettings currentAsr() {
-        AppSetting s = load();
-        return new AsrOnlineSettings(
-                parseAsrProvider(s.getAsrProvider()),
-                StringUtils.hasText(s.getAsrOnlineBaseUrl()) ? s.getAsrOnlineBaseUrl() : DEFAULT_ASR_ONLINE_BASE_URL,
-                s.getAsrOnlineApiKey(),
-                StringUtils.hasText(s.getAsrOnlineModel()) ? s.getAsrOnlineModel() : DEFAULT_ASR_ONLINE_MODEL
-        );
-    }
-
     /** 面向前台的设置快照:出于安全不回传明文 ApiKey,仅以 {@code aiApiKeyConfigured} 标记是否已配置。 */
     public SettingsResponse currentResponse() {
         AppSetting s = load();
         AiProperties ai = currentAi();
         ClipProperties clip = currentClip();
-        AsrOnlineSettings asr = currentAsr();
         return new SettingsResponse(
                 ai.enabled(),
                 ai.apiType().name(),
@@ -94,10 +70,6 @@ public class SettingsService {
                 ai.temperature(),
                 ai.confidenceThreshold(),
                 ai.timeoutSeconds(),
-                asr.provider().name(),
-                asr.baseUrl(),
-                StringUtils.hasText(s.getAsrOnlineApiKey()),
-                asr.model(),
                 clip.paddingSeconds(),
                 clip.preciseExport()
         );
@@ -130,26 +102,6 @@ public class SettingsService {
         }
         if (request.aiTimeoutSeconds() != null) {
             s.setAiTimeoutSeconds(Math.max(1, request.aiTimeoutSeconds()));
-        }
-        if (request.asrProvider() != null) {
-            s.setAsrProvider(parseAsrProvider(request.asrProvider()).name());
-        }
-        if (request.asrOnlineBaseUrl() != null) {
-            String previousBaseUrl = canonicalUrl(s.getAsrOnlineBaseUrl());
-            String nextBaseUrl = normalizeAsrBaseUrl(request.asrOnlineBaseUrl());
-            s.setAsrOnlineBaseUrl(nextBaseUrl);
-            // A key may only be reused for the endpoint it was entered for. Changing the
-            // endpoint without a new key must invalidate the stored credential.
-            if (!Objects.equals(previousBaseUrl, canonicalUrl(nextBaseUrl))
-                    && request.asrOnlineApiKey() == null) {
-                s.setAsrOnlineApiKey(null);
-            }
-        }
-        if (request.asrOnlineApiKey() != null) {
-            s.setAsrOnlineApiKey(request.asrOnlineApiKey().trim());
-        }
-        if (request.asrOnlineModel() != null) {
-            s.setAsrOnlineModel(request.asrOnlineModel().trim());
         }
         if (request.clipPaddingSeconds() != null) {
             s.setClipPaddingSeconds(Math.max(0, request.clipPaddingSeconds()));
@@ -191,9 +143,6 @@ public class SettingsService {
         row.setAiTemperature(aiDefaults.temperature());
         row.setAiConfidenceThreshold(aiDefaults.confidenceThreshold());
         row.setAiTimeoutSeconds(aiDefaults.timeoutSeconds());
-        row.setAsrProvider(AsrProvider.LOCAL.name());
-        row.setAsrOnlineBaseUrl(DEFAULT_ASR_ONLINE_BASE_URL);
-        row.setAsrOnlineModel(DEFAULT_ASR_ONLINE_MODEL);
         row.setClipPaddingSeconds(clipDefaults.paddingSeconds());
         row.setClipPreciseExport(clipDefaults.preciseExport());
         row.setUpdatedAt(Instant.now());
@@ -210,50 +159,6 @@ public class SettingsService {
         } catch (IllegalArgumentException ex) {
             return ApiType.CHAT;
         }
-    }
-
-    private AsrProvider parseAsrProvider(String value) {
-        if (value == null) {
-            return AsrProvider.LOCAL;
-        }
-        try {
-            return AsrProvider.valueOf(value.trim().toUpperCase());
-        } catch (IllegalArgumentException ex) {
-            return AsrProvider.LOCAL;
-        }
-    }
-
-    /** 在线 ASR 只允许 HTTPS；本机回环地址允许 HTTP 以支持本地兼容服务。 */
-    private String normalizeAsrBaseUrl(String value) {
-        String trimmed = value == null ? "" : value.trim();
-        if (trimmed.isEmpty()) {
-            return "";
-        }
-        try {
-            URI uri = new URI(trimmed);
-            String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(Locale.ROOT);
-            String host = uri.getHost();
-            boolean loopbackHttp = "http".equals(scheme)
-                    && ("localhost".equalsIgnoreCase(host)
-                    || "127.0.0.1".equals(host)
-                    || "[::1]".equals(host)
-                    || "::1".equals(host));
-            if (!("https".equals(scheme) || loopbackHttp)
-                    || host == null
-                    || uri.getUserInfo() != null
-                    || uri.getQuery() != null
-                    || uri.getFragment() != null) {
-                throw new ApiException(HttpStatus.BAD_REQUEST,
-                        "在线 ASR Base URL 必须是 HTTPS 地址（本机回环地址可使用 HTTP），且不得包含用户信息、查询参数或片段");
-            }
-            return trimmed.replaceAll("/+$", "");
-        } catch (URISyntaxException ex) {
-            throw new ApiException(org.springframework.http.HttpStatus.BAD_REQUEST, "在线 ASR Base URL 格式无效");
-        }
-    }
-
-    private String canonicalUrl(String value) {
-        return value == null ? "" : value.trim().replaceAll("/+$", "");
     }
 
     private double clamp(double value, double min, double max) {

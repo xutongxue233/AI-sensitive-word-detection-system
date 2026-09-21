@@ -291,7 +291,7 @@ app:
 - `api-type=chat` 兼容性最广（Ollama、vLLM、one-api、new-api 等）；`api-type=responses` 用于 OpenAI 新版 Responses 接口，请确认你的服务商支持该端点。
 - 置信度把关：命中经 AI 复核后，仅当 `violation=true` 且 `confidence >= confidence-threshold` 才标记为违规；其余置为安全状态，仍可在「命中与 AI 复核」表中查看其置信度与原因。
 - 关闭 AI 时，规则命中按 0.70 置信度全部保留为违规，便于人工兜底。
-- 出于安全考虑，`GET /api/v1/settings` 不回传明文 API Key，仅返回配置标记；前台保存时留空即保持原 Key 不变，但更换在线 ASR 端点时必须重新填写对应密钥。
+- 出于安全考虑，`GET /api/v1/settings` 不回传明文 AI API Key，仅返回配置标记；前台保存时留空即保持原 Key 不变。
 
 ### 前端开发模式
 

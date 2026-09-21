@@ -123,10 +123,6 @@ CREATE TABLE IF NOT EXISTS app_settings (
     ai_temperature DOUBLE NOT NULL DEFAULT 0,
     ai_confidence_threshold DOUBLE NOT NULL DEFAULT 0.6,
     ai_timeout_seconds INT NOT NULL DEFAULT 60,
-    asr_provider VARCHAR(20) NOT NULL DEFAULT 'LOCAL',
-    asr_online_base_url VARCHAR(500),
-    asr_online_api_key VARCHAR(500),
-    asr_online_model VARCHAR(120),
     clip_padding_seconds DOUBLE NOT NULL DEFAULT 0.2,
     clip_precise_export TINYINT(1) NOT NULL DEFAULT 0,
     updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
